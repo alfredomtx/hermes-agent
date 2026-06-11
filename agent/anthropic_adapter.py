@@ -839,9 +839,9 @@ def build_anthropic_bedrock_client(region: str):
     Attaches the common Anthropic beta headers as client-level defaults so
     that Bedrock-hosted Claude models get the same enhanced features as
     native Anthropic. The ``context-1m-2025-08-07`` beta in particular
-    unlocks the 1M context window for Opus 4.6/4.7 on Bedrock — without
-    it, Bedrock caps these models at 200K even though the Anthropic API
-    serves them with 1M natively.
+    unlocks the 1M context window for Opus 4.6/4.7/4.8 and Sonnet 4.6 on
+    Bedrock — without it, some Bedrock routes cap these models at 200K
+    even though the Anthropic API serves them with 1M natively.
 
     Auth uses the boto3 default credential chain (IAM roles, SSO, env vars).
     """

@@ -1,9 +1,9 @@
 """Tests for the 1M-context beta header on AWS Bedrock Claude models.
 
-Claude Opus 4.6/4.7 and Sonnet 4.6 support a 1M context window, but on AWS
-Bedrock (and Microsoft Foundry) that window is still gated behind the
-``context-1m-2025-08-07`` beta header as of 2026-04. Without it, Bedrock
-caps these models at 200K even though ``model_metadata.py`` advertises 1M.
+Claude Opus 4.6/4.7/4.8 and Sonnet 4.6 support a 1M context window, but on AWS
+Bedrock (and Microsoft Foundry) that window has been gated behind the
+``context-1m-2025-08-07`` beta header on some routes. Without it, Bedrock
+can cap these models at 200K even though ``model_metadata.py`` advertises 1M.
 
 These tests guard the invariant that the header is always emitted on the
 Bedrock client path, and that it survives the MiniMax bearer-auth strip.
@@ -55,7 +55,7 @@ class TestBedrockContext1MBeta:
         default_headers = call_kwargs.get("default_headers") or {}
         beta_header = default_headers.get("anthropic-beta", "")
         assert "context-1m-2025-08-07" in beta_header, (
-            "Bedrock client must send context-1m-2025-08-07 or Opus 4.6/4.7 "
+            "Bedrock client must send context-1m-2025-08-07 or Opus 4.6/4.7/4.8 "
             "silently caps at 200K context"
         )
         # Other common betas still present — no regression.
