@@ -1297,8 +1297,10 @@ def classify_bedrock_error(error_message: str) -> str:
 
 BEDROCK_CONTEXT_LENGTHS: Dict[str, int] = {
     # Anthropic Claude models on Bedrock
-    "anthropic.claude-opus-4-6":     200_000,
-    "anthropic.claude-sonnet-4-6":   200_000,
+    "anthropic.claude-opus-4-8":     1_000_000,
+    "anthropic.claude-opus-4-7":     1_000_000,
+    "anthropic.claude-opus-4-6":     1_000_000,
+    "anthropic.claude-sonnet-4-6":   1_000_000,
     "anthropic.claude-sonnet-4-5":   200_000,
     "anthropic.claude-haiku-4-5":    200_000,
     "anthropic.claude-opus-4":       200_000,
