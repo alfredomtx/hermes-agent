@@ -144,6 +144,7 @@ _GATEWAY_RATE_LIMIT_RE = re.compile(
 )
 
 _DELEGATE_TASK_ARGS_PROGRESS_CHARS = 3000
+_DELEGATE_TASK_ARGS_TEXT_PREVIEW_CHARS = 160
 
 
 def _split_progress_payload(text: str, *, chunk_size: int = _DELEGATE_TASK_ARGS_PROGRESS_CHARS) -> List[str]:
@@ -178,6 +179,32 @@ def _split_progress_payload(text: str, *, chunk_size: int = _DELEGATE_TASK_ARGS_
     return chunks or [""]
 
 
+def _truncate_delegate_task_progress_fields(
+    value: Any,
+    *,
+    limit: int = _DELEGATE_TASK_ARGS_TEXT_PREVIEW_CHARS,
+) -> Any:
+    """Return a presentation-only copy with long delegate goal/context trimmed."""
+    try:
+        limit = max(1, int(limit))
+    except (TypeError, ValueError):
+        limit = _DELEGATE_TASK_ARGS_TEXT_PREVIEW_CHARS
+
+    if isinstance(value, dict):
+        truncated: dict[Any, Any] = {}
+        for key, item in value.items():
+            if key in {"goal", "context"} and isinstance(item, str) and len(item) > limit:
+                truncated[key] = item[:limit] + "..."
+            else:
+                truncated[key] = _truncate_delegate_task_progress_fields(item, limit=limit)
+        return truncated
+    if isinstance(value, list):
+        return [_truncate_delegate_task_progress_fields(item, limit=limit) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_truncate_delegate_task_progress_fields(item, limit=limit) for item in value)
+    return value
+
+
 def _format_delegate_task_args_progress(
     args: Optional[dict], *, chunk_size: int = _DELEGATE_TASK_ARGS_PROGRESS_CHARS
 ) -> List[str]:
@@ -187,10 +214,11 @@ def _format_delegate_task_args_progress(
     It lets Telegram users audit exactly what context/instructions were handed
     to child agents without switching all tool progress into noisy verbose mode.
     """
+    display_args = _truncate_delegate_task_progress_fields(args or {})
     try:
-        body = json.dumps(args or {}, ensure_ascii=False, indent=2, default=str)
+        body = json.dumps(display_args, ensure_ascii=False, indent=2, default=str)
     except Exception:
-        body = str(args or {})
+        body = str(display_args)
 
     try:
         from agent.redact import redact_sensitive_text
