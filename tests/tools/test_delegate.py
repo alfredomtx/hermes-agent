@@ -83,6 +83,24 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertNotIn("max_iterations", props)
         self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
 
+    def test_profile_examples_do_not_advertise_generic_reviewer_lane(self):
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        overrides = _build_dynamic_schema_overrides()
+        props = overrides["parameters"]["properties"]
+        text = "\n".join(
+            [
+                overrides["description"],
+                props["profile"]["description"],
+                props["tasks"]["items"]["properties"]["profile"]["description"],
+            ]
+        )
+
+        self.assertIn("reviewer-codex", text)
+        self.assertIn("reviewer-opus", text)
+        self.assertNotIn("reviewer for high-reasoning review", text)
+        self.assertNotIn("explorer, reviewer, coder", text)
+
     def test_schema_description_advertises_runtime_limits(self):
         """The model must see the user's actual concurrency / spawn-depth caps,
         not the framework defaults. Without this, models that read 'default 3'
@@ -474,7 +492,7 @@ class TestDelegateTask(unittest.TestCase):
             "max_iterations": 50,
             "profiles": {
                 "explorer": {"provider": "openai-codex", "model": "gpt-5.4-mini"},
-                "reviewer": {"provider": "openai-codex", "model": "gpt-5.5", "reasoning_effort": "xhigh"},
+                "reviewer-codex": {"provider": "openai-codex", "model": "gpt-5.5", "reasoning_effort": "xhigh"},
             },
         }
         seen = []
@@ -507,7 +525,7 @@ class TestDelegateTask(unittest.TestCase):
             delegate_task(
                 tasks=[
                     {"goal": "Explore", "profile": "explorer"},
-                    {"goal": "Review", "profile": "reviewer"},
+                    {"goal": "Review", "profile": "reviewer-codex"},
                 ],
                 parent_agent=parent,
             )
@@ -2297,10 +2315,13 @@ class TestDelegateHeartbeat(unittest.TestCase):
         }
 
         def slow_run(**kwargs):
-            # Long enough to exceed the OLD idle threshold (5 cycles) at
-            # the patched interval, but shorter than the new in-tool
-            # threshold.
-            time.sleep(0.4)
+            # Wait for an observable number of heartbeats instead of sleeping
+            # a fixed duration. If the code incorrectly applies the idle stale
+            # threshold while current_tool is set, heartbeats stop before this
+            # target and the bounded wait falls through to the assertion.
+            deadline = time.monotonic() + 1.0
+            while len(touch_calls) <= 4 and time.monotonic() < deadline:
+                time.sleep(0.005)
             return {"final_response": "done", "completed": True, "api_calls": 1}
 
         child.run_conversation.side_effect = slow_run
@@ -2325,7 +2346,7 @@ class TestDelegateHeartbeat(unittest.TestCase):
         self.assertGreater(
             len(touch_calls), 2,
             f"Heartbeat stopped too early while child was inside a tool; "
-            f"got {len(touch_calls)} touches over 0.4s at 0.05s interval",
+            f"got {len(touch_calls)} touches with idle stale threshold 2",
         )
 
 
