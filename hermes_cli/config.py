@@ -1757,6 +1757,22 @@ DEFAULT_CONFIG = {
                                        # raise if children time out before producing output.
         "reasoning_effort": "",  # reasoning effort for subagents: "xhigh", "high", "medium",
                                  # "low", "minimal", "none" (empty = inherit parent's level)
+        "service_tier": "",  # priority processing for subagents: "fast"/"priority"/"on" => priority;
+                              # empty inherits parent; unsupported models ignore fast overrides.
+        "profiles": {
+            # Named routing profiles for delegate_task(profile=...) and per-task
+            # {"profile": "..."}. Profiles override only the keys they set;
+            # unspecified keys inherit the root delegation config or parent agent.
+            # Example:
+            # "explorer": {
+            #     "provider": "openai-codex",
+            #     "model": "gpt-5.4-mini",
+            #     "reasoning_effort": "medium",
+            #     "service_tier": "fast",
+            #     "toolsets": ["file", "terminal"],
+            #     "max_iterations": 25,
+            # },
+        },
         "max_concurrent_children": 3,  # max parallel children per batch; floor of 1 enforced, no ceiling
         # Orchestrator role controls (see tools/delegate_tool.py:_get_max_spawn_depth
         # and _get_orchestrator_enabled).  Floored at 1, no upper ceiling —
