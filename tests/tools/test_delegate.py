@@ -69,6 +69,8 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("tasks", props)
         self.assertIn("context", props)
         self.assertIn("toolsets", props)
+        self.assertIn("profile", props)
+        self.assertIn("profile", props["tasks"]["items"]["properties"])
         # max_iterations is intentionally NOT exposed to the model — it's
         # config-authoritative via delegation.max_iterations so users get
         # predictable budgets.
@@ -368,6 +370,131 @@ class TestDelegateTask(unittest.TestCase):
             self.assertEqual(kwargs["api_key"], parent.api_key)
             self.assertEqual(kwargs["provider"], parent.provider)
             self.assertEqual(kwargs["api_mode"], parent.api_mode)
+
+    def test_profile_routes_child_model_reasoning_toolsets_and_fast_mode(self):
+        parent = _make_mock_parent(depth=0)
+        parent.service_tier = None
+        cfg = {
+            "model": "",
+            "provider": "",
+            "reasoning_effort": "",
+            "max_iterations": 50,
+            "profiles": {
+                "explorer": {
+                    "provider": "openai-codex",
+                    "model": "gpt-5.4-mini",
+                    "reasoning_effort": "medium",
+                    "service_tier": "fast",
+                    "toolsets": ["file", "terminal"],
+                    "max_iterations": 17,
+                    "inherit_mcp_toolsets": False,
+                }
+            },
+        }
+        captured_cfgs = []
+
+        def fake_creds(profile_cfg, _parent):
+            captured_cfgs.append(profile_cfg)
+            return {
+                "model": profile_cfg.get("model"),
+                "provider": profile_cfg.get("provider"),
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "api_key": "profile-key",
+                "api_mode": "codex_responses",
+                "command": None,
+                "args": [],
+            }
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value=cfg),
+            patch("tools.delegate_tool._resolve_delegation_credentials", side_effect=fake_creds),
+            patch("run_agent.AIAgent") as MockAgent,
+        ):
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(goal="Explore repo", profile="explorer", parent_agent=parent)
+
+        self.assertEqual(captured_cfgs[0]["model"], "gpt-5.4-mini")
+        self.assertEqual(captured_cfgs[0]["provider"], "openai-codex")
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["model"], "gpt-5.4-mini")
+        self.assertEqual(kwargs["provider"], "openai-codex")
+        self.assertEqual(kwargs["reasoning_config"], {"enabled": True, "effort": "medium"})
+        self.assertEqual(sorted(kwargs["enabled_toolsets"]), ["file", "terminal"])
+        self.assertEqual(kwargs["max_iterations"], 17)
+        self.assertEqual(kwargs["service_tier"], "priority")
+        self.assertEqual(kwargs["request_overrides"], {"service_tier": "priority"})
+
+    def test_batch_tasks_can_use_different_profiles(self):
+        parent = _make_mock_parent(depth=0)
+        cfg = {
+            "max_iterations": 50,
+            "profiles": {
+                "explorer": {"provider": "openai-codex", "model": "gpt-5.4-mini"},
+                "reviewer": {"provider": "openai-codex", "model": "gpt-5.5", "reasoning_effort": "xhigh"},
+            },
+        }
+        seen = []
+
+        def fake_creds(profile_cfg, _parent):
+            seen.append((profile_cfg.get("provider"), profile_cfg.get("model")))
+            return {
+                "model": profile_cfg.get("model"),
+                "provider": profile_cfg.get("provider"),
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "api_key": "profile-key",
+                "api_mode": "codex_responses",
+                "command": None,
+                "args": [],
+            }
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value=cfg),
+            patch("tools.delegate_tool._resolve_delegation_credentials", side_effect=fake_creds),
+            patch("run_agent.AIAgent") as MockAgent,
+        ):
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(
+                tasks=[
+                    {"goal": "Explore", "profile": "explorer"},
+                    {"goal": "Review", "profile": "reviewer"},
+                ],
+                parent_agent=parent,
+            )
+
+        self.assertEqual(
+            seen,
+            [("openai-codex", "gpt-5.4-mini"), ("openai-codex", "gpt-5.5")],
+        )
+
+    def test_unknown_profile_returns_error_before_spawn(self):
+        parent = _make_mock_parent(depth=0)
+        cfg = {"profiles": {"explorer": {"model": "gpt-5.4-mini"}}}
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value=cfg),
+            patch("run_agent.AIAgent") as MockAgent,
+        ):
+            result = json.loads(
+                delegate_task(goal="Explore", profile="missing", parent_agent=parent)
+            )
+
+        self.assertIn("error", result)
+        self.assertIn("Unknown delegation profile 'missing'", result["error"])
+        MockAgent.assert_not_called()
 
     def test_child_inherits_parent_print_fn(self):
         parent = _make_mock_parent(depth=0)
