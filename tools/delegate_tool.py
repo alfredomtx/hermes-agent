@@ -3002,8 +3002,9 @@ def _build_top_level_description() -> str:
         "/stop cancels every running background subagent.\n\n"
         "IMPORTANT:\n"
         "- Use the 'profile' parameter when delegation.profiles defines a better lane "
-        "for the task class (e.g. explorer for repo/file discovery; reviewer for "
-        "high-reasoning review). Per-task profile beats the top-level profile.\n"
+        "for the task class (e.g. explorer for repo/file discovery, or a pair of "
+        "reviewer-codex + reviewer-opus tasks for high-reasoning review). "
+        "Per-task profile beats the top-level profile.\n"
         "- Subagents have NO memory of your conversation. Pass all relevant "
         "info (file paths, error messages, constraints) via the 'context' field.\n"
         "- If the user is writing in a non-English language, or asked for "
@@ -3156,7 +3157,7 @@ DELEGATE_TASK_SCHEMA = {
                 "description": (
                     "Optional delegation profile from config.yaml delegation.profiles. "
                     "Use profiles to route task classes to the right model/reasoning/tool policy "
-                    "(e.g. explorer for file/repo discovery, reviewer for high-reasoning review). "
+                    "(e.g. explorer for file/repo discovery; reviewer-codex + reviewer-opus for dual review). "
                     "Per-task profile overrides this top-level value."
                 ),
             },
@@ -3177,7 +3178,7 @@ DELEGATE_TASK_SCHEMA = {
                         },
                         "profile": {
                             "type": "string",
-                            "description": "Per-task delegation profile override (e.g. explorer, reviewer, coder).",
+                            "description": "Per-task delegation profile override (e.g. explorer, reviewer-codex, reviewer-opus, coder).",
                         },
                         "acp_command": {
                             "type": "string",
