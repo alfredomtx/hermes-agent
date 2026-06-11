@@ -480,10 +480,96 @@ def _get_orchestrator_enabled() -> bool:
     return True
 
 
-def _get_inherit_mcp_toolsets() -> bool:
+def _get_inherit_mcp_toolsets(cfg: Optional[dict] = None) -> bool:
     """Whether narrowed child toolsets should keep the parent's MCP toolsets."""
-    cfg = _load_config()
+    if cfg is None:
+        cfg = _load_config()
     return is_truthy_value(cfg.get("inherit_mcp_toolsets"), default=True)
+
+
+def _normalize_profile_name(profile: Optional[str]) -> Optional[str]:
+    name = str(profile or "").strip()
+    return name or None
+
+
+def _merge_delegation_profile(cfg: dict, profile: Optional[str]) -> dict:
+    """Return delegation config with a named profile applied.
+
+    The root delegation config remains the default/inherit behavior. A profile
+    overrides only the keys it declares, so users can centralize common defaults
+    and specialize model/reasoning/tool policy per delegated task kind.
+    """
+    profile_name = _normalize_profile_name(profile)
+    base = {k: v for k, v in (cfg or {}).items() if k != "profiles"}
+    if not profile_name:
+        return base
+
+    profiles = (cfg or {}).get("profiles") or {}
+    if not isinstance(profiles, dict) or profile_name not in profiles:
+        known = sorted(str(k) for k in profiles.keys()) if isinstance(profiles, dict) else []
+        suffix = f" Known profiles: {', '.join(known)}." if known else " No profiles configured."
+        raise ValueError(f"Unknown delegation profile '{profile_name}'.{suffix}")
+
+    profile_cfg = profiles[profile_name]
+    if not isinstance(profile_cfg, dict):
+        raise ValueError(f"Delegation profile '{profile_name}' must be a mapping.")
+
+    merged = dict(base)
+    for key, value in profile_cfg.items():
+        if value is not None:
+            merged[key] = value
+    merged["_profile"] = profile_name
+    return merged
+
+
+def _profile_toolsets(cfg: dict) -> Optional[List[str]]:
+    toolsets = (cfg or {}).get("toolsets")
+    if not isinstance(toolsets, list):
+        return None
+    return [str(t) for t in toolsets if str(t or "").strip()]
+
+
+def _profile_max_iterations(cfg: dict, default: int) -> int:
+    value = (cfg or {}).get("max_iterations", default)
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_service_tier_config(raw: Any) -> Optional[str]:
+    value = str(raw or "").strip().lower()
+    if not value or value in {"normal", "default", "standard", "off", "none"}:
+        return None
+    if value in {"fast", "priority", "on"}:
+        return "priority"
+    logger.warning("Unknown delegation service_tier '%s', ignoring", raw)
+    return None
+
+
+def _request_overrides_for_child(model: Optional[str], cfg: dict, parent_agent) -> tuple[Optional[str], Dict[str, Any]]:
+    """Resolve fast/priority request overrides for a child agent."""
+    raw_service_tier = (cfg or {}).get("service_tier")
+    if raw_service_tier in (None, ""):
+        raw_service_tier = getattr(parent_agent, "service_tier", None)
+    service_tier = _parse_service_tier_config(raw_service_tier)
+
+    overrides: Dict[str, Any] = {}
+    configured_overrides = (cfg or {}).get("request_overrides")
+    if isinstance(configured_overrides, dict):
+        overrides.update(configured_overrides)
+
+    if service_tier:
+        try:
+            from hermes_cli.models import resolve_fast_mode_overrides
+
+            fast_overrides = resolve_fast_mode_overrides(model)
+        except Exception:
+            fast_overrides = None
+        if fast_overrides:
+            overrides.update(fast_overrides)
+
+    return service_tier, overrides
 
 
 def _is_mcp_toolset_name(name: str) -> bool:
@@ -922,6 +1008,7 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    delegation_cfg: Optional[dict] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -955,22 +1042,30 @@ def _build_child_agent(
     parent_subagent_id = getattr(parent_agent, "_subagent_id", None)
     tui_depth = max(0, child_depth - 1)  # 0 = first-level child for the UI
 
-    delegation_cfg = _load_config()
+    delegation_cfg = delegation_cfg or _load_config()
 
     # When no explicit toolsets given, inherit from parent's enabled toolsets
     # so disabled tools (e.g. web) don't leak to subagents.
     # Note: enabled_toolsets=None means "all tools enabled" (the default),
     # so we must derive effective toolsets from the parent's loaded tools.
-    parent_enabled = getattr(parent_agent, "enabled_toolsets", None)
+    parent_enabled_raw = getattr(parent_agent, "enabled_toolsets", None)
+    parent_enabled = (
+        parent_enabled_raw
+        if isinstance(parent_enabled_raw, (list, tuple, set, frozenset))
+        else None
+    )
     if parent_enabled is not None:
         parent_toolsets = set(parent_enabled)
-    elif parent_agent and hasattr(parent_agent, "valid_tool_names"):
+    elif (
+        parent_agent
+        and isinstance(getattr(parent_agent, "valid_tool_names", None), (list, tuple, set, frozenset))
+    ):
         # enabled_toolsets is None (all tools) — derive from loaded tool names
         import model_tools
 
         parent_toolsets = {
             ts
-            for name in parent_agent.valid_tool_names
+            for name in getattr(parent_agent, "valid_tool_names", [])
             if (ts := model_tools.get_toolset_for_tool(name)) is not None
         }
     else:
@@ -982,13 +1077,13 @@ def _build_child_agent(
         # toolset names (e.g. web, terminal) are recognised during intersection.
         expanded_parent = _expand_parent_toolsets(parent_toolsets)
         child_toolsets = [t for t in toolsets if t in expanded_parent]
-        if _get_inherit_mcp_toolsets():
+        if _get_inherit_mcp_toolsets(delegation_cfg):
             child_toolsets = _preserve_parent_mcp_toolsets(
                 child_toolsets, parent_toolsets
             )
         child_toolsets = _strip_blocked_tools(child_toolsets)
     elif parent_agent and parent_enabled is not None:
-        child_toolsets = _strip_blocked_tools(parent_enabled)
+        child_toolsets = _strip_blocked_tools(list(parent_enabled))
     elif parent_toolsets:
         child_toolsets = _strip_blocked_tools(sorted(parent_toolsets))
     else:
@@ -1137,6 +1232,10 @@ def _build_child_agent(
         # openrouter/pareto-code), so we keep it inherited even when the
         # provider is overridden — it's a no-op on any other model.
 
+    child_service_tier, child_request_overrides = _request_overrides_for_child(
+        effective_model, delegation_cfg, parent_agent
+    )
+
     child = AIAgent(
         base_url=effective_base_url,
         api_key=effective_api_key,
@@ -1148,6 +1247,8 @@ def _build_child_agent(
         max_iterations=max_iterations,
         max_tokens=getattr(parent_agent, "max_tokens", None),
         reasoning_config=child_reasoning,
+        service_tier=child_service_tier,
+        request_overrides=child_request_overrides,
         prefill_messages=getattr(parent_agent, "prefill_messages", None),
         fallback_model=parent_fallback,
         enabled_toolsets=child_toolsets,
@@ -1976,14 +2077,15 @@ def delegate_task(
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
+    profile: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
 
     Supports two modes:
-      - Single: provide goal (+ optional context, toolsets, role)
-      - Batch:  provide tasks array [{goal, context, toolsets, role}, ...]
+      - Single: provide goal (+ optional context, toolsets, role, profile)
+      - Batch:  provide tasks array [{goal, context, toolsets, role, profile}, ...]
 
     The 'role' parameter controls whether a child can further delegate:
     'leaf' (default) cannot; 'orchestrator' retains the delegation
@@ -2004,8 +2106,9 @@ def delegate_task(
             "(`p` in /agents) or the `delegation.pause` RPC before retrying."
         )
 
-    # Normalise the top-level role once; per-task overrides re-normalise.
+    # Normalise the top-level role/profile once; per-task overrides re-normalise.
     top_role = _normalize_role(role)
+    top_profile = _normalize_profile_name(profile)
 
     # Depth limit — configurable via delegation.max_spawn_depth,
     # default 2 for parity with the original MAX_DEPTH constant.
@@ -2027,7 +2130,7 @@ def delegate_task(
     # Load config
     cfg = _load_config()
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
-    # Model-supplied max_iterations is ignored — the config value is authoritative
+    # Model-supplied max_iterations is ignored — the config/profile value is authoritative
     # so users get predictable budgets. The kwarg is retained for internal callers
     # and tests; a model-emitted value here would only shrink the budget and
     # surprise the user mid-run. Log and drop it if one slips through from a
@@ -2035,20 +2138,9 @@ def delegate_task(
     if max_iterations is not None and max_iterations != default_max_iter:
         logger.debug(
             "delegate_task: ignoring caller-supplied max_iterations=%s; "
-            "using delegation.max_iterations=%s from config",
-            max_iterations, default_max_iter,
+            "using delegation.max_iterations/profile max_iterations from config",
+            max_iterations,
         )
-    effective_max_iter = default_max_iter
-
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
@@ -2070,7 +2162,13 @@ def delegate_task(
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
         task_list = [
-            {"goal": goal, "context": context, "toolsets": toolsets, "role": top_role}
+            {
+                "goal": goal,
+                "context": context,
+                "toolsets": toolsets,
+                "role": top_role,
+                "profile": top_profile,
+            }
         ]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
@@ -2078,7 +2176,10 @@ def delegate_task(
     if not task_list:
         return tool_error("No tasks provided.")
 
-    # Validate each task has a goal
+    # Validate each task has a goal and resolve profile-specific config before
+    # constructing any children. If a later task names a bad profile, return a
+    # clean error without leaving earlier children registered in active state.
+    task_specs = []
     for i, task in enumerate(task_list):
         if not isinstance(task, dict):
             return tool_error(
@@ -2086,6 +2187,30 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+
+        task_profile = _normalize_profile_name(task.get("profile") or top_profile)
+        try:
+            task_cfg = _merge_delegation_profile(cfg, task_profile)
+            task_creds = _resolve_delegation_credentials(task_cfg, parent_agent)
+        except ValueError as exc:
+            return tool_error(str(exc))
+
+        task_toolsets = task.get("toolsets")
+        if task_toolsets is None:
+            task_toolsets = toolsets
+        if task_toolsets is None:
+            task_toolsets = _profile_toolsets(task_cfg)
+
+        task_specs.append(
+            {
+                "task": task,
+                "cfg": task_cfg,
+                "creds": task_creds,
+                "toolsets": task_toolsets,
+                "max_iterations": _profile_max_iterations(task_cfg, default_max_iter),
+                "role": _normalize_role(task.get("role") or top_role),
+            }
+        )
 
     overall_start = time.monotonic()
     results = []
@@ -2106,18 +2231,17 @@ def delegate_task(
     # child build raises (otherwise _last_resolved_tool_names stays corrupted).
     children = []
     try:
-        for i, t in enumerate(task_list):
+        for i, spec in enumerate(task_specs):
+            t = spec["task"]
+            creds = spec["creds"]
             task_acp_args = t.get("acp_args") if "acp_args" in t else None
-            # Per-task role beats top-level; normalise again so unknown
-            # per-task values warn and degrade to leaf uniformly.
-            effective_role = _normalize_role(t.get("role") or top_role)
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
                 context=t.get("context"),
-                toolsets=t.get("toolsets") or toolsets,
+                toolsets=spec["toolsets"],
                 model=creds["model"],
-                max_iterations=effective_max_iter,
+                max_iterations=spec["max_iterations"],
                 task_count=n_tasks,
                 parent_agent=parent_agent,
                 override_provider=creds["provider"],
@@ -2132,7 +2256,8 @@ def delegate_task(
                     if task_acp_args is not None
                     else (acp_args if acp_args is not None else creds.get("args"))
                 ),
-                role=effective_role,
+                role=spec["role"],
+                delegation_cfg=spec["cfg"],
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -2649,7 +2774,7 @@ def _build_top_level_description() -> str:
         "Only the final summary is returned -- intermediate tool results "
         "never enter your context window.\n\n"
         "TWO MODES (one of 'goal' or 'tasks' is required):\n"
-        "1. Single task: provide 'goal' (+ optional context, toolsets)\n"
+        "1. Single task: provide 'goal' (+ optional context, toolsets, profile)\n"
         f"2. Batch (parallel): provide 'tasks' array with up to {max_children} "
         f"items concurrently for this user (configured via "
         f"delegation.max_concurrent_children in config.yaml). "
@@ -2670,6 +2795,9 @@ def _build_top_level_description() -> str:
         "'interrupted' and its work is discarded. Children cannot continue "
         "in the background.\n\n"
         "IMPORTANT:\n"
+        "- Use the 'profile' parameter when delegation.profiles defines a better lane "
+        "for the task class (e.g. explorer for repo/file discovery; reviewer for "
+        "high-reasoning review). Per-task profile beats the top-level profile.\n"
         "- Subagents have NO memory of your conversation. Pass all relevant "
         "info (file paths, error messages, constraints) via the 'context' field.\n"
         "- If the user is writing in a non-English language, or asked for "
@@ -2816,6 +2944,15 @@ DELEGATE_TASK_SCHEMA = {
                     "['terminal', 'file', 'web'] for full-stack tasks."
                 ),
             },
+            "profile": {
+                "type": "string",
+                "description": (
+                    "Optional delegation profile from config.yaml delegation.profiles. "
+                    "Use profiles to route task classes to the right model/reasoning/tool policy "
+                    "(e.g. explorer for file/repo discovery, reviewer for high-reasoning review). "
+                    "Per-task profile overrides this top-level value."
+                ),
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -2830,6 +2967,10 @@ DELEGATE_TASK_SCHEMA = {
                             "type": "array",
                             "items": {"type": "string"},
                             "description": f"Toolsets for this specific task. Available: {_TOOLSET_LIST_STR}. Use 'web' for network access, 'terminal' for shell, 'browser' for web interaction.",
+                        },
+                        "profile": {
+                            "type": "string",
+                            "description": "Per-task delegation profile override (e.g. explorer, reviewer, coder).",
                         },
                         "acp_command": {
                             "type": "string",
@@ -2906,6 +3047,7 @@ registry.register(
         acp_command=args.get("acp_command"),
         acp_args=args.get("acp_args"),
         role=args.get("role"),
+        profile=args.get("profile"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
