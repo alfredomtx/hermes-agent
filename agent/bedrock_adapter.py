@@ -36,6 +36,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+_BEDROCK_CONTEXT_1M_BETA = "context-1m-2025-08-07"
+
 # ---------------------------------------------------------------------------
 # Ensure boto3/botocore are installed before any code in this module runs.
 # Upstream removed boto3 from [all] extras (PRs #24220, #24515); lazy_deps
@@ -445,10 +447,11 @@ def is_anthropic_bedrock_model(model_id: str) -> bool:
       - ``us.anthropic.claude-*`` (US inference profiles)
       - ``global.anthropic.claude-*`` (global inference profiles)
       - ``eu.anthropic.claude-*`` (EU inference profiles)
+      - ``au.anthropic.claude-*`` (Australia inference profiles)
     """
     model_lower = model_id.lower()
     # Strip regional prefix if present
-    for prefix in ("us.", "global.", "eu.", "ap.", "jp."):
+    for prefix in ("us.", "global.", "eu.", "ap.", "jp.", "au."):
         if model_lower.startswith(prefix):
             model_lower = model_lower[len(prefix):]
             break
@@ -980,6 +983,12 @@ def build_converse_kwargs(
                     "The agent will operate in text-only mode.", model
                 )
 
+    if _requires_context_1m_beta(model):
+        fields = kwargs.setdefault("additionalModelRequestFields", {})
+        betas = fields.setdefault("anthropic_beta", [])
+        if _BEDROCK_CONTEXT_1M_BETA not in betas:
+            betas.append(_BEDROCK_CONTEXT_1M_BETA)
+
     if guardrail_config:
         kwargs["guardrailConfig"] = guardrail_config
 
@@ -1326,6 +1335,17 @@ BEDROCK_CONTEXT_LENGTHS: Dict[str, int] = {
 
 # Default for unknown Bedrock models
 BEDROCK_DEFAULT_CONTEXT_LENGTH = 128_000
+
+
+def _requires_context_1m_beta(model_id: str) -> bool:
+    """Return True when Bedrock Converse needs the Claude 1M-context beta.
+
+    Bedrock Converse uses ``additionalModelRequestFields`` instead of the
+    Anthropic ``anthropic-beta`` header. Keep this keyed off the same metadata
+    used for context-window budgeting so advertising 1M context and enabling
+    the request path stay in sync.
+    """
+    return is_anthropic_bedrock_model(model_id) and get_bedrock_context_length(model_id) > 200_000
 
 
 def get_bedrock_context_length(model_id: str) -> int:
