@@ -125,6 +125,71 @@ _GATEWAY_RATE_LIMIT_RE = re.compile(
     re.IGNORECASE,
 )
 
+_DELEGATE_TASK_ARGS_PROGRESS_CHARS = 3000
+
+
+def _split_progress_payload(text: str, *, chunk_size: int = _DELEGATE_TASK_ARGS_PROGRESS_CHARS) -> List[str]:
+    """Split a large human-readable progress payload into message-sized chunks.
+
+    Gateway progress overflow normally splits between progress *items*, not
+    inside one large item. ``delegate_task`` arguments can contain large
+    ``context`` strings, so pre-chunk the payload before putting it on the
+    progress queue. Keep chunks line-oriented for readable Markdown fences and
+    hard-split very long lines so one JSON string cannot exceed Telegram's
+    message limit by itself.
+    """
+    chunk_size = max(100, int(chunk_size or _DELEGATE_TASK_ARGS_PROGRESS_CHARS))
+    chunks: List[str] = []
+    current: List[str] = []
+    current_len = 0
+
+    for raw_line in (text.splitlines() or [""]):
+        line_parts = [raw_line[i : i + chunk_size] for i in range(0, len(raw_line), chunk_size)] or [""]
+        for part in line_parts:
+            part_len = len(part) + 1
+            if current and current_len + part_len > chunk_size:
+                chunks.append("\n".join(current))
+                current = [part]
+                current_len = part_len
+            else:
+                current.append(part)
+                current_len += part_len
+
+    if current:
+        chunks.append("\n".join(current))
+    return chunks or [""]
+
+
+def _format_delegate_task_args_progress(
+    args: Optional[dict], *, chunk_size: int = _DELEGATE_TASK_ARGS_PROGRESS_CHARS
+) -> List[str]:
+    """Render ``delegate_task`` call arguments as Telegram progress cards.
+
+    This is intentionally only the tool *input* payload, not subagent output.
+    It lets Telegram users audit exactly what context/instructions were handed
+    to child agents without switching all tool progress into noisy verbose mode.
+    """
+    try:
+        body = json.dumps(args or {}, ensure_ascii=False, indent=2, default=str)
+    except Exception:
+        body = str(args or {})
+
+    try:
+        from agent.redact import redact_sensitive_text
+
+        body = redact_sensitive_text(body)
+    except Exception:
+        pass
+
+    chunks = _split_progress_payload(body, chunk_size=chunk_size)
+    total = len(chunks)
+    cards: List[str] = []
+    for index, chunk in enumerate(chunks, 1):
+        suffix = f" ({index}/{total})" if total > 1 else ""
+        cards.append(f"🔀 delegate_task parameters{suffix}\n```\n{chunk}\n```")
+    return cards
+
+
 _GATEWAY_SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9_\-]{12,}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
@@ -14536,6 +14601,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 elif _multiline:
                     _cmd_short = _cmd_short + " ..."
                 _code_block_short = f"{_block_header}```\n{_cmd_short}\n```"
+
+            # Telegram can opt into exact delegate_task input visibility without
+            # switching every tool into noisy verbose mode. Keep this scoped to
+            # delegate_task starts only: no subagent stdout, no completion payload.
+            try:
+                _show_delegate_args = is_truthy_value(
+                    resolve_display_setting(
+                        user_config,
+                        platform_key,
+                        "delegate_task_args",
+                        False,
+                    ),
+                    default=False,
+                )
+            except Exception:
+                _show_delegate_args = False
+            if tool_name == "delegate_task" and _show_delegate_args:
+                last_was_terminal_block[0] = False
+                for _card in _format_delegate_task_args_progress(args):
+                    progress_queue.put(_card)
+                return
 
             # Verbose mode: show detailed arguments, respects tool_preview_length
             if progress_mode == "verbose":
