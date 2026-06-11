@@ -312,8 +312,8 @@ def _supports_fast_mode(model: str) -> bool:
 # calls like title generation/session summarization.
 #
 # ``context-1m-2025-08-07`` is still required to unlock the 1M context window
-# on Claude Opus 4.6/4.7 and Sonnet 4.6 when served via AWS Bedrock or Azure
-# AI Foundry. Add it only for those endpoint-specific paths below.
+# on Claude Opus 4.6/4.7/4.8 and Sonnet 4.6 when served via AWS Bedrock or
+# Azure AI Foundry. Add it only for those endpoint-specific paths below.
 _COMMON_BETAS = [
     "interleaved-thinking-2025-05-14",
     "fine-grained-tool-streaming-2025-05-14",
