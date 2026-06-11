@@ -514,6 +514,57 @@ class TestDelegateTask(unittest.TestCase):
         self.assertIn("Unknown delegation profile 'missing'", result["error"])
         MockAgent.assert_not_called()
 
+    def test_oracle_profile_can_route_to_opus_max_reasoning(self):
+        parent = _make_mock_parent(depth=0)
+        parent.enabled_toolsets = ["file", "terminal", "session_search", "search", "skills"]
+        cfg = {
+            "profiles": {
+                "oracle": {
+                    "provider": "bedrock",
+                    "model": "us.anthropic.claude-opus-4-8",
+                    "reasoning_effort": "max",
+                    "service_tier": "normal",
+                    "toolsets": ["file", "terminal", "session_search"],
+                    "max_iterations": 80,
+                }
+            }
+        }
+
+        def fake_creds(profile_cfg, _parent):
+            return {
+                "model": profile_cfg.get("model"),
+                "provider": profile_cfg.get("provider"),
+                "base_url": None,
+                "api_key": None,
+                "api_mode": None,
+                "command": None,
+                "args": [],
+            }
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value=cfg),
+            patch("tools.delegate_tool._resolve_delegation_credentials", side_effect=fake_creds),
+            patch("run_agent.AIAgent") as MockAgent,
+        ):
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "oracle verdict",
+                "completed": True,
+                "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(goal="Review this plan", profile="oracle", parent_agent=parent)
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["provider"], "bedrock")
+        self.assertEqual(kwargs["model"], "us.anthropic.claude-opus-4-8")
+        self.assertEqual(kwargs["reasoning_config"], {"enabled": True, "effort": "max"})
+        self.assertEqual(sorted(kwargs["enabled_toolsets"]), ["file", "session_search", "terminal"])
+        self.assertEqual(kwargs["max_iterations"], 80)
+        self.assertIsNone(kwargs["service_tier"])
+        self.assertEqual(kwargs["request_overrides"], {})
+
     def test_child_inherits_parent_print_fn(self):
         parent = _make_mock_parent(depth=0)
         sink = MagicMock()
