@@ -2124,8 +2124,10 @@ DEFAULT_CONFIG = {
             # Named routing profiles for delegate_task(profile=...) and per-task
             # {"profile": "..."}. Profiles override only the keys they set;
             # unspecified keys inherit the root delegation config or parent agent.
+            # Use the reserved profile name "dual-review" to spawn both
+            # reviewer-codex and reviewer-opus for one review prompt.
             # Example:
-            # "explorer": {
+            # "file-explorer": {
             #     "provider": "openai-codex",
             #     "model": "gpt-5.4-mini",
             #     "reasoning_effort": "medium",
@@ -2134,6 +2136,9 @@ DEFAULT_CONFIG = {
             #     "max_iterations": 25,
             # },
         },
+        # When true, direct reviewer-codex / reviewer-opus profile requests fail.
+        # Use profile="dual-review" instead so both reviewers always run.
+        "require_dual_review": False,
         "max_concurrent_children": 3,  # unified concurrency cap: max parallel children per batch
                                        # AND max concurrent background (background=true)
                                        # delegation units. New async dispatches beyond the cap

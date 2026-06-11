@@ -532,6 +532,80 @@ def _normalize_profile_name(profile: Optional[str]) -> Optional[str]:
     return name or None
 
 
+DUAL_REVIEW_PROFILE = "dual-review"
+DUAL_REVIEWER_PROFILES = ("reviewer-codex", "reviewer-opus")
+_SINGLE_REVIEWER_PROFILES = frozenset(DUAL_REVIEWER_PROFILES)
+
+
+def _is_dual_review_profile(profile: Optional[str]) -> bool:
+    return _normalize_profile_name(profile) == DUAL_REVIEW_PROFILE
+
+
+def _is_single_reviewer_profile(profile: Optional[str]) -> bool:
+    profile_name = _normalize_profile_name(profile)
+    return bool(profile_name and profile_name in _SINGLE_REVIEWER_PROFILES)
+
+
+def _requires_dual_review(cfg: Optional[dict]) -> bool:
+    """Whether direct single-reviewer profiles are disabled."""
+    return is_truthy_value((cfg or {}).get("require_dual_review"), default=False)
+
+
+def _expand_dual_review_task_items(task_list: List[Dict[str, Any]], top_profile: Optional[str]) -> List[Dict[str, Any]]:
+    """Expand the reserved dual-review pseudo-profile into both reviewer lanes.
+
+    The expansion returns metadata beside each task instead of trusting hidden
+    task fields from the model.  This lets require_dual_review reject direct
+    single-reviewer profiles while still allowing the tool's own expansion to
+    route through reviewer-codex and reviewer-opus.
+    """
+    expanded: List[Dict[str, Any]] = []
+    for source_index, task in enumerate(task_list):
+        if not isinstance(task, dict):
+            expanded.append(
+                {
+                    "task": task,
+                    "from_dual_review": False,
+                    "source_index": source_index,
+                    "dual_review_profile": None,
+                }
+            )
+            continue
+
+        task_profile = _normalize_profile_name(task.get("profile") or top_profile)
+        if _is_dual_review_profile(task_profile):
+            for reviewer_profile in DUAL_REVIEWER_PROFILES:
+                cloned = dict(task)
+                cloned["profile"] = reviewer_profile
+                expanded.append(
+                    {
+                        "task": cloned,
+                        "from_dual_review": True,
+                        "source_index": source_index,
+                        "dual_review_profile": DUAL_REVIEW_PROFILE,
+                    }
+                )
+        else:
+            expanded.append(
+                {
+                    "task": task,
+                    "from_dual_review": False,
+                    "source_index": source_index,
+                    "dual_review_profile": None,
+                }
+            )
+    return expanded
+
+
+def _single_reviewer_profile_error(profile_name: str) -> str:
+    return (
+        f"Direct reviewer profile '{profile_name}' is disabled because "
+        "delegation.require_dual_review=true. Use profile='dual-review' so "
+        "reviewer-codex and reviewer-opus both run, then aggregate their "
+        "findings in the parent agent."
+    )
+
+
 def _merge_delegation_profile(cfg: dict, profile: Optional[str]) -> dict:
     """Return delegation config with a named profile applied.
 
@@ -2529,14 +2603,6 @@ def delegate_task(
         tasks = recovered_tasks
 
     if tasks and isinstance(tasks, list):
-        if len(tasks) > max_children:
-            return tool_error(
-                f"Too many tasks: {len(tasks)} provided, but "
-                f"max_concurrent_children is {max_children}. "
-                f"Either reduce the task count, split into multiple "
-                f"delegate_task calls, or increase "
-                f"delegation.max_concurrent_children in config.yaml."
-            )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
         task_list = [
@@ -2553,11 +2619,24 @@ def delegate_task(
     if not task_list:
         return tool_error("No tasks provided.")
 
+    expanded_task_items = _expand_dual_review_task_items(task_list, top_profile)
+    task_list = [item["task"] for item in expanded_task_items]
+    if len(task_list) > max_children:
+        return tool_error(
+            f"Too many tasks: {len(task_list)} provided, but "
+            f"max_concurrent_children is {max_children}. "
+            f"Either reduce the task count, split into multiple "
+            f"delegate_task calls, or increase "
+            f"delegation.max_concurrent_children in config.yaml."
+        )
+
     # Validate each task has a goal and resolve profile-specific config before
     # constructing any children. If a later task names a bad profile, return a
     # clean error without leaving earlier children registered in active state.
     task_specs = []
-    for i, task in enumerate(task_list):
+    require_dual_review = _requires_dual_review(cfg)
+    for i, task_item in enumerate(expanded_task_items):
+        task = task_item["task"]
         if not isinstance(task, dict):
             return tool_error(
                 f"Task {i} must be an object, got {type(task).__name__}."
@@ -2566,6 +2645,13 @@ def delegate_task(
             return tool_error(f"Task {i} is missing a 'goal'.")
 
         task_profile = _normalize_profile_name(task.get("profile") or top_profile)
+        if (
+            require_dual_review
+            and _is_single_reviewer_profile(task_profile)
+            and not task_item["from_dual_review"]
+        ):
+            return tool_error(_single_reviewer_profile_error(task_profile or ""))
+
         try:
             task_cfg = _merge_delegation_profile(cfg, task_profile)
             task_creds = _resolve_delegation_credentials(task_cfg, parent_agent)
@@ -3334,9 +3420,12 @@ def _build_top_level_description() -> str:
         "/stop cancels every running background subagent.\n\n"
         "IMPORTANT:\n"
         "- Use the 'profile' parameter when delegation.profiles defines a better lane "
-        "for the task class (e.g. explorer for repo/file discovery, or a pair of "
-        "reviewer-codex + reviewer-opus tasks for high-reasoning review). "
-        "Per-task profile beats the top-level profile.\n"
+        "for the task class (e.g. file-explorer for repo/file discovery, "
+        "scope-auditor for scope/spec alignment, or dual-review for "
+        "high-reasoning review). dual-review expands to reviewer-codex + "
+        "reviewer-opus internally so both models run and counts as two child "
+        "tasks for max_concurrent_children. Per-task profile beats "
+        "the top-level profile.\n"
         "- Subagents have NO memory of your conversation. Pass all relevant "
         "info (file paths, error messages, constraints) via the 'context' field.\n"
         "- If the user is writing in a non-English language, or asked for "
@@ -3375,6 +3464,8 @@ def _build_tasks_param_description() -> str:
         f"Batch mode: tasks to run in parallel (up to {max_children} for this "
         f"user, set via delegation.max_concurrent_children). Each gets "
         "its own subagent with isolated context and terminal session. "
+        "The reserved profile='dual-review' expands to two child tasks and "
+        "counts as two against this limit. "
         "When provided, top-level goal/context/toolsets are ignored."
     )
 
@@ -3520,7 +3611,9 @@ DELEGATE_TASK_SCHEMA = {
                 "description": (
                     "Optional delegation profile from config.yaml delegation.profiles. "
                     "Use profiles to route task classes to the right model/reasoning/tool policy "
-                    "(e.g. explorer for file/repo discovery; reviewer-codex + reviewer-opus for dual review). "
+                    "(e.g. file-explorer for file/repo discovery; scope-auditor for scope/spec alignment; "
+                    "dual-review for enforced reviewer-codex + reviewer-opus review; "
+                    "dual-review counts as two child tasks). "
                     "Per-task profile overrides this top-level value."
                 ),
             },
@@ -3536,7 +3629,7 @@ DELEGATE_TASK_SCHEMA = {
                         },
                         "profile": {
                             "type": "string",
-                            "description": "Per-task delegation profile override (e.g. explorer, reviewer-codex, reviewer-opus, coder).",
+                            "description": "Per-task delegation profile override (e.g. file-explorer, scope-auditor, dual-review, coder).",
                         },
                         "acp_command": {
                             "type": "string",
