@@ -198,7 +198,12 @@ def _format_delegate_task_args_progress(
     """
     display_args = _truncate_delegate_task_progress_fields(args or {})
     try:
-        body = json.dumps(display_args, ensure_ascii=False, indent=2, default=str)
+        body = json.dumps(
+            display_args,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
     except Exception:
         body = str(display_args)
 
