@@ -61,3 +61,27 @@ class TestBedrockContext1MBeta:
         # Other common betas still present — no regression.
         assert "interleaved-thinking-2025-05-14" in beta_header
         assert "fine-grained-tool-streaming-2025-05-14" in beta_header
+
+    def test_build_converse_kwargs_sends_1m_beta_for_long_context_claude(self):
+        """Bedrock Converse needs anthropic_beta in additionalModelRequestFields."""
+        from agent.bedrock_adapter import build_converse_kwargs
+
+        kwargs = build_converse_kwargs(
+            model="au.anthropic.claude-opus-4-8",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+
+        assert kwargs["additionalModelRequestFields"]["anthropic_beta"] == [
+            "context-1m-2025-08-07"
+        ]
+
+    def test_build_converse_kwargs_skips_1m_beta_for_standard_context_claude(self):
+        """Do not send the 1M beta for Claude IDs still capped at 200K."""
+        from agent.bedrock_adapter import build_converse_kwargs
+
+        kwargs = build_converse_kwargs(
+            model="us.anthropic.claude-sonnet-4-5",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+
+        assert "additionalModelRequestFields" not in kwargs
