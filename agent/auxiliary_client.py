@@ -2962,12 +2962,12 @@ def _should_fallback_on_auth_error(
 
     Most explicit auth failures should stay explicit: if a user asks for a
     provider with bad credentials, surfacing that error is usually correct.
-    Vision watchdogs are different: ``auxiliary.vision.provider: auto`` first
+    Vision watchdogs and context compression are different: ``auto`` first
     tries the main provider, and a stale AWS SSO token for Bedrock should not
-    make screenshot analysis fail when the user has a configured fallback
-    provider such as OpenAI Codex.
+    make screenshot analysis or compression fail when the user has a configured
+    fallback provider such as OpenAI Codex.
     """
-    if task != "vision" or not _is_auth_error(exc):
+    if task not in {"vision", "compression"} or not _is_auth_error(exc):
         return False
     provider_l = (provider or "").strip().lower()
     base_l = (base_url or "").strip().lower()
@@ -6486,22 +6486,30 @@ def call_llm(
                     "Auxiliary %s: refreshed %s credentials after auth error, retrying",
                     task or "call", auth_refresh_provider,
                 )
-                return _retry_same_provider_sync(
-                    task=task,
-                    resolved_provider=resolved_provider,
-                    resolved_model=resolved_model,
-                    resolved_base_url=resolved_base_url,
-                    resolved_api_key=resolved_api_key,
-                    resolved_api_mode=resolved_api_mode,
-                    main_runtime=main_runtime,
-                    final_model=final_model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    tools=tools,
-                    effective_timeout=effective_timeout,
-                    effective_extra_body=effective_extra_body,
-                )
+                try:
+                    return _retry_same_provider_sync(
+                        task=task,
+                        resolved_provider=resolved_provider,
+                        resolved_model=resolved_model,
+                        resolved_base_url=resolved_base_url,
+                        resolved_api_key=resolved_api_key,
+                        resolved_api_mode=resolved_api_mode,
+                        main_runtime=main_runtime,
+                        final_model=final_model,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        tools=tools,
+                        effective_timeout=effective_timeout,
+                        effective_extra_body=effective_extra_body,
+                    )
+                except Exception as retry_err:
+                    if _should_fallback_on_auth_error(
+                        task, auth_refresh_provider, _base_info, retry_err,
+                    ):
+                        first_err = retry_err
+                    else:
+                        raise
 
         # ── Same-provider credential-pool recovery ─────────────────────
         pool_provider = _recoverable_pool_provider(resolved_provider, client, main_runtime=main_runtime)
@@ -6619,6 +6627,11 @@ def call_llm(
             or _is_invalid_aux_response_error(first_err)
             or auth_fallback_allowed
         )
+        fallback_failed_provider = (
+            _recoverable_pool_provider(resolved_provider, client, main_runtime=main_runtime)
+            or resolved_provider
+            or "auto"
+        )
         if should_fallback and (is_auto or is_capacity_error):
             if _is_auth_error(first_err):
                 reason = "auth error"
@@ -6628,9 +6641,7 @@ def call_llm(
                 # "auto"; the client's base_url tells us which backend got the
                 # 402). Mark THAT label unhealthy so subsequent aux calls
                 # skip it instead of paying another doomed RTT.
-                _mark_provider_unhealthy(
-                    _recoverable_pool_provider(resolved_provider, client, main_runtime=main_runtime) or resolved_provider
-                )
+                _mark_provider_unhealthy(fallback_failed_provider)
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"
             elif _is_model_incompatible_error(first_err):
@@ -6642,15 +6653,19 @@ def call_llm(
             else:
                 reason = "connection error"
             logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
-                        task or "call", reason, resolved_provider, first_err)
+                        task or "call", reason, fallback_failed_provider, first_err)
 
             # Fallback order (#26882, #26803):
             #   1. User-configured fallback_chain (per-task) if set
             #   2. For auto: top-level main fallback_providers/fallback_model
             #   3. For auto: built-in auxiliary discovery chain
             #   4. For explicit aux providers: main agent model safety net
+            # For generic auto capacity errors, use the full auto-detection
+            # chain. For Bedrock SSO auth failures, prefer configured fallback
+            # providers (e.g. Codex 5.5) so we do not immediately route back
+            # into the same stale Bedrock main-provider path.
             fb_client, fb_model, fb_label = (None, None, "")
-            if is_auto:
+            if is_auto and not auth_fallback_allowed:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason)
                 if fb_client is None:
@@ -6661,10 +6676,10 @@ def call_llm(
                         resolved_provider, task, reason=reason)
             else:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason)
+                    task, fallback_failed_provider, reason=reason)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
-                        resolved_provider, task, reason=reason)
+                        fallback_failed_provider, task, reason=reason)
 
             if fb_client is not None:
                 fb_kwargs = _build_call_kwargs(
@@ -7030,21 +7045,29 @@ async def async_call_llm(
                     "Auxiliary %s (async): refreshed %s credentials after auth error, retrying",
                     task or "call", auth_refresh_provider,
                 )
-                return await _retry_same_provider_async(
-                    task=task,
-                    resolved_provider=resolved_provider,
-                    resolved_model=resolved_model,
-                    resolved_base_url=resolved_base_url,
-                    resolved_api_key=resolved_api_key,
-                    resolved_api_mode=resolved_api_mode,
-                    final_model=final_model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    tools=tools,
-                    effective_timeout=effective_timeout,
-                    effective_extra_body=effective_extra_body,
-                )
+                try:
+                    return await _retry_same_provider_async(
+                        task=task,
+                        resolved_provider=resolved_provider,
+                        resolved_model=resolved_model,
+                        resolved_base_url=resolved_base_url,
+                        resolved_api_key=resolved_api_key,
+                        resolved_api_mode=resolved_api_mode,
+                        final_model=final_model,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        tools=tools,
+                        effective_timeout=effective_timeout,
+                        effective_extra_body=effective_extra_body,
+                    )
+                except Exception as retry_err:
+                    if _should_fallback_on_auth_error(
+                        task, auth_refresh_provider, _client_base, retry_err,
+                    ):
+                        first_err = retry_err
+                    else:
+                        raise
 
         # ── Same-provider credential-pool recovery (mirrors sync) ─────
         pool_provider = _recoverable_pool_provider(resolved_provider, client, main_runtime=main_runtime)
@@ -7124,14 +7147,17 @@ async def async_call_llm(
             or _is_invalid_aux_response_error(first_err)
             or auth_fallback_allowed
         )
+        fallback_failed_provider = (
+            _recoverable_pool_provider(resolved_provider, client, main_runtime=main_runtime)
+            or resolved_provider
+            or "auto"
+        )
         if should_fallback and (is_auto or is_capacity_error):
             if _is_auth_error(first_err):
                 reason = "auth error"
             elif _is_payment_error(first_err):
                 reason = "payment error"
-                _mark_provider_unhealthy(
-                    _recoverable_pool_provider(resolved_provider, client) or resolved_provider
-                )
+                _mark_provider_unhealthy(fallback_failed_provider)
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"
             elif _is_model_incompatible_error(first_err):
@@ -7143,15 +7169,18 @@ async def async_call_llm(
             else:
                 reason = "connection error"
             logger.info("Auxiliary %s (async): %s on %s (%s), trying fallback",
-                        task or "call", reason, resolved_provider, first_err)
+                        task or "call", reason, fallback_failed_provider, first_err)
 
             # Fallback order (#26882, #26803):
             #   1. User-configured fallback_chain (per-task) if set
             #   2. For auto: top-level main fallback_providers/fallback_model
             #   3. For auto: built-in auxiliary discovery chain
             #   4. For explicit aux providers: main agent model safety net
+            # Generic auto capacity errors use the full auto-detection chain;
+            # Bedrock SSO auth failures use configured fallbacks first so they
+            # can route to Codex instead of looping back into Bedrock.
             fb_client, fb_model, fb_label = (None, None, "")
-            if is_auto:
+            if is_auto and not auth_fallback_allowed:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason)
                 if fb_client is None:
@@ -7162,10 +7191,10 @@ async def async_call_llm(
                         resolved_provider, task, reason=reason)
             else:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason)
+                    task, fallback_failed_provider, reason=reason)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
-                        resolved_provider, task, reason=reason)
+                        fallback_failed_provider, task, reason=reason)
 
             if fb_client is not None:
                 fb_kwargs = _build_call_kwargs(

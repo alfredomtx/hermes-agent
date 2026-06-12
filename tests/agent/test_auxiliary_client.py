@@ -3202,14 +3202,14 @@ class TestVisionBedrockAuthFallback:
         exc = Exception("Error when retrieving token from sso: Token has expired and refresh failed")
         assert _is_auth_error(exc)
 
-    def test_bedrock_sso_auth_fallback_stays_vision_only(self):
+    def test_bedrock_sso_auth_fallback_allowed_for_vision_and_compression(self):
         from agent.auxiliary_client import _should_fallback_on_auth_error
 
         exc = Exception("Error when retrieving token from sso: Token has expired and refresh failed")
         base_url = "https://bedrock-runtime.ca-central-1.amazonaws.com"
 
         assert _should_fallback_on_auth_error("vision", "bedrock", base_url, exc) is True
-        assert _should_fallback_on_auth_error("compression", "bedrock", base_url, exc) is False
+        assert _should_fallback_on_auth_error("compression", "bedrock", base_url, exc) is True
         assert _should_fallback_on_auth_error("web_extract", "bedrock", base_url, exc) is False
         assert _should_fallback_on_auth_error("title_generation", "bedrock", base_url, exc) is False
 
@@ -3542,6 +3542,40 @@ class TestAuxiliaryAuthRefreshRetry:
         mock_run.assert_called_once()
         mock_fallback.assert_not_called()
 
+    def test_call_llm_falls_back_to_codex_when_auto_bedrock_sso_login_fails_for_compression(self, monkeypatch):
+        sso_error = Exception("Error when retrieving token from sso: Token has expired and refresh failed")
+        stale_client = MagicMock()
+        stale_client.base_url = "https://bedrock-runtime.ca-central-1.amazonaws.com"
+        stale_client.chat.completions.create.side_effect = sso_error
+
+        fallback_client = MagicMock()
+        fallback_client.base_url = "https://chatgpt.com/backend-api/codex"
+        fallback_client.chat.completions.create.return_value = _DummyResponse("auto fallback compression ok")
+        monkeypatch.setenv("AWS_PROFILE", "as24-bedrock-readonly")
+
+        with (
+            patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("auto", None, None, None, None)),
+            patch("agent.auxiliary_client._get_cached_client", return_value=(stale_client, "us.anthropic.claude-opus-4-8")),
+            patch("agent.auxiliary_client._bedrock_sso_login_cooldown_until", {}),
+            patch("agent.auxiliary_client._bedrock_sso_login_success_until", {}),
+            patch("subprocess.run", return_value=SimpleNamespace(returncode=255, stdout="", stderr="login timed out")) as mock_run,
+            patch("agent.auxiliary_client._try_configured_fallback_chain", return_value=(fallback_client, "gpt-5.5", "fallback_chain[0](openai-codex)")) as mock_fallback,
+            patch("agent.auxiliary_client._try_payment_fallback") as mock_payment_fallback,
+            patch("agent.auxiliary_client._try_main_agent_model_fallback") as mock_main_fallback,
+        ):
+            resp = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                main_runtime={"provider": "bedrock", "base_url": "https://bedrock-runtime.ca-central-1.amazonaws.com"},
+            )
+
+        assert resp.choices[0].message.content == "auto fallback compression ok"
+        mock_run.assert_called_once()
+        mock_fallback.assert_called_once_with("compression", "bedrock", reason="auth error")
+        mock_payment_fallback.assert_not_called()
+        mock_main_fallback.assert_not_called()
+        fallback_client.chat.completions.create.assert_called_once()
+
     def test_call_llm_runs_bedrock_sso_login_and_retries_compression(self, monkeypatch):
         sso_error = Exception("Error when retrieving token from sso: Token has expired and refresh failed")
         stale_client = MagicMock()
@@ -3574,7 +3608,7 @@ class TestAuxiliaryAuthRefreshRetry:
         mock_run.assert_called_once()
         mock_fallback.assert_not_called()
 
-    def test_call_llm_preserves_bedrock_sso_error_when_login_fails_for_compression(self, monkeypatch):
+    def test_call_llm_falls_back_to_codex_when_bedrock_sso_login_fails_for_compression(self, monkeypatch):
         sso_error = Exception("Error when retrieving token from sso: Token has expired and refresh failed")
         stale_client = MagicMock()
         stale_client.base_url = "https://bedrock-runtime.ca-central-1.amazonaws.com"
@@ -3583,7 +3617,7 @@ class TestAuxiliaryAuthRefreshRetry:
 
         fallback_client = MagicMock()
         fallback_client.base_url = "https://chatgpt.com/backend-api/codex"
-        fallback_client.chat.completions.create.return_value = _DummyResponse("fallback should not run")
+        fallback_client.chat.completions.create.return_value = _DummyResponse("fallback compression ok")
 
         with (
             patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("bedrock", "us.anthropic.claude-opus-4-8", None, None, None)),
@@ -3594,19 +3628,57 @@ class TestAuxiliaryAuthRefreshRetry:
             patch("agent.auxiliary_client._try_configured_fallback_chain", return_value=(fallback_client, "gpt-5.5", "fallback_chain[0](openai-codex)")) as mock_fallback,
             patch("agent.auxiliary_client._try_main_agent_model_fallback") as mock_main_fallback,
         ):
-            with pytest.raises(Exception) as exc_info:
-                call_llm(
-                    task="compression",
-                    provider="bedrock",
-                    model="us.anthropic.claude-opus-4-8",
-                    messages=[{"role": "user", "content": "summarize"}],
-                )
+            resp = call_llm(
+                task="compression",
+                provider="bedrock",
+                model="us.anthropic.claude-opus-4-8",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
 
-        assert exc_info.value is sso_error
+        assert resp.choices[0].message.content == "fallback compression ok"
         mock_run.assert_called_once()
-        mock_fallback.assert_not_called()
+        mock_fallback.assert_called_once_with("compression", "bedrock", reason="auth error")
         mock_main_fallback.assert_not_called()
-        fallback_client.chat.completions.create.assert_not_called()
+        fallback_client.chat.completions.create.assert_called_once()
+
+    def test_call_llm_falls_back_to_codex_when_bedrock_retry_after_sso_still_fails_for_compression(self, monkeypatch):
+        sso_error = Exception("Error when retrieving token from sso: Token has expired and refresh failed")
+        stale_client = MagicMock()
+        stale_client.base_url = "https://bedrock-runtime.ca-central-1.amazonaws.com"
+        stale_client.chat.completions.create.side_effect = sso_error
+
+        retry_client = MagicMock()
+        retry_client.base_url = "https://bedrock-runtime.ca-central-1.amazonaws.com"
+        retry_client.chat.completions.create.side_effect = sso_error
+
+        fallback_client = MagicMock()
+        fallback_client.base_url = "https://chatgpt.com/backend-api/codex"
+        fallback_client.chat.completions.create.return_value = _DummyResponse("fallback after retry ok")
+        monkeypatch.setenv("AWS_PROFILE", "as24-bedrock-readonly")
+
+        with (
+            patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("bedrock", "us.anthropic.claude-opus-4-8", None, None, None)),
+            patch("agent.auxiliary_client._get_cached_client", side_effect=[(stale_client, "us.anthropic.claude-opus-4-8"), (retry_client, "us.anthropic.claude-opus-4-8")]),
+            patch("agent.auxiliary_client._bedrock_sso_login_cooldown_until", {}),
+            patch("agent.auxiliary_client._bedrock_sso_login_success_until", {}),
+            patch("subprocess.run", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")) as mock_run,
+            patch("agent.auxiliary_client._try_configured_fallback_chain", return_value=(fallback_client, "gpt-5.5", "fallback_chain[0](openai-codex)")) as mock_fallback,
+            patch("agent.auxiliary_client._try_main_agent_model_fallback") as mock_main_fallback,
+        ):
+            resp = call_llm(
+                task="compression",
+                provider="bedrock",
+                model="us.anthropic.claude-opus-4-8",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert resp.choices[0].message.content == "fallback after retry ok"
+        assert stale_client.chat.completions.create.call_count == 1
+        assert retry_client.chat.completions.create.call_count == 1
+        mock_run.assert_called_once()
+        mock_fallback.assert_called_once_with("compression", "bedrock", reason="auth error")
+        mock_main_fallback.assert_not_called()
+        fallback_client.chat.completions.create.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_async_call_llm_refreshes_anthropic_on_401_for_non_vision(self):
