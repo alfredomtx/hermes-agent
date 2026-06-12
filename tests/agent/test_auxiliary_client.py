@@ -3202,6 +3202,17 @@ class TestVisionBedrockAuthFallback:
         exc = Exception("Error when retrieving token from sso: Token has expired and refresh failed")
         assert _is_auth_error(exc)
 
+    def test_bedrock_sso_auth_fallback_stays_vision_only(self):
+        from agent.auxiliary_client import _should_fallback_on_auth_error
+
+        exc = Exception("Error when retrieving token from sso: Token has expired and refresh failed")
+        base_url = "https://bedrock-runtime.ca-central-1.amazonaws.com"
+
+        assert _should_fallback_on_auth_error("vision", "bedrock", base_url, exc) is True
+        assert _should_fallback_on_auth_error("compression", "bedrock", base_url, exc) is False
+        assert _should_fallback_on_auth_error("web_extract", "bedrock", base_url, exc) is False
+        assert _should_fallback_on_auth_error("title_generation", "bedrock", base_url, exc) is False
+
     def test_global_fallback_chain_available_to_auxiliary_vision(self):
         fallback_client = MagicMock()
 
@@ -3240,6 +3251,7 @@ class TestVisionBedrockAuthFallback:
                   return_value=("bedrock", primary_client, "us.anthropic.claude-opus-4-8")),
             patch("agent.auxiliary_client._try_configured_fallback_chain",
                   return_value=(fallback_client, "gpt-5.5", "fallback_chain[0](openai-codex)")),
+            patch("agent.auxiliary_client._refresh_provider_credentials", return_value=False) as mock_refresh,
             patch("agent.auxiliary_client._try_main_agent_model_fallback") as main_fallback,
         ):
             resp = call_llm(
@@ -3248,6 +3260,7 @@ class TestVisionBedrockAuthFallback:
             )
 
         assert resp.choices[0].message.content == "codex vision ok"
+        mock_refresh.assert_called_once_with("bedrock")
         fallback_client.chat.completions.create.assert_called_once()
         main_fallback.assert_not_called()
 
@@ -3409,6 +3422,191 @@ class TestAuxiliaryAuthRefreshRetry:
         mock_refresh_oauth.assert_called_once_with("refresh-token", use_json=False)
         mock_write.assert_called_once_with("fresh-token", "refresh-token-2", 9999999999999)
         stale_client.close.assert_called_once()
+
+    def test_refresh_provider_credentials_runs_browser_aws_sso_login_for_bedrock(self, monkeypatch):
+        stale_client = MagicMock()
+        cache_key = ("bedrock", False, None, None, None)
+        monkeypatch.setenv("AWS_PROFILE", "as24-bedrock-readonly")
+
+        with (
+            patch("agent.auxiliary_client._client_cache", {cache_key: (stale_client, "us.anthropic.claude-opus-4-8", None)}),
+            patch("agent.auxiliary_client._bedrock_sso_login_cooldown_until", {}),
+            patch("agent.auxiliary_client._bedrock_sso_login_success_until", {}),
+            patch("subprocess.run", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")) as mock_run,
+        ):
+            from agent.auxiliary_client import _refresh_provider_credentials
+
+            assert _refresh_provider_credentials("bedrock") is True
+
+        mock_run.assert_called_once()
+        assert mock_run.call_args.args[0] == [
+            "aws", "sso", "login", "--profile", "as24-bedrock-readonly",
+        ]
+        assert mock_run.call_args.kwargs["timeout"] == 180
+        stale_client.close.assert_called_once()
+
+    def test_refresh_provider_credentials_evicts_auto_cached_bedrock_clients(self, monkeypatch):
+        stale_client = MagicMock()
+        stale_client.base_url = "https://bedrock-runtime.ca-central-1.amazonaws.com"
+        runtime_key = (
+            "bedrock",
+            "us.anthropic.claude-opus-4-8",
+            "https://bedrock-runtime.ca-central-1.amazonaws.com",
+            "aws-sdk",
+            "anthropic_messages",
+            "",
+        )
+        auto_cache_key = ("auto", False, "", "", "", runtime_key, False, "")
+        monkeypatch.setenv("AWS_PROFILE", "as24-bedrock-readonly")
+
+        with (
+            patch("agent.auxiliary_client._client_cache", {auto_cache_key: (stale_client, "us.anthropic.claude-opus-4-8", None)}),
+            patch("agent.auxiliary_client._bedrock_sso_login_cooldown_until", {}),
+            patch("agent.auxiliary_client._bedrock_sso_login_success_until", {}),
+            patch("subprocess.run", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")),
+        ):
+            from agent.auxiliary_client import _client_cache, _refresh_provider_credentials
+
+            assert _refresh_provider_credentials("bedrock") is True
+            assert auto_cache_key not in _client_cache
+
+        stale_client.close.assert_called_once()
+
+    def test_refresh_provider_credentials_does_not_run_bedrock_sso_without_known_profile(self, monkeypatch):
+        monkeypatch.delenv("AWS_PROFILE", raising=False)
+        monkeypatch.delenv("AWS_DEFAULT_PROFILE", raising=False)
+        monkeypatch.delenv("AWS_CONFIG_FILE", raising=False)
+
+        with patch("subprocess.run") as mock_run:
+            from agent.auxiliary_client import _refresh_provider_credentials
+
+            assert _refresh_provider_credentials("bedrock") is False
+
+        mock_run.assert_not_called()
+
+    def test_refresh_provider_credentials_throttles_repeated_bedrock_sso_failures(self, monkeypatch):
+        monkeypatch.setenv("AWS_PROFILE", "cooldown-profile")
+
+        with (
+            patch("agent.auxiliary_client._bedrock_sso_login_cooldown_until", {}),
+            patch("subprocess.run", return_value=SimpleNamespace(returncode=255, stdout="", stderr="login failed")) as mock_run,
+        ):
+            from agent.auxiliary_client import _refresh_provider_credentials
+
+            assert _refresh_provider_credentials("bedrock") is False
+            assert _refresh_provider_credentials("bedrock") is False
+
+        mock_run.assert_called_once()
+
+    def test_refresh_provider_credentials_coalesces_recent_successful_bedrock_sso_login(self, monkeypatch):
+        monkeypatch.setenv("AWS_PROFILE", "coalesce-profile")
+
+        with (
+            patch("agent.auxiliary_client._bedrock_sso_login_cooldown_until", {}),
+            patch("agent.auxiliary_client._bedrock_sso_login_success_until", {}),
+            patch("subprocess.run", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")) as mock_run,
+        ):
+            from agent.auxiliary_client import _refresh_provider_credentials
+
+            assert _refresh_provider_credentials("bedrock") is True
+            assert _refresh_provider_credentials("bedrock") is True
+
+        mock_run.assert_called_once()
+
+    def test_call_llm_runs_bedrock_sso_login_for_auto_compression_on_bedrock(self, monkeypatch):
+        sso_error = Exception("Error when retrieving token from sso: Token has expired and refresh failed")
+        stale_client = MagicMock()
+        stale_client.base_url = "https://bedrock-runtime.ca-central-1.amazonaws.com"
+        stale_client.chat.completions.create.side_effect = sso_error
+
+        fresh_client = MagicMock()
+        fresh_client.base_url = "https://bedrock-runtime.ca-central-1.amazonaws.com"
+        fresh_client.chat.completions.create.return_value = _DummyResponse("fresh-auto-bedrock")
+        monkeypatch.setenv("AWS_PROFILE", "as24-bedrock-readonly")
+
+        with (
+            patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("auto", None, None, None, None)),
+            patch("agent.auxiliary_client._get_cached_client", side_effect=[(stale_client, "us.anthropic.claude-opus-4-8"), (fresh_client, "us.anthropic.claude-opus-4-8")]),
+            patch("agent.auxiliary_client._bedrock_sso_login_cooldown_until", {}),
+            patch("agent.auxiliary_client._bedrock_sso_login_success_until", {}),
+            patch("subprocess.run", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")) as mock_run,
+            patch("agent.auxiliary_client._try_configured_fallback_chain") as mock_fallback,
+        ):
+            resp = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                main_runtime={"provider": "bedrock", "base_url": "https://bedrock-runtime.ca-central-1.amazonaws.com"},
+            )
+
+        assert resp.choices[0].message.content == "fresh-auto-bedrock"
+        mock_run.assert_called_once()
+        mock_fallback.assert_not_called()
+
+    def test_call_llm_runs_bedrock_sso_login_and_retries_compression(self, monkeypatch):
+        sso_error = Exception("Error when retrieving token from sso: Token has expired and refresh failed")
+        stale_client = MagicMock()
+        stale_client.base_url = "https://bedrock-runtime.ca-central-1.amazonaws.com"
+        stale_client.chat.completions.create.side_effect = sso_error
+
+        fresh_client = MagicMock()
+        fresh_client.base_url = "https://bedrock-runtime.ca-central-1.amazonaws.com"
+        fresh_client.chat.completions.create.return_value = _DummyResponse("fresh-bedrock")
+        monkeypatch.setenv("AWS_PROFILE", "as24-bedrock-readonly")
+
+        with (
+            patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("bedrock", "us.anthropic.claude-opus-4-8", None, None, None)),
+            patch("agent.auxiliary_client._get_cached_client", side_effect=[(stale_client, "us.anthropic.claude-opus-4-8"), (fresh_client, "us.anthropic.claude-opus-4-8")]),
+            patch("agent.auxiliary_client._bedrock_sso_login_cooldown_until", {}),
+            patch("agent.auxiliary_client._bedrock_sso_login_success_until", {}),
+            patch("subprocess.run", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")) as mock_run,
+            patch("agent.auxiliary_client._try_configured_fallback_chain") as mock_fallback,
+        ):
+            resp = call_llm(
+                task="compression",
+                provider="bedrock",
+                model="us.anthropic.claude-opus-4-8",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert resp.choices[0].message.content == "fresh-bedrock"
+        assert stale_client.chat.completions.create.call_count == 1
+        assert fresh_client.chat.completions.create.call_count == 1
+        mock_run.assert_called_once()
+        mock_fallback.assert_not_called()
+
+    def test_call_llm_preserves_bedrock_sso_error_when_login_fails_for_compression(self, monkeypatch):
+        sso_error = Exception("Error when retrieving token from sso: Token has expired and refresh failed")
+        stale_client = MagicMock()
+        stale_client.base_url = "https://bedrock-runtime.ca-central-1.amazonaws.com"
+        stale_client.chat.completions.create.side_effect = sso_error
+        monkeypatch.setenv("AWS_PROFILE", "as24-bedrock-readonly")
+
+        fallback_client = MagicMock()
+        fallback_client.base_url = "https://chatgpt.com/backend-api/codex"
+        fallback_client.chat.completions.create.return_value = _DummyResponse("fallback should not run")
+
+        with (
+            patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("bedrock", "us.anthropic.claude-opus-4-8", None, None, None)),
+            patch("agent.auxiliary_client._get_cached_client", return_value=(stale_client, "us.anthropic.claude-opus-4-8")),
+            patch("agent.auxiliary_client._bedrock_sso_login_cooldown_until", {}),
+            patch("agent.auxiliary_client._bedrock_sso_login_success_until", {}),
+            patch("subprocess.run", return_value=SimpleNamespace(returncode=255, stdout="", stderr="login timed out")) as mock_run,
+            patch("agent.auxiliary_client._try_configured_fallback_chain", return_value=(fallback_client, "gpt-5.5", "fallback_chain[0](openai-codex)")) as mock_fallback,
+            patch("agent.auxiliary_client._try_main_agent_model_fallback") as mock_main_fallback,
+        ):
+            with pytest.raises(Exception) as exc_info:
+                call_llm(
+                    task="compression",
+                    provider="bedrock",
+                    model="us.anthropic.claude-opus-4-8",
+                    messages=[{"role": "user", "content": "summarize"}],
+                )
+
+        assert exc_info.value is sso_error
+        mock_run.assert_called_once()
+        mock_fallback.assert_not_called()
+        mock_main_fallback.assert_not_called()
+        fallback_client.chat.completions.create.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_async_call_llm_refreshes_anthropic_on_401_for_non_vision(self):
