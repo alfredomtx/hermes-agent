@@ -43,6 +43,7 @@ Payment / credit exhaustion fallback:
 import json
 import logging
 import os
+import subprocess
 import threading
 import time
 from pathlib import Path  # noqa: F401 — used by test mocks
@@ -498,6 +499,123 @@ _AUTH_JSON_PATH = get_hermes_home() / "auth.json"
 # they want explicitly (from config.yaml model.model, auxiliary.<task>.model,
 # or the user's active Codex model selection).
 _CODEX_AUX_BASE_URL = "https://chatgpt.com/backend-api/codex"
+
+# Bedrock uses AWS Identity Center/SSO. When botocore reports an expired SSO
+# refresh token, the only real recovery is a fresh `aws sso login` browser flow.
+# Keep this bounded and serialized per configured AWS profile so concurrent aux
+# calls do not spawn a pile of browser tabs.
+_BEDROCK_SSO_LOGIN_LOCKS: Dict[str, threading.Lock] = {}
+_BEDROCK_SSO_LOGIN_LOCKS_GUARD = threading.Lock()
+_BEDROCK_SSO_LOGIN_TIMEOUT_SECONDS = 180
+_BEDROCK_SSO_LOGIN_FAILURE_COOLDOWN_SECONDS = 60
+_BEDROCK_SSO_LOGIN_SUCCESS_COALESCE_SECONDS = 60
+_bedrock_sso_login_cooldown_until: Dict[str, float] = {}
+_bedrock_sso_login_success_until: Dict[str, float] = {}
+
+
+def _bedrock_sso_login_profile() -> str:
+    """Return the AWS profile Hermes is allowed to refresh for Bedrock SSO."""
+    return (os.getenv("AWS_PROFILE") or os.getenv("AWS_DEFAULT_PROFILE") or "").strip()
+
+
+def _bedrock_sso_login_command() -> Optional[List[str]]:
+    profile = _bedrock_sso_login_profile()
+    if not profile:
+        return None
+    return ["aws", "sso", "login", "--profile", profile]
+
+
+def _bedrock_sso_login_lock(lock_key: str) -> threading.Lock:
+    with _BEDROCK_SSO_LOGIN_LOCKS_GUARD:
+        lock = _BEDROCK_SSO_LOGIN_LOCKS.get(lock_key)
+        if lock is None:
+            lock = threading.Lock()
+            _BEDROCK_SSO_LOGIN_LOCKS[lock_key] = lock
+        return lock
+
+
+def _refresh_bedrock_sso_credentials() -> bool:
+    """Run one browser-based AWS SSO login for Bedrock and report success."""
+    cmd = _bedrock_sso_login_command()
+    if not cmd:
+        logger.warning(
+            "Auxiliary Bedrock SSO login skipped: AWS_PROFILE/AWS_DEFAULT_PROFILE is not set"
+        )
+        return False
+
+    profile = cmd[cmd.index("--profile") + 1] if "--profile" in cmd else "default"
+    lock_key = f"profile:{profile}"
+
+    now = time.monotonic()
+    success_until = _bedrock_sso_login_success_until.get(lock_key, 0.0)
+    if now < success_until:
+        logger.info(
+            "Auxiliary Bedrock SSO login skipped for %s: recent login already completed",
+            profile,
+        )
+        return True
+    cooldown_until = _bedrock_sso_login_cooldown_until.get(lock_key, 0.0)
+    if now < cooldown_until:
+        logger.info(
+            "Auxiliary Bedrock SSO login skipped for %s: previous login attempt failed %.0fs ago",
+            profile,
+            _BEDROCK_SSO_LOGIN_FAILURE_COOLDOWN_SECONDS - (cooldown_until - now),
+        )
+        return False
+
+    with _bedrock_sso_login_lock(lock_key):
+        now = time.monotonic()
+        success_until = _bedrock_sso_login_success_until.get(lock_key, 0.0)
+        if now < success_until:
+            return True
+        cooldown_until = _bedrock_sso_login_cooldown_until.get(lock_key, 0.0)
+        if now < cooldown_until:
+            return False
+
+        logger.warning(
+            "Auxiliary Bedrock auth expired; running `%s` before retrying",
+            " ".join(cmd),
+        )
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=_BEDROCK_SSO_LOGIN_TIMEOUT_SECONDS,
+            )
+        except FileNotFoundError:
+            logger.warning("Auxiliary Bedrock SSO login failed: aws CLI not found")
+            _bedrock_sso_login_success_until.pop(lock_key, None)
+            _bedrock_sso_login_cooldown_until[lock_key] = time.monotonic() + _BEDROCK_SSO_LOGIN_FAILURE_COOLDOWN_SECONDS
+            return False
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "Auxiliary Bedrock SSO login timed out after %ss",
+                _BEDROCK_SSO_LOGIN_TIMEOUT_SECONDS,
+            )
+            _bedrock_sso_login_success_until.pop(lock_key, None)
+            _bedrock_sso_login_cooldown_until[lock_key] = time.monotonic() + _BEDROCK_SSO_LOGIN_FAILURE_COOLDOWN_SECONDS
+            return False
+        except Exception as exc:
+            logger.warning("Auxiliary Bedrock SSO login failed: %s", exc)
+            _bedrock_sso_login_success_until.pop(lock_key, None)
+            _bedrock_sso_login_cooldown_until[lock_key] = time.monotonic() + _BEDROCK_SSO_LOGIN_FAILURE_COOLDOWN_SECONDS
+            return False
+
+        if result.returncode == 0:
+            _bedrock_sso_login_cooldown_until.pop(lock_key, None)
+            _bedrock_sso_login_success_until[lock_key] = time.monotonic() + _BEDROCK_SSO_LOGIN_SUCCESS_COALESCE_SECONDS
+            return True
+
+        err = (result.stderr or result.stdout or "").strip()
+        logger.warning(
+            "Auxiliary Bedrock SSO login exited with code %s%s",
+            result.returncode,
+            f": {err[:300]}" if err else "",
+        )
+        _bedrock_sso_login_success_until.pop(lock_key, None)
+        _bedrock_sso_login_cooldown_until[lock_key] = time.monotonic() + _BEDROCK_SSO_LOGIN_FAILURE_COOLDOWN_SECONDS
+        return False
 
 
 def _codex_cloudflare_headers(access_token: str) -> Dict[str, str]:
@@ -2637,10 +2755,29 @@ def _is_model_not_found_error(exc: Exception) -> bool:
 def _evict_cached_clients(provider: str) -> None:
     """Drop cached auxiliary clients for a provider so fresh creds are used."""
     normalized = _normalize_aux_provider(provider)
+
+    def _cache_key_matches_provider(key: tuple, client: Any) -> bool:
+        key_provider = _normalize_aux_provider(str(key[0])) if key else ""
+        if key_provider == normalized:
+            return True
+        if normalized != "bedrock":
+            return False
+        # Auto-routed Bedrock auxiliary clients are cached under provider
+        # "auto" with the real provider only visible in the runtime-key tuple,
+        # so evict them too after AWS SSO refresh.
+        runtime_key = key[5] if len(key) > 5 and isinstance(key[5], tuple) else ()
+        if runtime_key and _normalize_aux_provider(str(runtime_key[0])) == "bedrock":
+            return True
+        for obj in (client, getattr(client, "_real_client", None), getattr(client, "_client", None), getattr(client, "client", None)):
+            base = str(getattr(obj, "base_url", "") or "")
+            if "bedrock-runtime." in base and ".amazonaws.com" in base:
+                return True
+        return False
+
     with _client_cache_lock:
         stale_keys = [
-            key for key in _client_cache
-            if _normalize_aux_provider(str(key[0])) == normalized
+            key for key, entry in _client_cache.items()
+            if _cache_key_matches_provider(key, entry[0] if entry else None)
         ]
         for key in stale_keys:
             client = _client_cache.get(key, (None, None, None))[0]
@@ -2729,6 +2866,8 @@ def _recoverable_pool_provider(
     if normalized not in {"", "auto", "custom"}:
         return normalized
     base = str(getattr(client, "base_url", "") or "")
+    if "bedrock-runtime." in base and ".amazonaws.com" in base:
+        return "bedrock"
     if base_url_host_matches(base, "chatgpt.com"):
         return "openai-codex"
     if base_url_host_matches(base, "openrouter.ai"):
@@ -2935,6 +3074,11 @@ def _refresh_provider_credentials(provider: str) -> bool:
 
             creds = resolve_codex_runtime_credentials(force_refresh=True)
             if not str(creds.get("api_key", "") or "").strip():
+                return False
+            _evict_cached_clients(normalized)
+            return True
+        if normalized == "bedrock":
+            if not _refresh_bedrock_sso_credentials():
                 return False
             _evict_cached_clients(normalized)
             return True
@@ -5531,13 +5675,16 @@ def call_llm(
                     refreshed_client.chat.completions.create(**kwargs), task)
 
         # ── Auth refresh retry ───────────────────────────────────────
+        auth_refresh_provider = _recoverable_pool_provider(
+            resolved_provider, client, main_runtime=main_runtime,
+        ) or resolved_provider
         if (_is_auth_error(first_err)
-                and resolved_provider not in {"auto", "", None}
+                and auth_refresh_provider not in {"auto", "", None}
                 and not client_is_nous):
-            if _refresh_provider_credentials(resolved_provider):
+            if _refresh_provider_credentials(auth_refresh_provider):
                 logger.info(
                     "Auxiliary %s: refreshed %s credentials after auth error, retrying",
-                    task or "call", resolved_provider,
+                    task or "call", auth_refresh_provider,
                 )
                 return _retry_same_provider_sync(
                     task=task,
@@ -6024,13 +6171,16 @@ async def async_call_llm(
                     await refreshed_client.chat.completions.create(**kwargs), task)
 
         # ── Auth refresh retry (mirrors sync call_llm) ───────────────
+        auth_refresh_provider = _recoverable_pool_provider(
+            resolved_provider, client, main_runtime=main_runtime,
+        ) or resolved_provider
         if (_is_auth_error(first_err)
-                and resolved_provider not in {"auto", "", None}
+                and auth_refresh_provider not in {"auto", "", None}
                 and not client_is_nous):
-            if _refresh_provider_credentials(resolved_provider):
+            if _refresh_provider_credentials(auth_refresh_provider):
                 logger.info(
                     "Auxiliary %s (async): refreshed %s credentials after auth error, retrying",
-                    task or "call", resolved_provider,
+                    task or "call", auth_refresh_provider,
                 )
                 return await _retry_same_provider_async(
                     task=task,
