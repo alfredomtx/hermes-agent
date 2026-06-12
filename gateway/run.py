@@ -16614,6 +16614,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             except Exception:
                 _show_delegate_args = False
+            if tool_name == "todo":
+                try:
+                    from gateway.todo_progress import format_todo_progress
+
+                    _todo_card = format_todo_progress(args)
+                except Exception:
+                    _todo_card = None
+                if _todo_card:
+                    last_was_terminal_block[0] = False
+                    progress_queue.put(_todo_card)
+                    return
+
             if tool_name == "delegate_task" and _show_delegate_args:
                 last_was_terminal_block[0] = False
                 for _card in _format_delegate_task_args_progress(args):
