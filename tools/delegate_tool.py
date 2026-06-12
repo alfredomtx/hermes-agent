@@ -3089,8 +3089,9 @@ def _build_top_level_description() -> str:
         "IMPORTANT:\n"
         "- Use the 'profile' parameter when delegation.profiles defines a better lane "
         "for the task class (e.g. file-explorer for repo/file discovery, "
-        "scope-auditor for scope/spec alignment, or dual-review for "
-        "high-reasoning review). dual-review expands to reviewer-codex + "
+        "jira-auditor for Jira/ticket scope checks, deep-reviewer for "
+        "deep-review artifact lanes, or dual-review for high-reasoning review). "
+        "dual-review expands to reviewer-codex + "
         "reviewer-opus internally so both models run and counts as two child "
         "tasks for max_concurrent_children. Per-task profile beats "
         "the top-level profile.\n"
@@ -3248,7 +3249,8 @@ DELEGATE_TASK_SCHEMA = {
                 "description": (
                     "Optional delegation profile from config.yaml delegation.profiles. "
                     "Use profiles to route task classes to the right model/reasoning/tool policy "
-                    "(e.g. file-explorer for file/repo discovery; scope-auditor for scope/spec alignment; "
+                    "(e.g. file-explorer for file/repo discovery; jira-auditor for Jira/ticket scope checks; "
+                    "deep-reviewer for deep-review artifact lanes; "
                     "dual-review for enforced reviewer-codex + reviewer-opus review; "
                     "dual-review counts as two child tasks). "
                     "Per-task profile overrides this top-level value."
@@ -3271,7 +3273,7 @@ DELEGATE_TASK_SCHEMA = {
                         },
                         "profile": {
                             "type": "string",
-                            "description": "Per-task delegation profile override (e.g. file-explorer, scope-auditor, dual-review, coder).",
+                            "description": "Per-task delegation profile override (e.g. file-explorer, jira-auditor, deep-reviewer, dual-review, coder).",
                         },
                         "acp_command": {
                             "type": "string",
