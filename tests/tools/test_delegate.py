@@ -599,6 +599,60 @@ class TestDelegateTask(unittest.TestCase):
         )
         self.assertEqual(MockAgent.call_count, 2)
 
+    def test_dual_review_injects_assigned_lane_into_child_prompt(self):
+        parent = _make_mock_parent(depth=0)
+        cfg = {
+            "max_iterations": 50,
+            "max_concurrent_children": 4,
+            "require_dual_review": True,
+            "profiles": {
+                "reviewer-codex": {"provider": "openai-codex", "model": "gpt-5.5"},
+                "reviewer-opus": {"provider": "bedrock", "model": "us.anthropic.claude-opus-4-8"},
+            },
+        }
+
+        def fake_creds(profile_cfg, _parent):
+            return {
+                "model": profile_cfg.get("model"),
+                "provider": profile_cfg.get("provider"),
+                "base_url": None,
+                "api_key": None,
+                "api_mode": None,
+                "command": None,
+                "args": [],
+            }
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value=cfg),
+            patch("tools.delegate_tool._resolve_delegation_credentials", side_effect=fake_creds),
+            patch("run_agent.AIAgent") as MockAgent,
+        ):
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "review done",
+                "completed": True,
+                "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(
+                goal="Review diff",
+                context=(
+                    "Write reviewer-codex output to findings/logic.reviewer-codex.md "
+                    "and reviewer-opus output to findings/logic.reviewer-opus.md."
+                ),
+                profile="dual-review",
+                parent_agent=parent,
+            )
+
+        prompts = [call.kwargs["ephemeral_system_prompt"] for call in MockAgent.call_args_list]
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("DUAL-REVIEW LANE", prompts[0])
+        self.assertIn("Your assigned reviewer lane is `reviewer-codex`", prompts[0])
+        self.assertIn("findings/logic.reviewer-codex.md", prompts[0])
+        self.assertIn("Your assigned reviewer lane is `reviewer-opus`", prompts[1])
+        self.assertIn("findings/logic.reviewer-opus.md", prompts[1])
+
     def test_dual_review_profile_expands_batch_task_override(self):
         parent = _make_mock_parent(depth=0)
         cfg = {

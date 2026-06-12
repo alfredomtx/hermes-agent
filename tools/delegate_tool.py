@@ -551,6 +551,33 @@ def _requires_dual_review(cfg: Optional[dict]) -> bool:
     return is_truthy_value((cfg or {}).get("require_dual_review"), default=False)
 
 
+def _task_with_dual_review_lane_context(task: Dict[str, Any], reviewer_profile: str) -> Dict[str, Any]:
+    """Clone a dual-review task and tell the child which reviewer lane it is.
+
+    Dual review expands one model-visible task into Codex + Opus children.  The
+    task text is otherwise identical, so artifact-writing workflows need a
+    grounded way for each child to select its own output path instead of racing
+    on a shared file.  This marker is also useful for normal review summaries.
+    """
+    cloned = dict(task)
+    cloned["profile"] = reviewer_profile
+    marker = (
+        "DUAL-REVIEW LANE:\n"
+        "- This task was expanded from profile='dual-review'.\n"
+        f"- Your assigned reviewer lane is `{reviewer_profile}`.\n"
+        "- If the task lists model-specific output paths, write only the path "
+        "for your assigned lane.\n"
+        "- Do not write a shared artifact path unless the task explicitly says "
+        "a shared write is safe."
+    )
+    context = cloned.get("context")
+    if isinstance(context, str) and context.strip():
+        cloned["context"] = f"{context.rstrip()}\n\n{marker}"
+    else:
+        cloned["context"] = marker
+    return cloned
+
+
 def _expand_dual_review_task_items(task_list: List[Dict[str, Any]], top_profile: Optional[str]) -> List[Dict[str, Any]]:
     """Expand the reserved dual-review pseudo-profile into both reviewer lanes.
 
@@ -575,8 +602,7 @@ def _expand_dual_review_task_items(task_list: List[Dict[str, Any]], top_profile:
         task_profile = _normalize_profile_name(task.get("profile") or top_profile)
         if _is_dual_review_profile(task_profile):
             for reviewer_profile in DUAL_REVIEWER_PROFILES:
-                cloned = dict(task)
-                cloned["profile"] = reviewer_profile
+                cloned = _task_with_dual_review_lane_context(task, reviewer_profile)
                 expanded.append(
                     {
                         "task": cloned,
@@ -3421,9 +3447,8 @@ def _build_top_level_description() -> str:
         "IMPORTANT:\n"
         "- Use the 'profile' parameter when delegation.profiles defines a better lane "
         "for the task class (e.g. file-explorer for repo/file discovery, "
-        "jira-auditor for Jira/ticket scope checks, deep-reviewer for "
-        "deep-review artifact lanes, or dual-review for high-reasoning review). "
-        "dual-review expands to reviewer-codex + "
+        "jira-auditor for Jira/ticket scope checks, or dual-review for any "
+        "review work). dual-review expands to reviewer-codex + "
         "reviewer-opus internally so both models run and counts as two child "
         "tasks for max_concurrent_children. Per-task profile beats "
         "the top-level profile.\n"
@@ -3613,7 +3638,6 @@ DELEGATE_TASK_SCHEMA = {
                     "Optional delegation profile from config.yaml delegation.profiles. "
                     "Use profiles to route task classes to the right model/reasoning/tool policy "
                     "(e.g. file-explorer for file/repo discovery; jira-auditor for Jira/ticket scope checks; "
-                    "deep-reviewer for deep-review artifact lanes; "
                     "dual-review for enforced reviewer-codex + reviewer-opus review; "
                     "dual-review counts as two child tasks). "
                     "Per-task profile overrides this top-level value."
@@ -3631,7 +3655,7 @@ DELEGATE_TASK_SCHEMA = {
                         },
                         "profile": {
                             "type": "string",
-                            "description": "Per-task delegation profile override (e.g. file-explorer, jira-auditor, deep-reviewer, dual-review, coder).",
+                            "description": "Per-task delegation profile override (e.g. file-explorer, jira-auditor, dual-review, coder).",
                         },
                         "acp_command": {
                             "type": "string",
