@@ -2087,6 +2087,16 @@ class BasePlatformAdapter(ABC):
         from agent.display import get_tool_emoji
         emoji = get_tool_emoji(event.tool_name, default="⚙️")
 
+        if event.tool_name == "todo":
+            try:
+                from gateway.todo_progress import format_todo_progress
+
+                todo_card = format_todo_progress(event.args)
+            except Exception:
+                todo_card = None
+            if todo_card:
+                return todo_card
+
         if mode == "verbose":
             if event.args:
                 import json
