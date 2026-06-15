@@ -2962,12 +2962,13 @@ def _should_fallback_on_auth_error(
 
     Most explicit auth failures should stay explicit: if a user asks for a
     provider with bad credentials, surfacing that error is usually correct.
-    Vision watchdogs and context compression are different: ``auto`` first
-    tries the main provider, and a stale AWS SSO token for Bedrock should not
-    make screenshot analysis or compression fail when the user has a configured
-    fallback provider such as OpenAI Codex.
+    Vision watchdogs, context compression, and web extraction are different:
+    ``auto`` first tries the main provider, and a stale AWS SSO token for
+    Bedrock should not make screenshot analysis, compression, or web-content
+    summarization fail when the user has a configured fallback provider such as
+    OpenAI Codex.
     """
-    if task not in {"vision", "compression"} or not _is_auth_error(exc):
+    if task not in {"vision", "compression", "web_extract"} or not _is_auth_error(exc):
         return False
     provider_l = (provider or "").strip().lower()
     base_l = (base_url or "").strip().lower()
@@ -3394,6 +3395,7 @@ async def _retry_same_provider_async(
     resolved_base_url: Optional[str],
     resolved_api_key: Optional[str],
     resolved_api_mode: Optional[str],
+    main_runtime: Optional[Dict[str, Any]],
     final_model: Optional[str],
     messages: list,
     temperature: Optional[float],
@@ -3418,6 +3420,7 @@ async def _retry_same_provider_async(
             base_url=resolved_base_url,
             api_key=resolved_api_key,
             api_mode=resolved_api_mode,
+            main_runtime=main_runtime,
         )
     if retry_client is None:
         raise RuntimeError(
@@ -6824,6 +6827,7 @@ async def async_call_llm(
             base_url=resolved_base_url,
             api_key=resolved_api_key,
             api_mode=resolved_api_mode,
+            main_runtime=main_runtime,
         )
         if client is None:
             _explicit = (resolved_provider or "").strip().lower()
@@ -7053,6 +7057,7 @@ async def async_call_llm(
                         resolved_base_url=resolved_base_url,
                         resolved_api_key=resolved_api_key,
                         resolved_api_mode=resolved_api_mode,
+                        main_runtime=main_runtime,
                         final_model=final_model,
                         messages=messages,
                         temperature=temperature,
@@ -7097,6 +7102,7 @@ async def async_call_llm(
                         resolved_base_url=resolved_base_url,
                         resolved_api_key=resolved_api_key,
                         resolved_api_mode=resolved_api_mode,
+                        main_runtime=main_runtime,
                         final_model=final_model,
                         messages=messages,
                         temperature=temperature,
