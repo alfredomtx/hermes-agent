@@ -17136,6 +17136,141 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _remap_pending_tool_lines(kept_offset)
                 return True
 
+            async def _close_bubble_preserving_inflight() -> None:
+                """Finalize the current progress bubble on a content __reset__,
+                but carry still-in-flight tool rows into a fresh bubble.
+
+                A ``__reset__`` fires when interim/streamed content lands as a
+                new platform message; the current progress bubble must close so
+                later tool rows render BELOW the content (linearization).  But
+                interim content is sent asynchronously, so its reset can arrive
+                AFTER a long-running tool's start row was recorded and BEFORE
+                its ``__tool_duration__`` — clearing the pending index would
+                strand the duration as a standalone ``✅ tool completed in Xs``
+                fallback line (the reported "second line" symptom) or drop it.
+
+                Split instead: flush the already-resolved rows into the now-
+                immutable bubble, then re-seed a fresh bubble with the rows whose
+                tool has started but not yet completed, remapping their pending
+                indexes so the inbound suffix still attaches inline.  When no
+                tool is in flight this degrades to the old flush-then-clear.
+                """
+                nonlocal progress_msg_id, progress_lines, can_edit
+                if not can_edit:
+                    progress_msg_id = None
+                    progress_lines = []
+                    _reset_pending_tool_lines()
+                    return
+
+                inflight_indexes = sorted({
+                    idx
+                    for idxs in pending_tool_line_indexes.values()
+                    for idx in idxs
+                    if 0 <= idx < len(progress_lines)
+                })
+                inflight_set = set(inflight_indexes)
+                resolved_lines = [
+                    line for i, line in enumerate(progress_lines) if i not in inflight_set
+                ]
+                carried_lines = [progress_lines[i] for i in inflight_indexes]
+
+                # Flush the resolved rows into the current (soon-immutable)
+                # bubble, splitting if they exceed the platform message limit.
+                if resolved_lines:
+                    groups = _split_progress_groups(resolved_lines)
+                    first_text = _progress_text(groups[0])
+                    if progress_msg_id is not None:
+                        try:
+                            await _edit_progress_message(progress_msg_id, first_text)
+                        except Exception:
+                            pass
+                    else:
+                        await _send_progress_text(first_text)
+                    for group in groups[1:]:
+                        await _send_progress_text(_progress_text(group))
+
+                # Re-seed a fresh bubble with the in-flight rows and rebase their
+                # pending indexes onto it.
+                old_to_new = {old: new for new, old in enumerate(inflight_indexes)}
+                for tool_name in list(pending_tool_line_indexes.keys()):
+                    remapped = [
+                        old_to_new[i]
+                        for i in pending_tool_line_indexes[tool_name]
+                        if i in old_to_new
+                    ]
+                    if remapped:
+                        pending_tool_line_indexes[tool_name] = remapped
+                    else:
+                        del pending_tool_line_indexes[tool_name]
+                progress_msg_id = None
+                progress_lines = carried_lines
+                last_progress_msg[0] = None
+                repeat_count[0] = 0
+
+            async def _drain_and_flush_progress() -> None:
+                """Drain any queued progress events, then publish the final
+                bubble.  Called on cancellation from EITHER the idle
+                ``queue.Empty`` sleep or a direct ``CancelledError`` so a
+                throttle-deferred completion-duration suffix (already applied to
+                ``progress_lines`` in memory but not yet sent) is never lost.
+                """
+                nonlocal progress_msg_id, progress_lines, can_edit
+                while not progress_queue.empty():
+                    try:
+                        raw = progress_queue.get_nowait()
+                        if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
+                            _, base_msg, count = raw
+                            if progress_lines:
+                                progress_lines[-1] = f"{base_msg} (×{count + 1})"
+                                await _roll_progress_overflow_if_needed()
+                        elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__tool_start__":
+                            _, started_tool_name, started_msg = raw
+                            progress_lines.append(str(started_msg))
+                            _record_pending_tool_line(started_tool_name, len(progress_lines) - 1)
+                            await _roll_progress_overflow_if_needed()
+                        elif isinstance(raw, tuple) and len(raw) == 4 and raw[0] == "__tool_duration__":
+                            _, completed_tool_name, duration, is_error = raw
+                            completed_index = _complete_pending_tool_line(
+                                completed_tool_name,
+                                duration,
+                                bool(is_error),
+                            )
+                            if completed_index is None:
+                                _append_fallback_completion_line(
+                                    completed_tool_name,
+                                    duration,
+                                    bool(is_error),
+                                )
+                            await _roll_progress_overflow_if_needed()
+                        elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
+                            # Content-bubble marker during drain: close off the
+                            # current bubble but carry in-flight tool rows so a
+                            # still-pending duration suffix lands inline (see
+                            # _close_bubble_preserving_inflight).
+                            await _close_bubble_preserving_inflight()
+                        else:
+                            progress_lines.append(str(raw))
+                            await _roll_progress_overflow_if_needed()
+                    except Exception:
+                        break
+                # Final flush with all remaining lines.  Cancellation can arrive
+                # while the first send is still being awaited, before
+                # ``progress_msg_id`` is recorded; in that race, send a
+                # consolidated bubble instead of dropping the final lines.
+                if can_edit and progress_lines:
+                    await _roll_progress_overflow_if_needed()
+                if can_edit and progress_lines:
+                    full_text = _progress_text(progress_lines)
+                    try:
+                        if progress_msg_id:
+                            await _edit_progress_message(progress_msg_id, full_text)
+                        else:
+                            result = await _send_progress_text(full_text)
+                            if result.success and result.message_id:
+                                progress_msg_id = result.message_id
+                    except Exception:
+                        pass
+
             while True:
                 try:
                     if not _run_still_current():
@@ -17200,28 +17335,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # on the content side. (Issue: tool + content
                         # linearization regression after PR #7885.)
                         #
-                        # Flush first: a just-applied completion-duration suffix
-                        # (``__tool_duration__`` mutates ``progress_lines`` in
-                        # place) may still be pending behind the edit throttle.
-                        # Abandoning the bubble without pushing it would strand
-                        # the stale start row on the platform with no "· 0.5s"
-                        # suffix — the exact symptom for the LAST tools before a
-                        # reply and any tool whose completion straddles interim
-                        # content. The drain-path __reset__ handler already does
-                        # this; keep the two in sync.
-                        if can_edit and progress_lines and progress_msg_id is not None:
-                            if not await _roll_progress_overflow_if_needed():
-                                _flush_text = _progress_text(progress_lines)
-                                try:
-                                    await _edit_progress_message(progress_msg_id, _flush_text)
-                                    _last_edit_ts = time.monotonic()
-                                except Exception:
-                                    pass
-                        progress_msg_id = None
-                        progress_lines = []
-                        _reset_pending_tool_lines()
-                        last_progress_msg[0] = None
-                        repeat_count[0] = 0
+                        # Preserve in-flight tools: interim content is sent
+                        # asynchronously, so its reset can land AFTER a long
+                        # tool's start row but BEFORE its __tool_duration__.
+                        # _close_bubble_preserving_inflight() flushes resolved
+                        # rows, then re-seeds a fresh bubble carrying any started-
+                        # but-not-completed rows so their inline "· Xs" suffix
+                        # still attaches (no stranded "✅ tool completed" line and
+                        # no dropped suffix). The drain-path handler mirrors this.
+                        await _close_bubble_preserving_inflight()
                         continue
                     else:
                         msg = str(raw)
@@ -17320,75 +17442,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await adapter.send_typing(source.chat_id, metadata=_progress_metadata)
 
                 except queue.Empty:
-                    await asyncio.sleep(0.3)
+                    # A cancellation can land while we idle here.  The sleep is
+                    # a sibling of the CancelledError handler below, so without
+                    # this guard a cancel during the idle wait escapes the whole
+                    # loop and SKIPS the drain/final-flush — stranding a
+                    # throttle-deferred duration suffix that was already applied
+                    # to ``progress_lines`` in memory (the "last tool before the
+                    # reply shows no · Xs" symptom).  Re-raise into the same
+                    # drain path so the pending edit is published.
+                    try:
+                        await asyncio.sleep(0.3)
+                    except asyncio.CancelledError:
+                        await _drain_and_flush_progress()
+                        return
                 except asyncio.CancelledError:
-                    # Drain remaining queued messages
-                    while not progress_queue.empty():
-                        try:
-                            raw = progress_queue.get_nowait()
-                            if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
-                                _, base_msg, count = raw
-                                if progress_lines:
-                                    progress_lines[-1] = f"{base_msg} (×{count + 1})"
-                                    await _roll_progress_overflow_if_needed()
-                            elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__tool_start__":
-                                _, started_tool_name, started_msg = raw
-                                progress_lines.append(str(started_msg))
-                                _record_pending_tool_line(started_tool_name, len(progress_lines) - 1)
-                                await _roll_progress_overflow_if_needed()
-                            elif isinstance(raw, tuple) and len(raw) == 4 and raw[0] == "__tool_duration__":
-                                _, completed_tool_name, duration, is_error = raw
-                                completed_index = _complete_pending_tool_line(
-                                    completed_tool_name,
-                                    duration,
-                                    bool(is_error),
-                                )
-                                if completed_index is None:
-                                    _append_fallback_completion_line(
-                                        completed_tool_name,
-                                        duration,
-                                        bool(is_error),
-                                    )
-                                await _roll_progress_overflow_if_needed()
-                            elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
-                                # Content-bubble marker during drain: close off
-                                # the current progress bubble and start a fresh
-                                # one for any tool lines that arrived after.
-                                await _roll_progress_overflow_if_needed()
-                                if can_edit and progress_lines and progress_msg_id:
-                                    _pending_text = _progress_text(progress_lines)
-                                    try:
-                                        await _edit_progress_message(progress_msg_id, _pending_text)
-                                    except Exception:
-                                        pass
-                                progress_msg_id = None
-                                progress_lines = []
-                                _reset_pending_tool_lines()
-                                last_progress_msg[0] = None
-                                repeat_count[0] = 0
-                            else:
-                                progress_lines.append(str(raw))
-                                await _roll_progress_overflow_if_needed()
-                        except Exception:
-                            break
-                    # Final flush with all remaining tools.  Cancellation can
-                    # arrive while the first send is still being awaited, before
-                    # ``progress_msg_id`` is recorded; in that race, send a
-                    # consolidated progress bubble instead of dropping the final
-                    # completion lines.
-                    if can_edit and progress_lines:
-                        await _roll_progress_overflow_if_needed()
-                    if can_edit and progress_lines:
-                        full_text = _progress_text(progress_lines)
-                        try:
-                            if progress_msg_id:
-                                await _edit_progress_message(progress_msg_id, full_text)
-                            else:
-                                result = await _send_progress_text(full_text)
-                                if result.success and result.message_id:
-                                    progress_msg_id = result.message_id
-                        except Exception:
-                            pass
+                    await _drain_and_flush_progress()
                     return
                 except Exception as e:
                     logger.error("Progress message error: %s", e)
