@@ -2472,7 +2472,7 @@ class TestVisionBedrockAuthFallback:
         exc = Exception("Error when retrieving token from sso: Token has expired and refresh failed")
         assert _is_auth_error(exc)
 
-    def test_bedrock_sso_auth_fallback_allowed_for_vision_and_compression(self):
+    def test_bedrock_sso_auth_fallback_allowed_for_vision_compression_and_web_extract(self):
         from agent.auxiliary_client import _should_fallback_on_auth_error
 
         exc = Exception("Error when retrieving token from sso: Token has expired and refresh failed")
@@ -2480,7 +2480,7 @@ class TestVisionBedrockAuthFallback:
 
         assert _should_fallback_on_auth_error("vision", "bedrock", base_url, exc) is True
         assert _should_fallback_on_auth_error("compression", "bedrock", base_url, exc) is True
-        assert _should_fallback_on_auth_error("web_extract", "bedrock", base_url, exc) is False
+        assert _should_fallback_on_auth_error("web_extract", "bedrock", base_url, exc) is True
         assert _should_fallback_on_auth_error("title_generation", "bedrock", base_url, exc) is False
 
     def test_global_fallback_chain_available_to_auxiliary_vision(self):
@@ -2844,6 +2844,46 @@ class TestAuxiliaryAuthRefreshRetry:
         mock_fallback.assert_called_once_with("compression", "bedrock", reason="auth error")
         mock_payment_fallback.assert_not_called()
         mock_main_fallback.assert_not_called()
+        fallback_client.chat.completions.create.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_async_call_llm_falls_back_to_main_codex_when_auto_bedrock_sso_login_fails_for_web_extract(self, monkeypatch):
+        sso_error = Exception("Error when retrieving token from sso: Token has expired and refresh failed")
+        stale_client = MagicMock()
+        stale_client.base_url = "https://bedrock-runtime.ca-central-1.amazonaws.com"
+        stale_client.chat.completions.create = AsyncMock(side_effect=sso_error)
+
+        fallback_client = MagicMock()
+        fallback_client.base_url = "https://chatgpt.com/backend-api/codex"
+        fallback_client.chat.completions.create = AsyncMock(return_value=_DummyResponse("main fallback web_extract ok"))
+        monkeypatch.setenv("AWS_PROFILE", "as24-bedrock-readonly")
+
+        main_runtime = {"provider": "bedrock", "base_url": "https://bedrock-runtime.ca-central-1.amazonaws.com"}
+
+        with (
+            patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("auto", None, None, None, None)),
+            patch("agent.auxiliary_client._get_cached_client", return_value=(stale_client, "us.anthropic.claude-opus-4-8")) as mock_get_cached,
+            patch("agent.auxiliary_client._bedrock_sso_login_cooldown_until", {}),
+            patch("agent.auxiliary_client._bedrock_sso_login_success_until", {}),
+            patch("subprocess.run", return_value=SimpleNamespace(returncode=255, stdout="", stderr="login timed out")) as mock_run,
+            patch("agent.auxiliary_client._try_configured_fallback_chain", return_value=(None, None, "")) as mock_fallback,
+            patch("agent.auxiliary_client._try_payment_fallback") as mock_payment_fallback,
+            patch("agent.auxiliary_client._try_main_agent_model_fallback", return_value=(fallback_client, "gpt-5.5", "main-agent(openai-codex)")) as mock_main_fallback,
+            patch("agent.auxiliary_client._to_async_client", return_value=(fallback_client, "gpt-5.5")) as mock_to_async,
+        ):
+            resp = await async_call_llm(
+                task="web_extract",
+                messages=[{"role": "user", "content": "summarize page"}],
+                main_runtime=main_runtime,
+            )
+
+        assert resp.choices[0].message.content == "main fallback web_extract ok"
+        assert mock_get_cached.call_args.kwargs["main_runtime"] is main_runtime
+        mock_run.assert_called_once()
+        mock_fallback.assert_called_once_with("web_extract", "bedrock", reason="auth error")
+        mock_payment_fallback.assert_not_called()
+        mock_main_fallback.assert_called_once_with("bedrock", "web_extract", reason="auth error")
+        mock_to_async.assert_called_once_with(fallback_client, "gpt-5.5", is_vision=False)
         fallback_client.chat.completions.create.assert_called_once()
 
     def test_call_llm_runs_bedrock_sso_login_and_retries_compression(self, monkeypatch):
