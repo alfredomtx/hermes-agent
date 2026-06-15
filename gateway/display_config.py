@@ -47,6 +47,13 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     # live, just cleaned up after success so the chat doesn't fill up with
     # stale breadcrumbs. Failed runs leave bubbles in place as breadcrumbs.
     "cleanup_progress": False,
+    # Optional per-tool completion timing in gateway progress bubbles. When
+    # enabled, each tool's existing progress row gets a compact duration suffix
+    # appended in place (e.g. "💻 terminal: \"date\" · 10ms"), and a fallback
+    # "✅ <tool> completed in <time>" row is emitted only if no matching start
+    # row was found. Off by default to avoid extra chat noise; platforms/users
+    # can opt in where timing visibility matters.
+    "tool_completion_durations": False,
 }
 
 # ---------------------------------------------------------------------------
@@ -235,7 +242,7 @@ def _normalise(setting: str, value: Any) -> Any:
         if isinstance(value, str):
             return value.lower() in {"true", "1", "yes", "on"}
         return bool(value)
-    if setting == "cleanup_progress":
+    if setting in {"cleanup_progress", "tool_completion_durations"}:
         if isinstance(value, str):
             return value.lower() in {"true", "1", "yes", "on"}
         return bool(value)

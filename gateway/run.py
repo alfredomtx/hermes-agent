@@ -1933,11 +1933,81 @@ def _format_duration(seconds: float) -> str:
     total = int(round(seconds))
     if total < 0:
         total = 0
-    hours, rem = divmod(total, 3600)
-    minutes, secs = divmod(rem, 60)
-    if hours:
+    minutes, secs = divmod(total, 60)
+    if minutes >= 60:
+        hours, minutes = divmod(minutes, 60)
         return f"{hours}:{minutes:02d}:{secs:02d}"
     return f"{minutes}:{secs:02d}"
+
+
+def _format_tool_progress_duration(seconds: float) -> str:
+    """Compact human duration for gateway tool-progress completion lines."""
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        value = 0.0
+    if value < 0:
+        value = 0.0
+
+    if value < 0.1:
+        return f"{int(round(value * 1000))}ms"
+    if value < 10:
+        return f"{value:.1f}s"
+
+    total = int(round(value))
+    if total < 60:
+        return f"{total}s"
+    minutes, secs = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m {secs:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"
+
+
+def _format_tool_completion_progress_line(
+    tool_name: str,
+    duration: float,
+    *,
+    is_error: bool = False,
+) -> str:
+    """Render a concise fallback completion row for gateway tool progress."""
+    name = str(tool_name or "tool")
+    elapsed = _format_tool_progress_duration(duration)
+    if is_error:
+        return f"❌ {name} failed after {elapsed}"
+    return f"✅ {name} completed in {elapsed}"
+
+
+def _format_tool_completion_duration_suffix(
+    duration: float,
+    *,
+    is_error: bool = False,
+) -> str:
+    """Render the compact suffix appended to an existing tool-progress row."""
+    elapsed = _format_tool_progress_duration(duration)
+    if is_error:
+        return f" · failed after {elapsed}"
+    return f" · {elapsed}"
+
+
+def _append_tool_completion_duration_to_progress_line(
+    line: Any,
+    duration: float,
+    *,
+    is_error: bool = False,
+) -> str:
+    """Append completion timing to the first visible line of a progress card."""
+    text = str(line or "")
+    suffix = _format_tool_completion_duration_suffix(duration, is_error=is_error)
+    if not text:
+        return suffix.strip()
+
+    lines = text.splitlines()
+    for index, part in enumerate(lines):
+        if part.strip():
+            lines[index] = f"{part}{suffix}"
+            return "\n".join(lines)
+    return f"{text}{suffix}"
 
 
 async def _probe_audio_duration(path: str) -> Optional[str]:
@@ -14400,10 +14470,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         # Tool progress grouping: "accumulate" (edit one bubble) or "separate" (one msg per tool)
         progress_grouping = resolve_display_setting(user_config, platform_key, "tool_progress_grouping") or "accumulate"
+        try:
+            tool_completion_durations_enabled = is_truthy_value(
+                resolve_display_setting(
+                    user_config,
+                    platform_key,
+                    "tool_completion_durations",
+                    False,
+                ),
+                default=False,
+            )
+        except Exception:
+            tool_completion_durations_enabled = False
+
         # Disable tool progress for webhooks - they don't support message editing,
-        # so each progress line would be sent as a separate message.
+        # so each progress line would be sent as a separate message.  Completion
+        # durations can opt into the same event pipeline even when normal
+        # tool-start progress is off; the callback suppresses start rows in that
+        # duration-only mode.
         from gateway.config import Platform
-        tool_progress_enabled = progress_mode != "off" and source.platform != Platform.WEBHOOK
+        tool_progress_enabled = (
+            source.platform != Platform.WEBHOOK
+            and (progress_mode != "off" or tool_completion_durations_enabled)
+        )
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
         # in chat platforms while opting into concise mid-turn updates.
@@ -14517,27 +14606,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # /verbose.  We only fire when (a) the user hasn't seen the hint
             # before and (b) /verbose is actually usable on this platform
             # (gateway gate must be open).  The CLI has its own trigger.
-            if event_type == "tool.completed" and not long_tool_hint_fired[0]:
-                try:
-                    duration = kwargs.get("duration") or 0
-                    if duration >= _LONG_TOOL_THRESHOLD_S and progress_mode == "all":
-                        from agent.onboarding import (
-                            TOOL_PROGRESS_FLAG,
-                            is_seen,
-                            mark_seen,
-                            tool_progress_hint_gateway,
+            if event_type == "tool.completed":
+                duration = kwargs.get("duration") or 0
+                if not long_tool_hint_fired[0]:
+                    try:
+                        if duration >= _LONG_TOOL_THRESHOLD_S and progress_mode == "all":
+                            from agent.onboarding import (
+                                TOOL_PROGRESS_FLAG,
+                                is_seen,
+                                mark_seen,
+                                tool_progress_hint_gateway,
+                            )
+                            _cfg = _load_gateway_config()
+                            gate_on = is_truthy_value(
+                                cfg_get(_cfg, "display", "tool_progress_command"),
+                                default=False,
+                            )
+                            if gate_on and not is_seen(_cfg, TOOL_PROGRESS_FLAG):
+                                long_tool_hint_fired[0] = True
+                                progress_queue.put(tool_progress_hint_gateway())
+                                mark_seen(_hermes_home / "config.yaml", TOOL_PROGRESS_FLAG)
+                    except Exception as _hint_err:
+                        logger.debug("tool-progress onboarding hint failed: %s", _hint_err)
+
+                if tool_completion_durations_enabled and tool_name:
+                    last_was_terminal_block[0] = False
+                    last_progress_msg[0] = None
+                    repeat_count[0] = 0
+                    progress_queue.put(
+                        (
+                            "__tool_duration__",
+                            tool_name,
+                            duration,
+                            bool(kwargs.get("is_error", False)),
                         )
-                        _cfg = _load_gateway_config()
-                        gate_on = is_truthy_value(
-                            cfg_get(_cfg, "display", "tool_progress_command"),
-                            default=False,
-                        )
-                        if gate_on and not is_seen(_cfg, TOOL_PROGRESS_FLAG):
-                            long_tool_hint_fired[0] = True
-                            progress_queue.put(tool_progress_hint_gateway())
-                            mark_seen(_hermes_home / "config.yaml", TOOL_PROGRESS_FLAG)
-                except Exception as _hint_err:
-                    logger.debug("tool-progress onboarding hint failed: %s", _hint_err)
+                    )
                 return
 
             # "_thinking" is assistant scratch text between tool calls.  It
@@ -14559,8 +14662,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not tool_progress_enabled:
                 return
 
-            # Only act on tool.started events (ignore tool.completed, reasoning.available, etc.)
+            # Only act on tool.started events (ignore reasoning.available, etc.)
             if event_type not in {"tool.started",}:
+                return
+            if progress_mode == "off":
                 return
 
             # Suppress tool-progress bubbles once the user has sent `stop`.
@@ -14579,8 +14684,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
 
-            # "new" mode: only report when tool changes
-            if progress_mode == "new" and tool_name == last_tool[0]:
+            # "new" mode: only report when tool changes. When completion
+            # durations are enabled every call needs its own row to carry its
+            # own timing suffix, so don't collapse repeats in that case.
+            if (
+                progress_mode == "new"
+                and tool_name == last_tool[0]
+                and not tool_completion_durations_enabled
+            ):
                 return
             last_tool[0] = tool_name
             
@@ -14619,8 +14730,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Consecutive terminal calls: drop the repeated
                 # "💻 terminal" header so back-to-back commands render as
                 # adjacent code blocks under a single header.
+                #
+                # Exception: when completion-duration suffixes are enabled we
+                # always keep the header. The suffix is appended to the row's
+                # first visible line, and without a header that line is the
+                # opening ``` fence — appending there corrupts the code block.
+                # A per-row header gives each terminal call a stable, visible
+                # line to carry its own duration.
+                _drop_header = last_was_terminal_block[0] and not tool_completion_durations_enabled
                 _block_header = (
-                    "" if last_was_terminal_block[0] else f"{emoji} {tool_name}\n"
+                    "" if _drop_header else f"{emoji} {tool_name}\n"
                 )
                 _code_block_full = f"{_block_header}```\n{_cmd_full}\n```"
                 # Single-line, capped preview for non-verbose modes.
@@ -14659,20 +14778,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _todo_card = None
                 if _todo_card:
                     last_was_terminal_block[0] = False
-                    progress_queue.put(_todo_card)
+                    progress_queue.put(("__tool_start__", tool_name, _todo_card))
                     return
 
             if tool_name == "delegate_task" and _show_delegate_args:
                 last_was_terminal_block[0] = False
                 for _card in _format_delegate_task_args_progress(args):
-                    progress_queue.put(_card)
+                    progress_queue.put(("__tool_start__", tool_name, _card))
                 return
 
             # Verbose mode: show detailed arguments, respects tool_preview_length
             if progress_mode == "verbose":
                 if _code_block_full is not None:
                     last_was_terminal_block[0] = True
-                    progress_queue.put(_code_block_full)
+                    progress_queue.put(("__tool_start__", tool_name, _code_block_full))
                     return
                 last_was_terminal_block[0] = False
                 if args:
@@ -14689,7 +14808,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     msg = f"{emoji} {tool_name}: \"{preview}\""
                 else:
                     msg = f"{emoji} {tool_name}..."
-                progress_queue.put(msg)
+                progress_queue.put(("__tool_start__", tool_name, msg))
                 return
             
             # "all" / "new" modes: short preview, respects tool_preview_length
@@ -14712,6 +14831,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 msg = f"{emoji} {tool_name}..."
                 last_was_terminal_block[0] = False
             
+            # Dedup completion tracking needs one row per tool call so each
+            # completion can append its own duration. Keep the older collapsed
+            # duplicate behavior only when duration suffixes are disabled.
+            if tool_completion_durations_enabled:
+                last_progress_msg[0] = None
+                repeat_count[0] = 0
+                progress_queue.put(("__tool_start__", tool_name, msg))
+                return
+
             # Dedup: collapse consecutive identical progress messages.
             # Common with execute_code where models iterate with the same
             # code (same boilerplate imports → identical previews).
@@ -14724,7 +14852,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             last_progress_msg[0] = msg
             repeat_count[0] = 0
             
-            progress_queue.put(msg)
+            progress_queue.put(("__tool_start__", tool_name, msg))
         
         # Background task to send progress messages
         # Accumulates tool lines into a single message that gets edited.
@@ -14823,6 +14951,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             def _progress_text(lines: list) -> str:
                 return "\n".join(str(line) for line in lines)
 
+            pending_tool_line_indexes: dict[str, list[int]] = {}
+
+            def _record_pending_tool_line(tool_name: Any, index: int) -> None:
+                if tool_name:
+                    pending_tool_line_indexes.setdefault(str(tool_name), []).append(index)
+
+            def _complete_pending_tool_line(
+                tool_name: Any,
+                duration: Any,
+                is_error: bool,
+            ) -> Optional[int]:
+                if not tool_name:
+                    return None
+                # The agent emits tool.started and tool.completed in the same
+                # parsed-call order (FIFO), including for parallel/repeated
+                # same-name calls, so match the oldest unresolved start row.
+                indexes = pending_tool_line_indexes.get(str(tool_name)) or []
+                while indexes:
+                    index = indexes.pop(0)
+                    if 0 <= index < len(progress_lines):
+                        progress_lines[index] = _append_tool_completion_duration_to_progress_line(
+                            progress_lines[index],
+                            duration,
+                            is_error=is_error,
+                        )
+                        return index
+                return None
+
+            def _append_fallback_completion_line(
+                tool_name: Any,
+                duration: Any,
+                is_error: bool,
+            ) -> int:
+                progress_lines.append(
+                    _format_tool_completion_progress_line(
+                        str(tool_name or "tool"),
+                        duration,
+                        is_error=is_error,
+                    )
+                )
+                return len(progress_lines) - 1
+
+            def _reset_pending_tool_lines() -> None:
+                pending_tool_line_indexes.clear()
+
             def _split_progress_groups(lines: list) -> list[list]:
                 """Partition progress lines into platform-sized editable bubbles."""
                 groups: list[list] = []
@@ -14890,6 +15063,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # just its lines so subsequent edits update it instead of
                 # replaying the full historical transcript into new messages.
                 progress_lines = groups[-1]
+                _reset_pending_tool_lines()
                 return True
 
             while True:
@@ -14920,12 +15094,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception:
                         pass
 
-                    # Handle dedup messages: update last line with repeat counter
+                    # Handle structured progress messages first, then legacy
+                    # plain strings.
                     if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                         _, base_msg, count = raw
                         if progress_lines:
                             progress_lines[-1] = f"{base_msg} (×{count + 1})"
                         msg = progress_lines[-1] if progress_lines else base_msg
+                    elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__tool_start__":
+                        _, started_tool_name, started_msg = raw
+                        msg = str(started_msg)
+                        progress_lines.append(msg)
+                        _record_pending_tool_line(started_tool_name, len(progress_lines) - 1)
+                    elif isinstance(raw, tuple) and len(raw) == 4 and raw[0] == "__tool_duration__":
+                        _, completed_tool_name, duration, is_error = raw
+                        completed_index = _complete_pending_tool_line(
+                            completed_tool_name,
+                            duration,
+                            bool(is_error),
+                        )
+                        if completed_index is None:
+                            completed_index = _append_fallback_completion_line(
+                                completed_tool_name,
+                                duration,
+                                bool(is_error),
+                            )
+                        msg = progress_lines[completed_index]
                     elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
                         # Content bubble just landed on the platform — close off
                         # the current tool-progress bubble so the next tool
@@ -14937,11 +15131,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # linearization regression after PR #7885.)
                         progress_msg_id = None
                         progress_lines = []
+                        _reset_pending_tool_lines()
                         last_progress_msg[0] = None
                         repeat_count[0] = 0
                         continue
                     else:
-                        msg = raw
+                        msg = str(raw)
                         progress_lines.append(msg)
 
                     if await _roll_progress_overflow_if_needed():
@@ -15048,6 +15243,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 if progress_lines:
                                     progress_lines[-1] = f"{base_msg} (×{count + 1})"
                                     await _roll_progress_overflow_if_needed()
+                            elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__tool_start__":
+                                _, started_tool_name, started_msg = raw
+                                progress_lines.append(str(started_msg))
+                                _record_pending_tool_line(started_tool_name, len(progress_lines) - 1)
+                                await _roll_progress_overflow_if_needed()
+                            elif isinstance(raw, tuple) and len(raw) == 4 and raw[0] == "__tool_duration__":
+                                _, completed_tool_name, duration, is_error = raw
+                                completed_index = _complete_pending_tool_line(
+                                    completed_tool_name,
+                                    duration,
+                                    bool(is_error),
+                                )
+                                if completed_index is None:
+                                    _append_fallback_completion_line(
+                                        completed_tool_name,
+                                        duration,
+                                        bool(is_error),
+                                    )
+                                await _roll_progress_overflow_if_needed()
                             elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
                                 # Content-bubble marker during drain: close off
                                 # the current progress bubble and start a fresh
@@ -15061,20 +15275,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         pass
                                 progress_msg_id = None
                                 progress_lines = []
+                                _reset_pending_tool_lines()
                                 last_progress_msg[0] = None
                                 repeat_count[0] = 0
                             else:
-                                progress_lines.append(raw)
+                                progress_lines.append(str(raw))
                                 await _roll_progress_overflow_if_needed()
                         except Exception:
                             break
-                    # Final edit with all remaining tools (only if editing works)
-                    if can_edit and progress_lines and progress_msg_id:
+                    # Final flush with all remaining tools.  Cancellation can
+                    # arrive while the first send is still being awaited, before
+                    # ``progress_msg_id`` is recorded; in that race, send a
+                    # consolidated progress bubble instead of dropping the final
+                    # completion lines.
+                    if can_edit and progress_lines:
                         await _roll_progress_overflow_if_needed()
-                    if can_edit and progress_lines and progress_msg_id:
+                    if can_edit and progress_lines:
                         full_text = _progress_text(progress_lines)
                         try:
-                            await _edit_progress_message(progress_msg_id, full_text)
+                            if progress_msg_id:
+                                await _edit_progress_message(progress_msg_id, full_text)
+                            else:
+                                result = await _send_progress_text(full_text)
+                                if result.success and result.message_id:
+                                    progress_msg_id = result.message_id
                         except Exception:
                             pass
                     return
