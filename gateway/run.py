@@ -17035,6 +17035,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             def _reset_pending_tool_lines() -> None:
                 pending_tool_line_indexes.clear()
 
+            def _remap_pending_tool_lines(kept_offset: int) -> None:
+                """Rebase pending start-row indexes onto the kept overflow bubble.
+
+                After an overflow split keeps only ``groups[-1]`` as the mutable
+                bubble, every absolute index shifts down by ``kept_offset`` (the
+                number of lines flushed into earlier, now-immutable bubbles).
+                Rows that landed in those flushed groups can no longer be edited,
+                so drop them; rows that survived into the kept bubble keep their
+                pending status at the rebased offset.  Without this, a tool whose
+                start row survives the split loses its pending index and its
+                later duration renders as a standalone ``✅ tool completed in Xs``
+                fallback line instead of an inline ``· Xs`` suffix.
+                """
+                if kept_offset <= 0:
+                    return
+                for tool_name in list(pending_tool_line_indexes.keys()):
+                    rebased = [
+                        index - kept_offset
+                        for index in pending_tool_line_indexes[tool_name]
+                        if index >= kept_offset
+                    ]
+                    if rebased:
+                        pending_tool_line_indexes[tool_name] = rebased
+                    else:
+                        del pending_tool_line_indexes[tool_name]
+
             def _split_progress_groups(lines: list) -> list[list]:
                 """Partition progress lines into platform-sized editable bubbles."""
                 groups: list[list] = []
@@ -17101,8 +17127,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # The newest continuation is now the only mutable bubble.  Keep
                 # just its lines so subsequent edits update it instead of
                 # replaying the full historical transcript into new messages.
+                # Rebase pending tool-line indexes onto the kept bubble so a
+                # start row that survived the split still receives its inline
+                # completion-duration suffix (instead of a standalone fallback
+                # line) — see _remap_pending_tool_lines.
+                kept_offset = len(progress_lines) - len(groups[-1])
                 progress_lines = groups[-1]
-                _reset_pending_tool_lines()
+                _remap_pending_tool_lines(kept_offset)
                 return True
 
             while True:
