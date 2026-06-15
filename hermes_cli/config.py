@@ -1463,6 +1463,7 @@ DEFAULT_CONFIG = {
         "tool_progress_command": False,  # Enable /verbose command in messaging gateway
         "tool_progress_overrides": {},  # DEPRECATED — use display.platforms instead
         "tool_preview_length": 0,  # Max chars for tool call previews (0 = no limit, show full paths/commands)
+        "tool_completion_durations": False,  # Gateway: append per-tool completion timing to progress rows (e.g. "💻 terminal · 10ms")
         # Auto-delete system-notice replies (e.g. "✨ New session started!",
         # "♻ Restarting gateway…", "⚡ Stopped…") after N seconds on platforms
         # that support message deletion (currently Telegram; other platforms
