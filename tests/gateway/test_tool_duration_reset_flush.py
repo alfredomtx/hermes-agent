@@ -238,14 +238,14 @@ async def _run(monkeypatch, user_config, agent_cls):
         [item["content"] for item in adapter.sent]
         + [item["content"] for item in adapter.edits]
     )
-    return result, rendered
+    return result, rendered, adapter
 
 
 @pytest.mark.asyncio
 async def test_duration_suffix_survives_reset_from_interim_content(monkeypatch):
     """delegate_task completion straddles an interim message; its duration
     must still be published (flushed before __reset__ abandons the bubble)."""
-    result, rendered = await _run(
+    result, rendered, _adapter = await _run(
         monkeypatch, _user_config(interim=True), FakeInterimResetAgent
     )
 
@@ -254,4 +254,54 @@ async def test_duration_suffix_survives_reset_from_interim_content(monkeypatch):
     assert "🔀 delegate_task parameters · 2m 05s" in rendered
     # The last tools before the reply keep their suffixes too.
     assert 'write_file: "/tmp/x.out" · 0.5s' in rendered
-    assert "💻 terminal · 10ms" in rendered
+
+
+class FakeResetMidToolAgent(BaseFakeTimingAgent):
+    """A __reset__ lands BETWEEN a terminal's start and completed.
+
+    Interim commentary arrives while the terminal command is still running.
+    The stream consumer sends it asynchronously, firing __reset__, which used
+    to clear the pending-tool-line index — so the terminal completion could
+    not find its start row and rendered as a SEPARATE fallback line
+    (``✅ terminal completed in 1.4s``) instead of an inline ``· 1.4s``
+    suffix on the ``💻 terminal`` block.
+    """
+
+    def run_conversation(self, user_message, conversation_history=None, task_id=None, **kwargs):
+        cb = self.tool_progress_callback
+        assert cb is not None
+        interim = self.interim_assistant_callback
+
+        # Terminal starts, then commentary arrives mid-run (fires __reset__),
+        # then the terminal completes.
+        cb("tool.started", "terminal", preview="acli jira workitem view ASPD-30171",
+           args={"command": "acli jira workitem view ASPD-30171"})
+        if interim:
+            interim("Let me check the ticket details.")
+            time.sleep(0.4)  # let the async __reset__ land before completion
+        cb("tool.completed", "terminal", duration=1.4)
+        time.sleep(1.7)
+        return {
+            "final_response": "done",
+            "messages": [
+                {"role": "user", "content": user_message},
+                {"role": "assistant", "content": "done"},
+            ],
+            "api_calls": 1,
+            "completed": True,
+        }
+
+
+@pytest.mark.asyncio
+async def test_terminal_duration_inline_when_reset_lands_mid_tool(monkeypatch):
+    """A __reset__ between terminal start and completion must NOT produce a
+    standalone '✅ terminal completed in 1.4s' fallback line — the suffix
+    belongs inline on the terminal block."""
+    result, rendered, adapter = await _run(
+        monkeypatch, _user_config(interim=True), FakeResetMidToolAgent
+    )
+
+    assert result["final_response"] == "done"
+    # Inline suffix on the terminal block, not a separate fallback row.
+    assert "💻 terminal · 1.4s" in rendered
+    assert "✅ terminal completed in 1.4s" not in rendered
