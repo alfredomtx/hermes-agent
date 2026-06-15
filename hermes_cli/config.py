@@ -1760,6 +1760,7 @@ DEFAULT_CONFIG = {
         # applies where tool_progress is already enabled. Per-platform override
         # via display.platforms.<platform>.tool_progress_grouping.
         "tool_progress_grouping": "accumulate",
+        "tool_completion_durations": False,  # Gateway: append per-tool completion timing to progress rows (e.g. "💻 terminal · 10ms")
         # How a reasoning/thinking summary renders when show_reasoning is on.
         # "code" (default) = 💭 fenced code block; "blockquote" = "> " lines;
         # "subtext" = "-# " lines (Discord small grey metadata text). Discord
