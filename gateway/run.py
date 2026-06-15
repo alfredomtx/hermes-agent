@@ -15129,6 +15129,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # order. Mirrors GatewayStreamConsumer.on_segment_break
                         # on the content side. (Issue: tool + content
                         # linearization regression after PR #7885.)
+                        #
+                        # Flush first: a just-applied completion-duration suffix
+                        # (``__tool_duration__`` mutates ``progress_lines`` in
+                        # place) may still be pending behind the edit throttle.
+                        # Abandoning the bubble without pushing it would strand
+                        # the stale start row on the platform with no "· 0.5s"
+                        # suffix — the exact symptom for the LAST tools before a
+                        # reply and any tool whose completion straddles interim
+                        # content. The drain-path __reset__ handler already does
+                        # this; keep the two in sync.
+                        if can_edit and progress_lines and progress_msg_id is not None:
+                            if not await _roll_progress_overflow_if_needed():
+                                _flush_text = _progress_text(progress_lines)
+                                try:
+                                    await _edit_progress_message(progress_msg_id, _flush_text)
+                                    _last_edit_ts = time.monotonic()
+                                except Exception:
+                                    pass
                         progress_msg_id = None
                         progress_lines = []
                         _reset_pending_tool_lines()
