@@ -223,6 +223,75 @@ def _format_delegate_task_args_progress(
     return cards
 
 
+def _format_subagent_tool_card(
+    tool_name: Optional[str],
+    preview: Optional[str],
+    *,
+    goal: Optional[str] = None,
+    task_index: int = 0,
+    task_count: int = 1,
+) -> str:
+    """Render ONE delegate_task child tool call as a compact gateway card.
+
+    Used when ``display.platforms.<platform>.subagent_tool_progress == "full"``.
+    Child tool events are already relayed from ``tools/delegate_tool.py`` as
+    ``"subagent.tool"``; this turns one into a short, redacted progress line so
+    a user watching on Telegram/Discord can see what a subagent is doing
+    without dropping to the CLI. It is intentionally the child's tool *input*
+    preview only — never subagent stdout/output, matching the privacy posture
+    of ``_format_delegate_task_args_progress``.
+    """
+    from agent.display import get_tool_emoji, get_tool_preview_max_len
+
+    emoji = get_tool_emoji(tool_name or "", default="⚙️")
+    # 1-indexed subagent tag only when several children run in parallel, so a
+    # single-subagent run stays clean.
+    tag = f"[{task_index + 1}] " if task_count > 1 else ""
+    goal_label = (goal or "").strip()
+    if goal_label:
+        goal_short = (goal_label[:40] + "…") if len(goal_label) > 40 else goal_label
+        header = f"🔀 {tag}{goal_short}"
+    else:
+        header = f"🔀 {tag}subagent"
+
+    line = f"{emoji} {tool_name or 'tool'}"
+    if preview:
+        _pl = get_tool_preview_max_len()
+        _cap = _pl if _pl > 0 else 40
+        short = preview if len(preview) <= _cap else preview[: _cap - 1] + "…"
+        line += f'  "{short}"'
+
+    card = f"{header}\n└ {line}"
+    try:
+        from agent.redact import redact_sensitive_text
+
+        card = redact_sensitive_text(card)
+    except Exception:
+        pass
+    return card
+
+
+def _format_subagent_progress_card(preview: Optional[str]) -> Optional[str]:
+    """Render the BATCHED subagent progress summary as a gateway card.
+
+    Used when ``subagent_tool_progress == "batched"``. ``tools/delegate_tool.py``
+    relays one ``"subagent.progress"`` event per ~5 child tool calls, with the
+    already-formatted ``"🔀 …"`` summary string in ``preview``. We only redact
+    and pass it through — no per-tool spam, just a periodic heartbeat of which
+    tools the child has run.
+    """
+    text = (preview or "").strip()
+    if not text:
+        return None
+    try:
+        from agent.redact import redact_sensitive_text
+
+        text = redact_sensitive_text(text)
+    except Exception:
+        pass
+    return text
+
+
 _GATEWAY_SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9_\-]{12,}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
@@ -14483,15 +14552,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             tool_completion_durations_enabled = False
 
+        # delegate_task child tool visibility. "off" (default) drops child tool
+        # events; "batched" renders the periodic subagent.progress summary;
+        # "full" renders every child tool start. Resolved once here so it can
+        # both (a) keep the progress pipeline alive when tool_progress is "off"
+        # and (b) drive the subagent.* branch in progress_callback below.
+        try:
+            subagent_progress_mode = str(
+                resolve_display_setting(
+                    user_config,
+                    platform_key,
+                    "subagent_tool_progress",
+                    "off",
+                )
+                or "off"
+            ).lower()
+            if subagent_progress_mode not in {"off", "batched", "full"}:
+                subagent_progress_mode = "off"
+        except Exception:
+            subagent_progress_mode = "off"
+        subagent_progress_enabled = subagent_progress_mode != "off"
+
         # Disable tool progress for webhooks - they don't support message editing,
         # so each progress line would be sent as a separate message.  Completion
         # durations can opt into the same event pipeline even when normal
         # tool-start progress is off; the callback suppresses start rows in that
-        # duration-only mode.
+        # duration-only mode.  Subagent tool visibility likewise keeps the
+        # pipeline alive even when the parent's own tool progress is "off".
         from gateway.config import Platform
         tool_progress_enabled = (
             source.platform != Platform.WEBHOOK
-            and (progress_mode != "off" or tool_completion_durations_enabled)
+            and (
+                progress_mode != "off"
+                or tool_completion_durations_enabled
+                or subagent_progress_enabled
+            )
         )
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
@@ -14598,6 +14693,56 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
             if not progress_queue or not _run_still_current():
+                return
+
+            # delegate_task child tool visibility. The child's progress callback
+            # (tools/delegate_tool.py) relays its OWN tool calls to this parent
+            # callback as "subagent.tool" (per call) and "subagent.progress" (a
+            # batched summary every ~5 child tools). Depth-2+ grandchild
+            # summaries arrive as the legacy underscore event "subagent_progress"
+            # with the summary string in the tool_name slot. The gateway drops
+            # all of these by default; surface them only when the operator opted
+            # in via display.platforms.<platform>.subagent_tool_progress.
+            #   "full"    → render every "subagent.tool"
+            #   "batched" → render the "subagent.progress"/"subagent_progress"
+            #               summary only
+            # Other subagent.* lifecycle events (start/complete/thinking) are
+            # intentionally NOT rendered here to avoid extra chat noise; the
+            # parent's own delegate_task call + summary already bracket the run.
+            # Queued under the "__subagent__" sentinel (not "delegate_task") so
+            # these cards stay out of the parent's tool-completion FIFO and never
+            # absorb a parent delegate_task duration suffix.
+            if event_type in {"subagent.tool", "subagent.progress", "subagent_progress"}:
+                if subagent_progress_mode == "full" and event_type == "subagent.tool":
+                    try:
+                        _card = _format_subagent_tool_card(
+                            tool_name,
+                            preview,
+                            goal=kwargs.get("goal"),
+                            task_index=int(kwargs.get("task_index", 0) or 0),
+                            task_count=int(kwargs.get("task_count", 1) or 1),
+                        )
+                    except Exception as _sub_err:
+                        logger.debug("subagent tool card render failed: %s", _sub_err)
+                        _card = None
+                    if _card:
+                        last_was_terminal_block[0] = False
+                        progress_queue.put(("__tool_start__", "__subagent__", _card))
+                elif subagent_progress_mode == "batched" and event_type in {
+                    "subagent.progress",
+                    "subagent_progress",
+                }:
+                    # Dotted form carries the summary in `preview`; the legacy
+                    # underscore form (depth-2 grandchild) carries it in the
+                    # tool_name slot — accept either.
+                    try:
+                        _card = _format_subagent_progress_card(preview or tool_name)
+                    except Exception as _sub_err:
+                        logger.debug("subagent progress card render failed: %s", _sub_err)
+                        _card = None
+                    if _card:
+                        last_was_terminal_block[0] = False
+                        progress_queue.put(("__tool_start__", "__subagent__", _card))
                 return
 
             # First-touch onboarding: the first time a tool takes longer than
