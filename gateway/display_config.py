@@ -60,6 +60,19 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     # row was found. Off by default to avoid extra chat noise; platforms/users
     # can opt in where timing visibility matters.
     "tool_completion_durations": False,
+    # Surface a delegate_task child's OWN tool calls in gateway progress.
+    # Child tool events are already relayed to the parent's progress callback
+    # (tools/delegate_tool.py emits "subagent.tool"/"subagent.progress"), but
+    # the gateway drops them by default — only the parent's delegate_task call
+    # is shown. Three levels:
+    #   "off"     — drop child tool events (default; original behavior)
+    #   "batched" — render the batched "subagent.progress" summary only
+    #               (one card per ~5 child tools; low spam)
+    #   "full"    — render every individual "subagent.tool" event (noisy on
+    #               long subagent runs, but a complete live trace)
+    # A long subagent doing dozens of tools can post many permanent messages
+    # on platforms with no message editing, so this stays off unless opted in.
+    "subagent_tool_progress": "off",
 }
 
 # ---------------------------------------------------------------------------
@@ -261,6 +274,16 @@ def _normalise(setting: str, value: Any) -> Any:
     if setting == "reasoning_style":
         val = str(value).lower()
         return val if val in ("code", "blockquote", "subtext") else "code"
+    if setting == "subagent_tool_progress":
+        # Tri-state string flag. Accept legacy booleans for forgiveness:
+        # True → "full" (show everything), False → "off". Unknown strings
+        # collapse to "off" so a typo fails safe (quiet) rather than spamming.
+        if value is True:
+            return "full"
+        if value is False:
+            return "off"
+        v = str(value).strip().lower()
+        return v if v in {"off", "batched", "full"} else "off"
     if setting == "tool_preview_length":
         try:
             return int(value)
