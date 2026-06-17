@@ -230,6 +230,7 @@ def _format_subagent_tool_card(
     goal: Optional[str] = None,
     task_index: int = 0,
     task_count: int = 1,
+    include_header: bool = True,
 ) -> str:
     """Render ONE delegate_task child tool call as a compact gateway card.
 
@@ -240,19 +241,16 @@ def _format_subagent_tool_card(
     without dropping to the CLI. It is intentionally the child's tool *input*
     preview only — never subagent stdout/output, matching the privacy posture
     of ``_format_delegate_task_args_progress``.
+
+    ``include_header`` controls whether the ``🔀 <goal>`` header line is
+    emitted. The caller drops it for consecutive tool calls from the SAME
+    subagent so a long child run renders as one header followed by a run of
+    bare ``└ <tool>`` lines — mirroring the consecutive-terminal-block header
+    drop. When False, only the indented tool line is returned.
     """
     from agent.display import get_tool_emoji, get_tool_preview_max_len
 
     emoji = get_tool_emoji(tool_name or "", default="⚙️")
-    # 1-indexed subagent tag only when several children run in parallel, so a
-    # single-subagent run stays clean.
-    tag = f"[{task_index + 1}] " if task_count > 1 else ""
-    goal_label = (goal or "").strip()
-    if goal_label:
-        goal_short = (goal_label[:40] + "…") if len(goal_label) > 40 else goal_label
-        header = f"🔀 {tag}{goal_short}"
-    else:
-        header = f"🔀 {tag}subagent"
 
     line = f"{emoji} {tool_name or 'tool'}"
     if preview:
@@ -261,7 +259,20 @@ def _format_subagent_tool_card(
         short = preview if len(preview) <= _cap else preview[: _cap - 1] + "…"
         line += f'  "{short}"'
 
-    card = f"{header}\n└ {line}"
+    if include_header:
+        # 1-indexed subagent tag only when several children run in parallel, so
+        # a single-subagent run stays clean.
+        tag = f"[{task_index + 1}] " if task_count > 1 else ""
+        goal_label = (goal or "").strip()
+        if goal_label:
+            goal_short = (goal_label[:40] + "…") if len(goal_label) > 40 else goal_label
+            header = f"🔀 {tag}{goal_short}"
+        else:
+            header = f"🔀 {tag}subagent"
+        card = f"{header}\n└ {line}"
+    else:
+        card = f"└ {line}"
+
     try:
         from agent.redact import redact_sensitive_text
 
@@ -14626,6 +14637,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # fenced code block — consecutive terminal calls then drop the
         # repeated "💻 terminal" header and render back-to-back blocks.
         last_was_terminal_block = [False]
+        # Last delegate_task subagent whose tool card we rendered (by stable
+        # subagent_id). In "full" mode, consecutive child tool calls from the
+        # SAME subagent drop the repeated "🔀 <goal>" header so a long child
+        # run reads as one header + a run of bare "└ <tool>" lines — mirroring
+        # the consecutive-terminal-block header drop above. None until the
+        # first subagent tool card; reset is unnecessary since a different
+        # subagent_id naturally re-emits the header.
+        last_subagent_id = [None]
 
         # ── Discord voice "verbal ack before tool calls" ────────────────
         # When the bot is in a voice channel with the continuous mixer
@@ -14719,6 +14738,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # absorb a parent delegate_task duration suffix.
             if event_type in {"subagent.tool", "subagent.progress", "subagent_progress"}:
                 if subagent_progress_mode == "full" and event_type == "subagent.tool":
+                    # Header dedup keyed on the stable subagent_id (sa-<idx>-<uuid>
+                    # from tools/delegate_tool.py): emit the "🔀 <goal>" header
+                    # only when the active subagent changes. A missing/blank id
+                    # fails safe to header-always so we never silently strip the
+                    # only context line. task_index is NOT used as the key — it
+                    # can collide across nested orchestrator levels.
+                    _sub_id = kwargs.get("subagent_id")
+                    _include_header = (not _sub_id) or (_sub_id != last_subagent_id[0])
                     try:
                         _card = _format_subagent_tool_card(
                             tool_name,
@@ -14726,12 +14753,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             goal=kwargs.get("goal"),
                             task_index=int(kwargs.get("task_index", 0) or 0),
                             task_count=int(kwargs.get("task_count", 1) or 1),
+                            include_header=_include_header,
                         )
                     except Exception as _sub_err:
                         logger.debug("subagent tool card render failed: %s", _sub_err)
                         _card = None
                     if _card:
                         last_was_terminal_block[0] = False
+                        if _sub_id:
+                            last_subagent_id[0] = _sub_id
                         progress_queue.put(("__tool_start__", "__subagent__", _card))
                 elif subagent_progress_mode == "batched" and event_type in {
                     "subagent.progress",
