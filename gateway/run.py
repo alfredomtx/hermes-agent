@@ -2090,6 +2090,34 @@ def _append_tool_completion_duration_to_progress_line(
     return f"{text}{suffix}"
 
 
+def _append_subagent_duration_to_card(
+    line: Any,
+    duration: float,
+    *,
+    is_error: bool = False,
+) -> str:
+    """Append completion timing to the LAST visible line of a subagent card.
+
+    Subagent "full"-mode cards are either two lines (``🔀 <goal>`` header +
+    ``└ <tool> "preview"``) or, when the header was deduped, a single bare
+    ``└ <tool>`` line. The benchmark suffix must sit with the *tool* line, so
+    we append to the last non-blank line rather than the first — otherwise on a
+    header card the "· 10ms" would land on the goal header. For a bare deduped
+    card the last line IS the tool line, so this is correct in both shapes.
+    """
+    text = str(line or "")
+    suffix = _format_tool_completion_duration_suffix(duration, is_error=is_error)
+    if not text:
+        return suffix.strip()
+
+    lines = text.splitlines()
+    for index in range(len(lines) - 1, -1, -1):
+        if lines[index].strip():
+            lines[index] = f"{lines[index]}{suffix}"
+            return "\n".join(lines)
+    return f"{text}{suffix}"
+
+
 async def _probe_audio_duration(path: str) -> Optional[str]:
     """Best-effort duration probe. Returns formatted MM:SS / HH:MM:SS, or None on failure."""
     ext = os.path.splitext(path)[1].lower()
@@ -14736,7 +14764,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Queued under the "__subagent__" sentinel (not "delegate_task") so
             # these cards stay out of the parent's tool-completion FIFO and never
             # absorb a parent delegate_task duration suffix.
-            if event_type in {"subagent.tool", "subagent.progress", "subagent_progress"}:
+            if event_type in {
+                "subagent.tool",
+                "subagent.progress",
+                "subagent_progress",
+                "subagent.tool_completed",
+            }:
                 if subagent_progress_mode == "full" and event_type == "subagent.tool":
                     # Header dedup keyed on the stable subagent_id (sa-<idx>-<uuid>
                     # from tools/delegate_tool.py): emit the "🔀 <goal>" header
@@ -14762,7 +14795,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         last_was_terminal_block[0] = False
                         if _sub_id:
                             last_subagent_id[0] = _sub_id
-                        progress_queue.put(("__tool_start__", "__subagent__", _card))
+                        # Tuple carries the subagent_id + real tool name so the
+                        # consumer can match a later completion to THIS child's
+                        # card (keyed on (sub_id, tool)) without cross-attributing
+                        # a parallel sibling's duration. The "__subagent__"
+                        # sentinel still keeps these out of the parent's FIFO.
+                        progress_queue.put(
+                            (
+                                "__tool_start__",
+                                "__subagent__",
+                                _card,
+                                _sub_id or "",
+                                str(tool_name or ""),
+                            )
+                        )
+                elif subagent_progress_mode == "full" and event_type == "subagent.tool_completed":
+                    # Benchmark suffix: append "· <duration>" to this child's
+                    # matching tool card. Only meaningful in "full" mode (one
+                    # card per child tool); batched/off have no per-tool row to
+                    # annotate. Independent of the parent's
+                    # tool_completion_durations toggle — opting into "full"
+                    # subagent visibility implies you want the timings too.
+                    _sub_id = kwargs.get("subagent_id") or ""
+                    progress_queue.put(
+                        (
+                            "__subagent_duration__",
+                            _sub_id,
+                            str(tool_name or ""),
+                            kwargs.get("duration"),
+                            bool(kwargs.get("is_error", False)),
+                        )
+                    )
                 elif subagent_progress_mode == "batched" and event_type in {
                     "subagent.progress",
                     "subagent_progress",
@@ -15242,6 +15305,77 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             def _reset_pending_tool_lines() -> None:
                 pending_tool_line_indexes.clear()
+                subagent_pending_indexes.clear()
+
+            # Parallel pending map for subagent tool cards, keyed on
+            # (subagent_id, tool_name). Kept separate from the parent's
+            # pending_tool_line_indexes (which keys on tool name alone and is
+            # fed by the "__subagent__" sentinel, so it never sees these) so a
+            # completion from one child can never staple its duration onto a
+            # concurrent sibling's identically-named tool card. Within a single
+            # child, starts and completions arrive in FIFO order, so popping the
+            # oldest index for a given (sub_id, tool) is correct even when two
+            # children interleave on the parent's single callback.
+            subagent_pending_indexes: dict[tuple, list[int]] = {}
+
+            def _record_subagent_pending_line(
+                sub_id: Any, tool_name: Any, index: int
+            ) -> None:
+                # Record even when sub_id is "" (missing id) so the matching
+                # completion (also "") can still find its card; the key just
+                # degrades to (\"\", tool) which is still per-tool-name FIFO.
+                if tool_name:
+                    subagent_pending_indexes.setdefault(
+                        (str(sub_id or ""), str(tool_name)), []
+                    ).append(index)
+
+            def _complete_subagent_pending_line(
+                sub_id: Any,
+                tool_name: Any,
+                duration: Any,
+                is_error: bool,
+            ) -> Optional[int]:
+                if not tool_name:
+                    return None
+                key = (str(sub_id or ""), str(tool_name))
+                indexes = subagent_pending_indexes.get(key) or []
+                while indexes:
+                    index = indexes.pop(0)
+                    if 0 <= index < len(progress_lines):
+                        progress_lines[index] = (
+                            _append_subagent_duration_to_card(
+                                progress_lines[index],
+                                duration,
+                                is_error=is_error,
+                            )
+                        )
+                        return index
+                # No matching start card (e.g. it overflowed out of the editable
+                # bubble, or the start was dropped). Unlike the parent path we do
+                # NOT emit a standalone "✅ tool completed" fallback row for
+                # subagents — an orphan completion line with no preceding card is
+                # more confusing than a silently-missing suffix.
+                return None
+
+            def _remap_subagent_pending_lines(kept_offset: int) -> None:
+                """Rebase subagent pending indexes onto the kept overflow bubble.
+
+                Mirrors _remap_pending_tool_lines for the (sub_id, tool) map so a
+                subagent card that survives an overflow split keeps its pending
+                slot and still receives its inline duration suffix.
+                """
+                if kept_offset <= 0:
+                    return
+                for key in list(subagent_pending_indexes.keys()):
+                    rebased = [
+                        index - kept_offset
+                        for index in subagent_pending_indexes[key]
+                        if index >= kept_offset
+                    ]
+                    if rebased:
+                        subagent_pending_indexes[key] = rebased
+                    else:
+                        del subagent_pending_indexes[key]
 
             def _remap_pending_tool_lines(kept_offset: int) -> None:
                 """Rebase pending start-row indexes onto the kept overflow bubble.
@@ -15342,6 +15476,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 kept_offset = len(progress_lines) - len(groups[-1])
                 progress_lines = groups[-1]
                 _remap_pending_tool_lines(kept_offset)
+                _remap_subagent_pending_lines(kept_offset)
                 return True
 
             async def _close_bubble_preserving_inflight() -> None:
@@ -15373,6 +15508,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 inflight_indexes = sorted({
                     idx
                     for idxs in pending_tool_line_indexes.values()
+                    for idx in idxs
+                    if 0 <= idx < len(progress_lines)
+                } | {
+                    # Include subagent in-flight rows so a child tool whose
+                    # start card was queued but whose duration hasn't arrived
+                    # yet is carried into the re-seeded bubble too — otherwise
+                    # its later "· Xs" suffix would find no card and be dropped.
+                    idx
+                    for idxs in subagent_pending_indexes.values()
                     for idx in idxs
                     if 0 <= idx < len(progress_lines)
                 })
@@ -15410,6 +15554,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         pending_tool_line_indexes[tool_name] = remapped
                     else:
                         del pending_tool_line_indexes[tool_name]
+                # Same rebase for the subagent (sub_id, tool) pending map.
+                for _sa_key in list(subagent_pending_indexes.keys()):
+                    _sa_remapped = [
+                        old_to_new[i]
+                        for i in subagent_pending_indexes[_sa_key]
+                        if i in old_to_new
+                    ]
+                    if _sa_remapped:
+                        subagent_pending_indexes[_sa_key] = _sa_remapped
+                    else:
+                        del subagent_pending_indexes[_sa_key]
                 progress_msg_id = None
                 progress_lines = carried_lines
                 last_progress_msg[0] = None
@@ -15435,6 +15590,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _, started_tool_name, started_msg = raw
                             progress_lines.append(str(started_msg))
                             _record_pending_tool_line(started_tool_name, len(progress_lines) - 1)
+                            await _roll_progress_overflow_if_needed()
+                        elif isinstance(raw, tuple) and len(raw) == 5 and raw[0] == "__tool_start__":
+                            # Subagent tool card: (sentinel, "__subagent__", card,
+                            # sub_id, real_tool). Record in the (sub_id, tool)
+                            # pending map — NOT the parent FIFO — so a later
+                            # __subagent_duration__ matches this child's card.
+                            _, _sa_sentinel, started_msg, _sa_id, _sa_tool = raw
+                            progress_lines.append(str(started_msg))
+                            _record_subagent_pending_line(
+                                _sa_id, _sa_tool, len(progress_lines) - 1
+                            )
+                            await _roll_progress_overflow_if_needed()
+                        elif isinstance(raw, tuple) and len(raw) == 5 and raw[0] == "__subagent_duration__":
+                            _, _sa_id, _sa_tool, _sa_dur, _sa_err = raw
+                            _complete_subagent_pending_line(
+                                _sa_id, _sa_tool, _sa_dur, bool(_sa_err)
+                            )
                             await _roll_progress_overflow_if_needed()
                         elif isinstance(raw, tuple) and len(raw) == 4 and raw[0] == "__tool_duration__":
                             _, completed_tool_name, duration, is_error = raw
@@ -15515,6 +15687,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Handle structured progress messages first, then legacy
                     # plain strings.
                     if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
+                        # NOTE: this rewrites progress_lines[-1] in place. A
+                        # subagent tool card (queued as a 5-tuple "__tool_start__"
+                        # below) can legitimately occupy that last slot, and it
+                        # never updates last_progress_msg/repeat_count, so it is
+                        # never itself the dedup target. __dedup__ is also only
+                        # produced when tool_completion_durations is OFF, and a
+                        # child's duration suffixes are all enqueued (FIFO) before
+                        # delegate_task returns control to the parent — so a
+                        # pending subagent suffix can't land on a clobbered line.
                         _, base_msg, count = raw
                         if progress_lines:
                             progress_lines[-1] = f"{base_msg} (×{count + 1})"
@@ -15524,6 +15705,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         msg = str(started_msg)
                         progress_lines.append(msg)
                         _record_pending_tool_line(started_tool_name, len(progress_lines) - 1)
+                    elif isinstance(raw, tuple) and len(raw) == 5 and raw[0] == "__tool_start__":
+                        # Subagent tool card: (sentinel, "__subagent__", card,
+                        # sub_id, real_tool). Recorded in the (sub_id, tool)
+                        # pending map so its later __subagent_duration__ matches
+                        # this child's row, never a parallel sibling's.
+                        _, _sa_sentinel, started_msg, _sa_id, _sa_tool = raw
+                        msg = str(started_msg)
+                        progress_lines.append(msg)
+                        _record_subagent_pending_line(
+                            _sa_id, _sa_tool, len(progress_lines) - 1
+                        )
+                    elif isinstance(raw, tuple) and len(raw) == 5 and raw[0] == "__subagent_duration__":
+                        _, _sa_id, _sa_tool, _sa_dur, _sa_err = raw
+                        _sa_index = _complete_subagent_pending_line(
+                            _sa_id, _sa_tool, _sa_dur, bool(_sa_err)
+                        )
+                        if _sa_index is None:
+                            # No matching card (overflowed/dropped). Suppress —
+                            # no orphan fallback row for subagents.
+                            continue
+                        msg = progress_lines[_sa_index]
                     elif isinstance(raw, tuple) and len(raw) == 4 and raw[0] == "__tool_duration__":
                         _, completed_tool_name, duration, is_error = raw
                         completed_index = _complete_pending_tool_line(

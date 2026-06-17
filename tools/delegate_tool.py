@@ -1088,6 +1088,22 @@ def _build_child_progress_callback(
             return
 
         if event == DelegateEvent.TASK_TOOL_COMPLETED:
+            # Relay the child tool's completion timing so the gateway can append
+            # a "· 10ms" benchmark suffix to the matching subagent card (same as
+            # the parent agent's tool rows). Forward ONLY tool_name + duration +
+            # is_error — never the result payload (that's subagent output, kept
+            # out of progress for the same privacy reason tool-start previews are
+            # input-only). subagent_id rides along via _identity_kwargs so the
+            # gateway can match completions to the right child under parallelism.
+            # CLI spinner path renders nothing on completion (it only prints tool
+            # starts), so this is gateway-only and a no-op when parent_cb is None.
+            if parent_cb:
+                _relay(
+                    "subagent.tool_completed",
+                    tool_name,
+                    duration=kwargs.get("duration"),
+                    is_error=bool(kwargs.get("is_error", False)),
+                )
             return
 
         if event == DelegateEvent.TASK_PROGRESS:
