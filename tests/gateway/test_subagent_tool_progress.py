@@ -240,7 +240,12 @@ class TestSubagentDispatchContract:
 
         def dispatch(mode, event_type, tool_name=None, preview=None, **kwargs):
             out = []
-            if event_type in {"subagent.tool", "subagent.progress", "subagent_progress"}:
+            if event_type in {
+                "subagent.tool",
+                "subagent.progress",
+                "subagent_progress",
+                "subagent.tool_completed",
+            }:
                 if mode == "full" and event_type == "subagent.tool":
                     _sub_id = kwargs.get("subagent_id")
                     _include_header = (not _sub_id) or (_sub_id != last_subagent_id[0])
@@ -255,7 +260,25 @@ class TestSubagentDispatchContract:
                     if card:
                         if _sub_id:
                             last_subagent_id[0] = _sub_id
-                        out.append(("__tool_start__", "__subagent__", card))
+                        out.append(
+                            (
+                                "__tool_start__",
+                                "__subagent__",
+                                card,
+                                _sub_id or "",
+                                str(tool_name or ""),
+                            )
+                        )
+                elif mode == "full" and event_type == "subagent.tool_completed":
+                    out.append(
+                        (
+                            "__subagent_duration__",
+                            kwargs.get("subagent_id") or "",
+                            str(tool_name or ""),
+                            kwargs.get("duration"),
+                            bool(kwargs.get("is_error", False)),
+                        )
+                    )
                 elif mode == "batched" and event_type in {
                     "subagent.progress",
                     "subagent_progress",
@@ -399,3 +422,153 @@ class TestSubagentDispatchContract:
         assert verdict == "PASSTHROUGH" and out == []
         verdict, _ = self._dispatch("full", "tool.completed", "read_file")
         assert verdict == "PASSTHROUGH"
+
+    def test_full_tool_completed_enqueues_duration(self):
+        # subagent.tool_completed → "__subagent_duration__" tuple carrying
+        # (sub_id, tool, duration, is_error). batched/off ignore it.
+        _, out = self._dispatch(
+            "full", "subagent.tool_completed", "terminal",
+            subagent_id="sa-0-aaa", duration=0.012, is_error=False,
+        )
+        assert len(out) == 1
+        assert out[0][0] == "__subagent_duration__"
+        assert out[0][1] == "sa-0-aaa"
+        assert out[0][2] == "terminal"
+        assert out[0][3] == 0.012
+        assert out[0][4] is False
+
+    def test_batched_and_off_ignore_tool_completed(self):
+        _, out_b = self._dispatch(
+            "batched", "subagent.tool_completed", "terminal",
+            subagent_id="sa-0-aaa", duration=0.012,
+        )
+        assert out_b == []
+        _, out_o = self._dispatch(
+            "off", "subagent.tool_completed", "terminal",
+            subagent_id="sa-0-aaa", duration=0.012,
+        )
+        assert out_o == []
+
+    def test_start_tuple_carries_subagent_id_and_tool(self):
+        # The 5-tuple start card must carry sub_id + real tool so the consumer
+        # can build its (sub_id, tool) pending key.
+        _, out = self._dispatch(
+            "full", "subagent.tool", "read_file", "x.py",
+            goal="g", subagent_id="sa-1-bbb",
+        )
+        assert out[0][0] == "__tool_start__"
+        assert out[0][1] == "__subagent__"
+        assert out[0][3] == "sa-1-bbb"
+        assert out[0][4] == "read_file"
+
+
+# ---------------------------------------------------------------------------
+# run._append_subagent_duration_to_card — benchmark suffix placement
+# ---------------------------------------------------------------------------
+
+class TestAppendSubagentDurationToCard:
+    def test_suffix_lands_on_tool_line_not_header(self):
+        from gateway.run import _append_subagent_duration_to_card
+
+        card = '🔀 Review the diff\n└ 💻 terminal  "pytest"'
+        out = _append_subagent_duration_to_card(card, 0.012, is_error=False)
+        lines = out.splitlines()
+        # Header untouched; suffix on the tool (last) line.
+        assert lines[0] == "🔀 Review the diff"
+        assert lines[1].endswith("· 12ms")
+        assert "·" not in lines[0]
+
+    def test_suffix_on_bare_deduped_card(self):
+        from gateway.run import _append_subagent_duration_to_card
+
+        card = '└ ⚙️ read_file  "config.yaml"'
+        out = _append_subagent_duration_to_card(card, 1.5)
+        assert out.endswith("· 1.5s")
+        assert out.count("\n") == 0
+
+    def test_error_suffix(self):
+        from gateway.run import _append_subagent_duration_to_card
+
+        out = _append_subagent_duration_to_card("└ terminal", 2.0, is_error=True)
+        assert "failed after 2.0s" in out
+
+
+# ---------------------------------------------------------------------------
+# End-to-end consumer mirror: out-of-order parallel duration matching
+# ---------------------------------------------------------------------------
+# This models the gateway queue consumer's progress_lines + (sub_id, tool)
+# pending map and proves the headline correctness property: with two parallel
+# children running the SAME tool name, completions arriving OUT OF ORDER each
+# land on their own child's card — no cross-attribution. Same drift caveat as
+# the dispatch harness: hand-copied mirror of the consumer branch.
+
+class TestSubagentDurationMatching:
+    def _make_consumer(self):
+        from gateway.run import (
+            _format_subagent_tool_card,
+            _append_subagent_duration_to_card,
+        )
+
+        progress_lines = []
+        subagent_pending = {}  # (sub_id, tool) -> [indexes]
+        last_subagent_id = [None]
+
+        def on_start(tool, preview, goal, sub_id, idx=0, cnt=1):
+            inc = (not sub_id) or (sub_id != last_subagent_id[0])
+            card = _format_subagent_tool_card(
+                tool, preview, goal=goal, task_index=idx, task_count=cnt,
+                include_header=inc,
+            )
+            if sub_id:
+                last_subagent_id[0] = sub_id
+            progress_lines.append(card)
+            subagent_pending.setdefault((sub_id or "", tool), []).append(
+                len(progress_lines) - 1
+            )
+
+        def on_complete(tool, sub_id, duration, is_error=False):
+            key = (sub_id or "", tool)
+            idxs = subagent_pending.get(key) or []
+            while idxs:
+                i = idxs.pop(0)
+                if 0 <= i < len(progress_lines):
+                    progress_lines[i] = _append_subagent_duration_to_card(
+                        progress_lines[i], duration, is_error=is_error
+                    )
+                    return i
+            return None
+
+        return progress_lines, on_start, on_complete
+
+    def test_out_of_order_parallel_no_cross_attribution(self):
+        lines, on_start, on_complete = self._make_consumer()
+        # Two children both run read_file; A starts first, B second.
+        on_start("read_file", "a.py", "Child A", "sa-0-aaa", 0, 2)  # line 0
+        on_start("read_file", "b.py", "Child B", "sa-1-bbb", 1, 2)  # line 1
+        # Completions arrive OUT OF ORDER: B finishes first, then A.
+        idx_b = on_complete("read_file", "sa-1-bbb", 0.005)
+        idx_a = on_complete("read_file", "sa-0-aaa", 2.0)
+        assert idx_b == 1 and idx_a == 0
+        # Each duration landed on its OWN child's card.
+        assert "a.py" in lines[0] and "· 2.0s" in lines[0]
+        assert "b.py" in lines[1] and "· 5ms" in lines[1]
+        # No cross-contamination.
+        assert "· 5ms" not in lines[0]
+        assert "· 2.0s" not in lines[1]
+
+    def test_same_child_repeated_tool_fifo(self):
+        lines, on_start, on_complete = self._make_consumer()
+        # One child runs read_file twice; FIFO matching within the child.
+        on_start("read_file", "first.py", "Child A", "sa-0-aaa")   # line 0
+        on_start("read_file", "second.py", "Child A", "sa-0-aaa")  # line 1 (deduped header)
+        on_complete("read_file", "sa-0-aaa", 0.1)   # → oldest = line 0
+        on_complete("read_file", "sa-0-aaa", 0.2)   # → next = line 1
+        assert "first.py" in lines[0] and "· 0.1s" in lines[0]
+        assert "second.py" in lines[1] and "· 0.2s" in lines[1]
+
+    def test_unmatched_completion_is_dropped_no_orphan(self):
+        lines, on_start, on_complete = self._make_consumer()
+        # Completion with no matching start card → returns None, no row added.
+        result = on_complete("terminal", "sa-9-zzz", 0.5)
+        assert result is None
+        assert lines == []  # no orphan "✅ completed" line
