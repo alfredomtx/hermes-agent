@@ -1,3 +1,4 @@
+import json
 import time
 from collections import OrderedDict
 from types import SimpleNamespace
@@ -147,7 +148,20 @@ class FakeTodoTimingAgent(BaseFakeTimingAgent):
             ]
         }
         cb("tool.started", "todo", preview=None, args=args)
-        cb("tool.completed", "todo", duration=0.004)
+        # Completion carries the tool result with per-item wall-clock timing
+        # (the todo tool stamps started_at/ended_at and exposes elapsed_seconds).
+        # The "one" task finished after ~2m14s; "two" never started → no time.
+        result = json.dumps({
+            "todos": [
+                {"id": "one", "content": "Audit config", "status": "completed", "elapsed_seconds": 134.0},
+                {"id": "two", "content": "Summarize risk", "status": "pending", "elapsed_seconds": None},
+            ],
+            "summary": {
+                "total": 2, "pending": 1, "in_progress": 0,
+                "completed": 1, "cancelled": 0, "total_elapsed_seconds": 134.0,
+            },
+        })
+        cb("tool.completed", "todo", duration=0.004, result=result)
 
 
 class FakeParallelSameToolAgent(BaseFakeTimingAgent):
@@ -331,7 +345,7 @@ async def test_completion_rows_are_not_overwritten_by_repeated_start_dedup(monke
 
 
 @pytest.mark.asyncio
-async def test_todo_plan_card_gets_inline_duration_instead_of_completion_row(monkeypatch):
+async def test_todo_plan_card_rerenders_with_per_item_durations(monkeypatch):
     user_config = _base_user_config(
         {
             "tool_progress": "all",
@@ -347,9 +361,55 @@ async def test_todo_plan_card_gets_inline_duration_instead_of_completion_row(mon
 
     assert result["final_response"] == "done"
     assert completion_lines == []
-    assert "📋 Plan (2 tasks) · 4ms" in rendered
-    assert "1. 🔄 in progress - Audit config" in rendered
+    # The todo card is RE-RENDERED at completion with per-item wall-clock
+    # durations (the start card is replaced in place via __todo_complete__).
+    # The old behavior appended the tool's own write latency ("· 4ms") to the
+    # start card, which measured the in-memory list write, not task time — that
+    # suffix must be gone, and no standalone "✅ todo completed" fallback row.
+    assert "· 4ms" not in rendered
     assert "✅ todo completed in 4ms" not in rendered
+    # Completed task shows its wall-clock span; pending task shows none.
+    assert "✅ completed (2m 14s) - Audit config" in rendered
+    assert "⏳ pending - Summarize risk" in rendered
+    # The pending row never gets a duration paren.
+    pending_rows = [
+        line for line in rendered.splitlines() if "Summarize risk" in line
+    ]
+    assert pending_rows and all("(" not in row for row in pending_rows)
+
+
+@pytest.mark.asyncio
+async def test_todo_completion_without_result_keeps_start_card(monkeypatch):
+    """If a todo completion arrives with no result payload, keep the start card
+    as-is. The completion must NOT emit the 'Reading task list' sentinel or a
+    bogus empty card."""
+    user_config = _base_user_config(
+        {
+            "tool_progress": "all",
+            "tool_completion_durations": True,
+        }
+    )
+
+    class FakeTodoNoResultAgent(BaseFakeTimingAgent):
+        def emit_tool_progress(self, cb):
+            args = {"todos": [
+                {"id": "one", "content": "Audit config", "status": "in_progress"},
+            ]}
+            cb("tool.started", "todo", preview=None, args=args)
+            cb("tool.completed", "todo", duration=0.004)  # no result kwarg
+
+    result, rendered, completion_lines = await _run_gateway_with_fake_agent(
+        monkeypatch,
+        user_config,
+        FakeTodoNoResultAgent,
+    )
+
+    assert result["final_response"] == "done"
+    # Start card preserved; no sentinel, no duration suffix, no fallback row.
+    assert "🔄 in progress - Audit config" in rendered
+    assert "Reading task list" not in rendered
+    assert "· 4ms" not in rendered
+    assert "✅ todo completed" not in rendered
 
 
 @pytest.mark.asyncio

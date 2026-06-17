@@ -14689,6 +14689,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # several tools exceed the threshold.
         long_tool_hint_fired = [False]
         _LONG_TOOL_THRESHOLD_S = 30.0
+        # FIFO of the ``merge`` flag for each todo call, pushed at tool.started
+        # and popped at tool.completed. Lets the completion re-render keep the
+        # same "📋 Plan" vs "📋 Plan update" title the start card used. The
+        # agent emits started/completed in parsed-call (FIFO) order.
+        _todo_merge_flags: List[bool] = []
 
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
@@ -14774,6 +14779,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception as _hint_err:
                         logger.debug("tool-progress onboarding hint failed: %s", _hint_err)
 
+                if tool_name == "todo":
+                    # Todo completion: the result carries per-item wall-clock
+                    # durations the start card could not (args have no timing).
+                    # Re-render the card from the result and REPLACE the start
+                    # row in place, instead of appending a "· 0ms" suffix that
+                    # only measures the in-memory list write, not task time.
+                    # Skip entirely when progress is off — the start branch
+                    # (gated on progress_mode below) never queued a card or a
+                    # merge flag, so there is nothing to supersede.
+                    if progress_mode == "off":
+                        return
+                    _merge_flag = _todo_merge_flags.pop(0) if _todo_merge_flags else False
+                    _todo_done_card = None
+                    _todo_result = kwargs.get("result")
+                    # Only re-render when the result actually carries items with
+                    # timing. With no usable result we leave the start card as-is
+                    # rather than emit the "Reading task list" sentinel (which
+                    # format_todo_progress returns for an empty/argless payload).
+                    if _todo_result is not None:
+                        try:
+                            from gateway.todo_progress import format_todo_progress
+
+                            _todo_done_card = format_todo_progress(
+                                {"merge": _merge_flag},
+                                result=_todo_result,
+                            )
+                        except Exception:
+                            _todo_done_card = None
+                    if _todo_done_card:
+                        last_was_terminal_block[0] = False
+                        last_progress_msg[0] = None
+                        repeat_count[0] = 0
+                        progress_queue.put(("__todo_complete__", "todo", _todo_done_card))
+                    return
+
                 if tool_completion_durations_enabled and tool_name:
                     last_was_terminal_block[0] = False
                     last_progress_msg[0] = None
@@ -14812,6 +14852,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
             if progress_mode == "off":
                 return
+
+            # Push this todo call's merge flag BEFORE the "new"-mode dedup
+            # early-return below, so the started/completed FIFO stays aligned
+            # even when a consecutive same-tool start row is deduped away. Both
+            # this push and the completion pop are gated on progress_mode != off
+            # (checked just above / in the tool.completed branch), so they stay
+            # one-to-one. The flag only drives the completion card's title.
+            if tool_name == "todo":
+                try:
+                    _todo_merge_flags.append(bool((args or {}).get("merge", False)))
+                except Exception:
+                    _todo_merge_flags.append(False)
 
             # Suppress tool-progress bubbles once the user has sent `stop`.
             # When the LLM response carries N parallel tool calls, the agent
@@ -15138,6 +15190,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return len(progress_lines) - 1
 
+            def _replace_pending_tool_line(tool_name: Any, new_text: str) -> Optional[int]:
+                """Swap a pending start row's text for a completion re-render.
+
+                Used by todo, whose completion card (with per-item durations)
+                fully supersedes the start card rather than appending a suffix.
+                Pops the oldest unresolved start row (FIFO, same ordering as
+                _complete_pending_tool_line) and overwrites it in place. Returns
+                the replaced index, or None when no start row is pending (e.g.
+                the start card was suppressed) so the caller can append instead.
+                """
+                if not tool_name:
+                    return None
+                indexes = pending_tool_line_indexes.get(str(tool_name)) or []
+                while indexes:
+                    index = indexes.pop(0)
+                    if 0 <= index < len(progress_lines):
+                        progress_lines[index] = str(new_text)
+                        return index
+                return None
+
             def _reset_pending_tool_lines() -> None:
                 pending_tool_line_indexes.clear()
 
@@ -15348,6 +15420,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     bool(is_error),
                                 )
                             await _roll_progress_overflow_if_needed()
+                        elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__todo_complete__":
+                            _, _todo_tool_name, _todo_card = raw
+                            if _replace_pending_tool_line(_todo_tool_name, _todo_card) is None:
+                                progress_lines.append(str(_todo_card))
+                            await _roll_progress_overflow_if_needed()
                         elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
                             # Content-bubble marker during drain: close off the
                             # current bubble but carry in-flight tool rows so a
@@ -15431,6 +15508,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 bool(is_error),
                             )
                         msg = progress_lines[completed_index]
+                    elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__todo_complete__":
+                        # Todo finished: replace the start card with the timed
+                        # re-render in place. No duration suffix — the card
+                        # already shows per-item wall-clock durations.
+                        _, _todo_tool_name, _todo_card = raw
+                        replaced_index = _replace_pending_tool_line(_todo_tool_name, _todo_card)
+                        if replaced_index is None:
+                            progress_lines.append(str(_todo_card))
+                            replaced_index = len(progress_lines) - 1
+                        msg = progress_lines[replaced_index]
                     elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
                         # Content bubble just landed on the platform — close off
                         # the current tool-progress bubble so the next tool

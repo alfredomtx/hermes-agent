@@ -81,6 +81,44 @@ def test_todo_progress_reading_state():
     assert format_todo_progress({}) == "📋 Todo\nReading task list"
 
 
+def test_todo_progress_renders_durations_from_result():
+    result = {
+        "todos": [
+            {"id": "a", "content": "build core", "status": "completed", "elapsed_seconds": 134.0},
+            {"id": "b", "content": "write tests", "status": "in_progress", "elapsed_seconds": 5.0},
+            {"id": "c", "content": "review", "status": "pending", "elapsed_seconds": None},
+        ]
+    }
+    card = format_todo_progress({"merge": True}, result=result)
+    assert card is not None
+    # Per-item wall-clock durations appear; pending (unmeasured) shows none.
+    assert "1. ✅ completed (2m 14s) - build core" in card
+    assert "2. 🔄 in progress (5.0s) - write tests" in card
+    assert "3. ⏳ pending - review" in card
+    assert "(" not in card.splitlines()[3]  # pending row has no duration paren
+
+
+def test_todo_progress_result_supersedes_args():
+    # Args (tool-start) carry no timing; result (completion) does and wins.
+    args = {"todos": [{"id": "a", "content": "stale", "status": "pending"}]}
+    result = {"todos": [{"id": "a", "content": "fresh", "status": "completed", "elapsed_seconds": 1.5}]}
+    card = format_todo_progress(args, result=result)
+    assert card is not None
+    assert "fresh" in card and "stale" not in card
+    assert "(1.5s)" in card
+
+
+def test_todo_progress_result_as_json_string():
+    # Gateway passes the raw tool result, which is a JSON string.
+    import json as _json
+    result = _json.dumps({"todos": [
+        {"id": "a", "content": "task", "status": "completed", "elapsed_seconds": 0.05},
+    ]})
+    card = format_todo_progress({"merge": False}, result=result)
+    assert card is not None
+    assert "✅ completed (50ms) - task" in card
+
+
 def test_base_adapter_uses_todo_progress_renderer():
     lines = []
     dispatcher = GatewayEventDispatcher(

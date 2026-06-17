@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Optional
 
 
@@ -32,24 +33,80 @@ def _truncate(text: str, limit: int) -> str:
     return text[: limit - 3] + "..."
 
 
+def _format_elapsed(seconds: Any) -> Optional[str]:
+    """Compact human duration for a per-item span. None when unmeasured.
+
+    Mirrors the gateway's tool-progress duration buckets (ms / s / m / h) so a
+    todo item's time reads the same as any other tool's completion time.
+    """
+    if not isinstance(seconds, (int, float)) or isinstance(seconds, bool):
+        return None
+    value = float(seconds)
+    if value < 0:
+        value = 0.0
+    if value < 0.1:
+        return f"{int(round(value * 1000))}ms"
+    if value < 10:
+        return f"{value:.1f}s"
+    total = int(round(value))
+    if total < 60:
+        return f"{total}s"
+    minutes, secs = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m {secs:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"
+
+
+def _coerce_todo_items(payload: Any) -> Optional[list]:
+    """Extract the todo item list from a tool result (JSON string or dict)."""
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (ValueError, TypeError):
+            return None
+    if isinstance(payload, dict):
+        items = payload.get("todos")
+        return items if isinstance(items, list) else None
+    return None
+
+
 def format_todo_progress(
     args: Optional[dict],
     *,
+    result: Any = None,
     max_items: int = 12,
     content_limit: int = 160,
 ) -> Optional[str]:
     """Render ``todo`` tool args as a compact plan card.
 
-    Gateway tool-progress events are emitted at tool start, so this renders the
-    input args, not the completed result.  Initial planning calls pass the full
-    list. Merge calls often pass only changed items, so label them as updates.
+    Gateway tool-progress events are emitted at tool start, so by default this
+    renders the input args, not the completed result.  Initial planning calls
+    pass the full list. Merge calls often pass only changed items, so label them
+    as updates.
+
+    When ``result`` is provided (the tool's completion payload), per-item
+    wall-clock durations are read from it and shown as ``(2m 14s)`` suffixes.
+    The model's args never carry timing, so durations only appear on the
+    completion re-render. If ``result`` is provided but carries no usable item
+    list, returns None (the caller should keep the existing start card) rather
+    than falling back to args or the "Reading task list" sentinel.
     """
     if not isinstance(args, dict):
         return None
 
-    todos = args.get("todos")
-    if todos is None:
-        return "📋 Todo\nReading task list"
+    if result is not None:
+        # Completion re-render path: the result is authoritative. No usable
+        # items → no card (caller leaves the start card untouched).
+        result_items = _coerce_todo_items(result)
+        if result_items is None:
+            return None
+        todos = result_items
+    else:
+        # Tool-start path: render from args (no timing available yet).
+        todos = args.get("todos")
+        if todos is None:
+            return "📋 Todo\nReading task list"
     if not isinstance(todos, list):
         return None
 
@@ -74,8 +131,10 @@ def format_todo_progress(
         icon = _STATUS_ICON.get(status, "•")
         content = _one_line(item.get("content") or item.get("id") or "<untitled task>")
         content = _truncate(content, content_limit)
+        elapsed = _format_elapsed(item.get("elapsed_seconds"))
+        duration = f" ({elapsed})" if elapsed else ""
         shown += 1
-        lines.append(f"{shown}. {icon} {label} - {content}")
+        lines.append(f"{shown}. {icon} {label}{duration} - {content}")
 
     remaining = count - shown
     if remaining > 0:
