@@ -1387,6 +1387,41 @@ class TelegramAdapter(BasePlatformAdapter):
                     self.name, exc,
                 )
             return False
+    @staticmethod
+    def _inline_keyboard_from_buttons(buttons: Optional[list]) -> Optional["InlineKeyboardMarkup"]:
+        """Build an InlineKeyboardMarkup from a generic ``buttons`` spec.
+
+        Accepts a flat list of ``{"text", "callback_data"}`` dicts (rendered as
+        a single row) or a list of such rows. Returns ``None`` when ``buttons``
+        is empty/falsy so callers can pass ``reply_markup=None`` to clear an
+        existing inline keyboard on edit. Malformed entries are skipped; a row
+        that ends up empty is dropped. Returns ``None`` if nothing valid remains.
+        """
+        if not buttons or InlineKeyboardMarkup is None or InlineKeyboardButton is None:
+            return None
+        # Normalize to list-of-rows: a flat list of dicts is one row.
+        if isinstance(buttons, list) and buttons and isinstance(buttons[0], dict):
+            rows = [buttons]
+        elif isinstance(buttons, list):
+            rows = [row for row in buttons if isinstance(row, list)]
+        else:
+            return None
+        keyboard = []
+        for row in rows:
+            built_row = []
+            for spec in row:
+                if not isinstance(spec, dict):
+                    continue
+                text = spec.get("text")
+                callback_data = spec.get("callback_data")
+                if not text or not callback_data:
+                    continue
+                built_row.append(InlineKeyboardButton(str(text), callback_data=str(callback_data)))
+            if built_row:
+                keyboard.append(built_row)
+        if not keyboard:
+            return None
+        return InlineKeyboardMarkup(keyboard)
 
     async def _drain_polling_connections(self) -> None:
         """Reset the httpx connection pool used for getUpdates polling.
@@ -2386,9 +2421,11 @@ class TelegramAdapter(BasePlatformAdapter):
         chat_id: str,
         content: str,
         reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
+        buttons: Optional[list] = None
     ) -> SendResult:
         """Send a message to a Telegram chat."""
+        _reply_markup = self._inline_keyboard_from_buttons(buttons)
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
@@ -2495,6 +2532,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 effective_thread_id = thread_kwargs.get("message_thread_id")
 
                 msg = None
+                # Inline buttons ride only the FIRST chunk so a split message
+                # doesn't render duplicate keyboards.
+                _chunk_reply_markup = _reply_markup if i == 0 else None
                 for _send_attempt in range(3):
                     try:
                         # Try Markdown first, fall back to plain text if it fails
@@ -2504,6 +2544,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 text=chunk,
                                 parse_mode=ParseMode.MARKDOWN_V2,
                                 reply_to_message_id=reply_to_id,
+                                **({"reply_markup": _chunk_reply_markup} if _chunk_reply_markup is not None else {}),
                                 **thread_kwargs,
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
@@ -2518,6 +2559,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     text=plain_chunk,
                                     parse_mode=None,
                                     reply_to_message_id=reply_to_id,
+                                    **({"reply_markup": _chunk_reply_markup} if _chunk_reply_markup is not None else {}),
                                     **thread_kwargs,
                                     **self._link_preview_kwargs(),
                                     **self._notification_kwargs(metadata),
@@ -2716,6 +2758,7 @@ class TelegramAdapter(BasePlatformAdapter):
         *,
         finalize: bool = False,
         metadata: Optional[Dict[str, Any]] = None,
+        buttons: Optional[list] = None,
     ) -> SendResult:
         """Edit a previously sent Telegram message.
 
@@ -2726,6 +2769,11 @@ class TelegramAdapter(BasePlatformAdapter):
         existing message with the first chunk and send the rest as
         continuation messages, returning the final chunk's id so subsequent
         edits target the most recent visible message.
+
+        ``buttons`` controls the inline keyboard. ``None`` (default) leaves the
+        existing keyboard untouched — important so the stream consumer's edits
+        never disturb markup. An explicit ``[]`` CLEARS the keyboard (used to
+        drop a Stop button when a run completes); a non-empty spec SETS it.
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
@@ -2744,6 +2792,14 @@ class TelegramAdapter(BasePlatformAdapter):
             rich_result = await self._try_edit_rich(chat_id, message_id, content)
             if rich_result is not None:
                 return rich_result
+        # Markup semantics: only touch reply_markup when buttons were provided
+        # (a list). None = leave as-is. [] -> reply_markup=None clears it.
+        _buttons_provided = buttons is not None
+        _markup_kw: Dict[str, Any] = (
+            {"reply_markup": self._inline_keyboard_from_buttons(buttons)}
+            if _buttons_provided
+            else {}
+        )
 
         # Pre-flight: if content already exceeds the limit, split-and-deliver
         # without round-tripping a doomed edit.
@@ -2758,6 +2814,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     chat_id=int(chat_id),
                     message_id=int(message_id),
                     text=content,
+                    **_markup_kw,
                 )
                 return SendResult(success=True, message_id=message_id)
 
@@ -2768,6 +2825,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     message_id=int(message_id),
                     text=formatted,
                     parse_mode=ParseMode.MARKDOWN_V2,
+                    **_markup_kw,
                 )
             except Exception as fmt_err:
                 # "Message is not modified" is a no-op, not an error
@@ -2784,6 +2842,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     chat_id=int(chat_id),
                     message_id=int(message_id),
                     text=_plain,
+                    **_markup_kw,
                 )
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
@@ -2820,6 +2879,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         chat_id=int(chat_id),
                         message_id=int(message_id),
                         text=content,
+                        **_markup_kw,
                     )
                     return SendResult(success=True, message_id=message_id)
                 except Exception as retry_err:
@@ -4247,42 +4307,136 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         # --- Update prompt callbacks ---
-        if not data.startswith("update_prompt:"):
+        if data.startswith("update_prompt:"):
+            answer = data.split(":", 1)[1]  # "y" or "n"
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to answer update prompts.")
+                return
+            await query.answer(text=f"Sent '{answer}' to the update process.")
+            # Edit the message to show the choice and remove buttons
+            label = "Yes" if answer == "y" else "No"
+            try:
+                await query.edit_message_text(
+                    text=self.format_message(f"⚕ Update prompt answered: *{label}*"),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass  # non-fatal if edit fails
+            # Write the response file
+            try:
+                from hermes_constants import get_hermes_home
+                home = get_hermes_home()
+                response_path = home / ".update_response"
+                tmp = response_path.with_suffix(".tmp")
+                tmp.write_text(answer)
+                tmp.replace(response_path)
+                logger.info("Telegram update prompt answered '%s' by user %s",
+                            answer, getattr(query.from_user, "id", "unknown"))
+            except Exception as exc:
+                logger.error("Failed to write update response from callback: %s", exc)
             return
-        answer = data.split(":", 1)[1]  # "y" or "n"
+
+        # --- Generic plugin callback fall-through (gateway_callback hook) ---
+        # No built-in prefix matched. Offer the click to plugins so they can
+        # own their own button namespace (e.g. the dynamic-workflows Stop
+        # button: "wf:stop:<taskId>") WITHOUT editing this core router.
+        await self._dispatch_plugin_callback(
+            query,
+            data,
+            query_chat_id=query_chat_id,
+            query_chat_type=query_chat_type,
+            query_thread_id=query_thread_id,
+            query_user_name=query_user_name,
+        )
+
+    async def _dispatch_plugin_callback(
+        self,
+        query,
+        data: str,
+        *,
+        query_chat_id,
+        query_chat_type,
+        query_thread_id,
+        query_user_name,
+    ) -> None:
+        """Offer an unmatched inline-button click to the ``gateway_callback``
+        plugin hook and perform the returned directive's async I/O.
+
+        Core does the auth CHECK (and passes the boolean to the plugin); the
+        plugin decides whether its action requires authorization and returns a
+        directive ``{handled, answer, edit_text, strip_buttons}``. The first
+        directive with ``handled=True`` wins. Unhandled clicks get a silent ack
+        so Telegram clears the button spinner.
+        """
         caller_id = str(getattr(query.from_user, "id", ""))
-        if not self._is_callback_user_authorized(
+        authorized = self._is_callback_user_authorized(
             caller_id,
             chat_id=query_chat_id,
             chat_type=str(query_chat_type) if query_chat_type is not None else None,
             thread_id=str(query_thread_id) if query_thread_id is not None else None,
             user_name=query_user_name,
-        ):
-            await query.answer(text="⛔ You are not authorized to answer update prompts.")
-            return
-        await query.answer(text=f"Sent '{answer}' to the update process.")
-        # Edit the message to show the choice and remove buttons
-        label = "Yes" if answer == "y" else "No"
+        )
+        directive = None
         try:
-            await query.edit_message_text(
-                text=self.format_message(f"⚕ Update prompt answered: *{label}*"),
-                parse_mode=ParseMode.MARKDOWN_V2,
-                reply_markup=None,
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+            results = _invoke_hook(
+                "gateway_callback",
+                data=data,
+                platform="telegram",
+                authorized=authorized,
+                user_id=caller_id,
+                chat_id=str(query_chat_id) if query_chat_id is not None else None,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
             )
-        except Exception:
-            pass  # non-fatal if edit fails
-        # Write the response file
-        try:
-            from hermes_constants import get_hermes_home
-            home = get_hermes_home()
-            response_path = home / ".update_response"
-            tmp = response_path.with_suffix(".tmp")
-            tmp.write_text(answer)
-            tmp.replace(response_path)
-            logger.info("Telegram update prompt answered '%s' by user %s",
-                        answer, getattr(query.from_user, "id", "unknown"))
+            for result in results or []:
+                if isinstance(result, dict) and result.get("handled"):
+                    directive = result
+                    break
         except Exception as exc:
-            logger.error("Failed to write update response from callback: %s", exc)
+            logger.debug("[%s] gateway_callback dispatch failed: %s", self.name, exc, exc_info=True)
+
+        if directive is None:
+            # No plugin owned this click; clear the spinner silently.
+            try:
+                await query.answer()
+            except Exception:
+                pass
+            return
+
+        # Perform the directive's async I/O (answer toast + optional edit).
+        answer_text = str(directive.get("answer") or "")
+        try:
+            await query.answer(text=answer_text) if answer_text else await query.answer()
+        except Exception:
+            pass
+
+        edit_text = directive.get("edit_text")
+        strip_buttons = bool(directive.get("strip_buttons"))
+        try:
+            if edit_text is not None:
+                await query.edit_message_text(
+                    text=self.format_message(str(edit_text)),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=None if strip_buttons else query.message.reply_markup
+                    if query.message is not None else None,
+                )
+            elif strip_buttons:
+                # Markup-only edit: drop the keyboard without touching the body
+                # (closes the double-tap window immediately).
+                await query.edit_message_reply_markup(reply_markup=None)
+        except Exception as exc:
+            if "not modified" not in str(exc).lower():
+                logger.debug("[%s] gateway_callback edit failed: %s", self.name, exc)
 
     # Maps `gt:<verb>` -> (script-name, extra-args, success-label, is_state).
     # Scripts live in ~/.hermes/scripts/gmail-triage/. `arg` from the callback
