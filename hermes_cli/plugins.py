@@ -210,6 +210,26 @@ VALID_HOOKS: Set[str] = {
     "kanban_task_claimed",
     "kanban_task_completed",
     "kanban_task_blocked",
+    # Gateway inline-button callback hook. Fired by a gateway adapter
+    # (e.g. Telegram) when an inline-button click's callback_data matches
+    # no built-in core prefix (ea:/sc:/cl:/gt:/mp:/update_prompt:). Lets a
+    # plugin own its own button namespace without editing the core callback
+    # router. Kwargs:
+    #   data: str           -- raw callback_data
+    #   platform: str       -- e.g. "telegram"
+    #   authorized: bool    -- whether the clicking user passed the adapter's
+    #                          callback-auth check (core does the check; the
+    #                          plugin decides if its action requires it)
+    #   user_id, chat_id, chat_type, thread_id, user_name -- click context
+    # A callback returns a directive dict to act, or None to pass:
+    #   {"handled": bool,         -- True if this callback owns `data`
+    #    "answer": str,           -- toast text for query.answer()
+    #    "edit_text": str|None,   -- if set, edit the message body to this
+    #    "strip_buttons": bool}   -- remove the inline keyboard
+    # The adapter performs the answer/edit (async I/O stays in core); the
+    # first directive with handled=True wins. Unhandled clicks get a silent
+    # ack so the spinner clears.
+    "gateway_callback",
 }
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"

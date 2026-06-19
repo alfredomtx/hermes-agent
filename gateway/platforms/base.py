@@ -2901,7 +2901,8 @@ class BasePlatformAdapter(ABC):
         chat_id: str,
         content: str,
         reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
+        buttons: Optional[list] = None
     ) -> SendResult:
         """
         Send a message to a chat.
@@ -2911,6 +2912,12 @@ class BasePlatformAdapter(ABC):
             content: Message content (may be markdown)
             reply_to: Optional message ID to reply to
             metadata: Additional platform-specific options
+            buttons: Optional inline buttons. A flat list of
+                ``{"text": str, "callback_data": str}`` dicts (one row), or a
+                list of such rows. ``callback_data`` must be <=64 bytes.
+                Adapters without inline-button support ignore this argument.
+                Button callbacks that match no built-in prefix are dispatched
+                to the ``gateway_callback`` plugin hook.
         
         Returns:
             SendResult with success status and message ID
@@ -2959,6 +2966,7 @@ class BasePlatformAdapter(ABC):
         content: str,
         *,
         finalize: bool = False,
+        buttons: Optional[list] = None,
     ) -> SendResult:
         """
         Edit a previously sent message. Optional — platforms that don't
@@ -2978,6 +2986,13 @@ class BasePlatformAdapter(ABC):
         should set ``finalize=True`` on the final edit of a streamed
         response (typically when ``got_done`` fires in the stream
         consumer) and leave it ``False`` on intermediate edits.
+
+        ``buttons`` mirrors :meth:`send` — a flat list (one row) or list of
+        rows of ``{"text", "callback_data"}`` dicts. Pass ``None`` (the
+        default) to leave/clear the inline keyboard; adapters that support
+        it should clear the markup when ``buttons`` is falsy so a completed
+        message can drop its buttons. Adapters without inline-button support
+        ignore it.
         """
         return SendResult(success=False, error="Not supported")
 
