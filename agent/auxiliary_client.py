@@ -3696,12 +3696,14 @@ def _try_configured_fallback_chain(
     failed_provider: str,
     reason: str = "error",
 ) -> Tuple[Optional[Any], Optional[str], str]:
-    """Try user-configured fallback providers for an auxiliary task.
+    """Try the per-task ``auxiliary.<task>.fallback_chain`` for an aux task.
 
-    Reads ``auxiliary.<task>.fallback_chain`` first, then appends the global
-    main-agent fallback chain (``fallback_providers`` / ``fallback_model``).
-    This keeps per-task overrides first while letting auxiliary calls share the
-    same Codex/OpenRouter/etc. fallback configured for normal chat.
+    Reads ONLY ``auxiliary.<task>.fallback_chain`` from config.yaml and tries
+    each entry in order. The global main-agent fallback chain
+    (``fallback_providers`` / ``fallback_model``) is owned by
+    :func:`_try_main_fallback_chain`; callers that want both run this first,
+    then that one, so each function has a single responsibility and the global
+    chain is never resolved twice.
 
     Each entry must have at least ``provider``; ``model``, ``base_url``, and
     ``api_key`` are optional.
@@ -3715,32 +3717,6 @@ def _try_configured_fallback_chain(
     task_config = _get_auxiliary_task_config(task)
     task_chain = task_config.get("fallback_chain")
     chain: List[Dict[str, Any]] = list(task_chain) if isinstance(task_chain, list) else []
-
-    try:
-        from hermes_cli.config import load_config
-        from hermes_cli.fallback_config import get_fallback_chain
-
-        global_chain = get_fallback_chain(load_config())
-    except Exception:
-        global_chain = []
-
-    # Merge global fallbacks after task-specific ones, preserving order while
-    # avoiding duplicate provider/model/base_url routes.
-    seen: set = set()
-    merged: List[Dict[str, Any]] = []
-    for entry in chain + global_chain:
-        if not isinstance(entry, dict):
-            continue
-        identity = (
-            str(entry.get("provider") or "").strip().lower(),
-            str(entry.get("model") or "").strip().lower(),
-            str(entry.get("base_url") or "").strip().rstrip("/").lower(),
-        )
-        if identity in seen:
-            continue
-        seen.add(identity)
-        merged.append(entry)
-    chain = merged
 
     if not chain:
         return None, None, ""
@@ -3852,11 +3828,17 @@ def _try_main_fallback_chain(
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try the top-level main-agent fallback chain for an auxiliary call.
 
-    ``provider: auto`` auxiliary tasks should respect the user's declared
-    main fallback policy before dropping into Hermes' built-in discovery
-    chain. The top-level chain is read through ``get_fallback_chain`` so
-    both modern ``fallback_providers`` and legacy ``fallback_model`` entries
-    participate in the same order as the main agent.
+    Owns the GLOBAL ``fallback_providers`` / ``fallback_model`` chain (read via
+    ``get_fallback_chain``) for every auxiliary path that wants it:
+      * ``provider: auto`` tasks, which should respect the user's declared main
+        fallback policy before dropping into Hermes' built-in discovery chain;
+      * explicit-provider / auth-failure fallbacks (e.g. a stale Bedrock SSO
+        token on ``compression`` / ``web_extract`` / ``vision``), which route
+        here to reach Codex before the last-resort main-agent-model safety net.
+    Callers run the per-task ``_try_configured_fallback_chain`` first, then this,
+    so each helper has a single responsibility and the global chain is resolved
+    at most once. Both modern ``fallback_providers`` and legacy
+    ``fallback_model`` entries participate in the same order as the main agent.
     """
     try:
         from hermes_cli.config import load_config
@@ -6659,10 +6641,13 @@ def call_llm(
                         task or "call", reason, fallback_failed_provider, first_err)
 
             # Fallback order (#26882, #26803):
-            #   1. User-configured fallback_chain (per-task) if set
-            #   2. For auto: top-level main fallback_providers/fallback_model
-            #   3. For auto: built-in auxiliary discovery chain
-            #   4. For explicit aux providers: main agent model safety net
+            #   1. User-configured per-task fallback_chain if set
+            #      (auxiliary.<task>.fallback_chain, via _try_configured_fallback_chain)
+            #   2. Top-level main fallback_providers/fallback_model chain
+            #      (via _try_main_fallback_chain): applies to BOTH branches now
+            #   3. auto only: built-in auxiliary discovery (_try_payment_fallback)
+            #      explicit/auth: main agent model safety net
+            #      (_try_main_agent_model_fallback)
             # For generic auto capacity errors, use the full auto-detection
             # chain. For Bedrock SSO auth failures, prefer configured fallback
             # providers (e.g. Codex 5.5) so we do not immediately route back
@@ -6681,6 +6666,9 @@ def call_llm(
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, fallback_failed_provider, reason=reason)
                 if fb_client is None:
+                    fb_client, fb_model, fb_label = _try_main_fallback_chain(
+                        task, fallback_failed_provider, reason=reason)
+                if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
                         fallback_failed_provider, task, reason=reason)
 
@@ -6698,7 +6686,8 @@ def call_llm(
             # (#26882) The error itself is re-raised below.
             logger.warning(
                 "Auxiliary %s: %s on %s and all fallbacks exhausted "
-                "(fallback_chain + main agent model). Raising original error.",
+                "(per-task chain + main fallback_providers + main agent model). "
+                "Raising original error.",
                 task or "call", reason, resolved_provider,
             )
         # Connection/timeout errors leave the cached client poisoned (closed
@@ -7178,10 +7167,13 @@ async def async_call_llm(
                         task or "call", reason, fallback_failed_provider, first_err)
 
             # Fallback order (#26882, #26803):
-            #   1. User-configured fallback_chain (per-task) if set
-            #   2. For auto: top-level main fallback_providers/fallback_model
-            #   3. For auto: built-in auxiliary discovery chain
-            #   4. For explicit aux providers: main agent model safety net
+            #   1. User-configured per-task fallback_chain if set
+            #      (auxiliary.<task>.fallback_chain, via _try_configured_fallback_chain)
+            #   2. Top-level main fallback_providers/fallback_model chain
+            #      (via _try_main_fallback_chain): applies to BOTH branches now
+            #   3. auto only: built-in auxiliary discovery (_try_payment_fallback)
+            #      explicit/auth: main agent model safety net
+            #      (_try_main_agent_model_fallback)
             # Generic auto capacity errors use the full auto-detection chain;
             # Bedrock SSO auth failures use configured fallbacks first so they
             # can route to Codex instead of looping back into Bedrock.
@@ -7198,6 +7190,9 @@ async def async_call_llm(
             else:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, fallback_failed_provider, reason=reason)
+                if fb_client is None:
+                    fb_client, fb_model, fb_label = _try_main_fallback_chain(
+                        task, fallback_failed_provider, reason=reason)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
                         fallback_failed_provider, task, reason=reason)
@@ -7220,7 +7215,8 @@ async def async_call_llm(
             # All fallback layers exhausted — warn before re-raising. (#26882)
             logger.warning(
                 "Auxiliary %s (async): %s on %s and all fallbacks exhausted "
-                "(fallback_chain + main agent model). Raising original error.",
+                "(per-task chain + main fallback_providers + main agent model). "
+                "Raising original error.",
                 task or "call", reason, resolved_provider,
             )
         # Mirror the sync path: drop poisoned clients on connection/timeout
