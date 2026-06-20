@@ -241,6 +241,33 @@ def _format_delegate_task_args_progress(
     return cards
 
 
+def _tool_progress_pipeline_enabled(
+    *,
+    is_webhook: bool,
+    progress_mode: str,
+    tool_completion_durations_enabled: bool,
+    subagent_progress_enabled: bool,
+    delegate_task_args_enabled: bool,
+) -> bool:
+    """Decide whether the gateway tool-progress pipeline must stay alive.
+
+    The progress queue/consumer is normally torn down when ``tool_progress``
+    is ``"off"``. Several features still need the pipeline even then:
+    completion durations, subagent tool visibility, and ``delegate_task_args``
+    (surface delegate_task call parameters WITHOUT general tool noise). Webhooks
+    never get tool progress (no message editing). Extracted as a pure function
+    so the off+delegate_task_args wiring gap is unit-testable.
+    """
+    if is_webhook:
+        return False
+    return bool(
+        progress_mode != "off"
+        or tool_completion_durations_enabled
+        or subagent_progress_enabled
+        or delegate_task_args_enabled
+    )
+
+
 def _format_subagent_tool_card(
     tool_name: Optional[str],
     preview: Optional[str],
@@ -16569,13 +16596,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # duration-only mode.  Subagent tool visibility likewise keeps the
         # pipeline alive even when the parent's own tool progress is "off".
         from gateway.config import Platform
-        tool_progress_enabled = (
-            source.platform != Platform.WEBHOOK
-            and (
-                progress_mode not in {"off", "log"}
-                or tool_completion_durations_enabled
-                or subagent_progress_enabled
+        # delegate_task input visibility is an independent opt-in: it must keep
+        # the progress pipeline alive even when tool_progress is "off" (the
+        # whole point: show delegate_task params WITHOUT general tool noise).
+        try:
+            delegate_task_args_enabled = is_truthy_value(
+                resolve_display_setting(
+                    user_config,
+                    platform_key,
+                    "delegate_task_args",
+                    False,
+                ),
+                default=False,
             )
+        except Exception:
+            delegate_task_args_enabled = False
+        tool_progress_enabled = _tool_progress_pipeline_enabled(
+            is_webhook=(source.platform == Platform.WEBHOOK),
+            progress_mode=progress_mode,
+            tool_completion_durations_enabled=tool_completion_durations_enabled,
+            subagent_progress_enabled=subagent_progress_enabled,
+            delegate_task_args_enabled=delegate_task_args_enabled,
         )
         # "log" mode: tool calls are written to ~/.hermes/logs/tool_calls.log
         # instead of the chat (#3459 / #3458). Gateway-only by design.
@@ -16907,6 +16948,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Only act on tool.started events (ignore reasoning.available, etc.)
             if event_type not in {"tool.started",}:
                 return
+
+            # delegate_task input visibility is INDEPENDENT of tool_progress:
+            # Telegram can keep tool_progress "off" (no general tool noise) yet
+            # still surface the exact delegate_task call parameters. Emit BEFORE
+            # the progress_mode=="off" guard below so the card isn't swallowed.
+            # Scoped to delegate_task starts only — no subagent stdout, no
+            # completion payload (matches _format_delegate_task_args_progress).
+            # delegate_task_args_enabled is resolved once at pipeline setup (it
+            # also keeps progress_queue alive when tool_progress is "off").
+            if tool_name == "delegate_task" and delegate_task_args_enabled:
+                last_tool[0] = tool_name
+                last_was_terminal_block[0] = False
+                for _card in _format_delegate_task_args_progress(args):
+                    progress_queue.put(("__tool_start__", tool_name, _card))
+                return
+
             if progress_mode == "off":
                 return
 
@@ -17008,21 +17065,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _cmd_short = _cmd_short + " ..."
                 _code_block_short = f"{_block_header}```\n{_cmd_short}\n```"
 
-            # Telegram can opt into exact delegate_task input visibility without
-            # switching every tool into noisy verbose mode. Keep this scoped to
-            # delegate_task starts only: no subagent stdout, no completion payload.
-            try:
-                _show_delegate_args = is_truthy_value(
-                    resolve_display_setting(
-                        user_config,
-                        platform_key,
-                        "delegate_task_args",
-                        False,
-                    ),
-                    default=False,
-                )
-            except Exception:
-                _show_delegate_args = False
             if tool_name == "todo":
                 try:
                     from gateway.todo_progress import format_todo_progress
@@ -17034,12 +17076,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     last_was_terminal_block[0] = False
                     progress_queue.put(("__tool_start__", tool_name, _todo_card))
                     return
-
-            if tool_name == "delegate_task" and _show_delegate_args:
-                last_was_terminal_block[0] = False
-                for _card in _format_delegate_task_args_progress(args):
-                    progress_queue.put(("__tool_start__", tool_name, _card))
-                return
 
             # Verbose mode: show detailed arguments, respects tool_preview_length
             if progress_mode == "verbose":
