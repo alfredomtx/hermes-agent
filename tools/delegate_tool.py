@@ -1022,6 +1022,10 @@ def _build_child_progress_callback(
                 kw["async_delegation_id"] = str(session_ref["async_delegation_id"])
             if session_ref.get("async_background"):
                 kw["async_background"] = True
+            # Reasoning config is resolved AFTER this callback is built, so it
+            # is late-bound through the shared ref (same pattern as session_id).
+            if session_ref.get("reasoning") is not None:
+                kw["reasoning"] = session_ref["reasoning"]
         kw["tool_count"] = _tool_count[0]
         return kw
 
@@ -1395,6 +1399,13 @@ def _build_child_agent(
                 )
     except Exception as exc:
         logger.debug("Could not load delegation reasoning_effort: %s", exc)
+
+    # Late-bind the resolved reasoning into the shared progress ref so relayed
+    # subagent events (and the roster row) can show the child's effort level.
+    try:
+        child_session_ref["reasoning"] = child_reasoning
+    except Exception:
+        pass
 
     # Inherit the parent's fallback provider chain so subagents can recover
     # from rate-limits and credential exhaustion exactly like the top-level
@@ -2817,12 +2828,14 @@ def delegate_task(
         _child_records = []
         for _i, _t, _c in children:
             _model = getattr(_c, "model", None)
+            _reasoning = getattr(_c, "reasoning_config", None)
             _child_records.append(
                 {
                     "task_index": _i,
                     "subagent_id": getattr(_c, "_subagent_id", "") or "",
                     "goal": _t["goal"],
                     "model": _model if isinstance(_model, str) else creds["model"],
+                    "reasoning": _reasoning,
                     "status": "pending",
                 }
             )

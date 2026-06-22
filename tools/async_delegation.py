@@ -181,6 +181,7 @@ def _normalise_children(
                 "subagent_id": str(child.get("subagent_id") or ""),
                 "goal": str(goal or ""),
                 "model": child_model if isinstance(child_model, str) else model,
+                "reasoning": child.get("reasoning"),
                 "status": _normalise_child_status(child.get("status") or "pending"),
                 "started_at": child.get("started_at"),
                 "completed_at": child.get("completed_at"),

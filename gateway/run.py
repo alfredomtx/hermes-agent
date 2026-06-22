@@ -15201,6 +15201,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         kwargs.get("goal") or preview or "",
                         int(kwargs.get("task_index", 0) or 0),
                         time.time(),
+                        kwargs.get("model") or "",
+                        kwargs.get("reasoning"),
                     ))
                 else:
                     progress_queue.put((

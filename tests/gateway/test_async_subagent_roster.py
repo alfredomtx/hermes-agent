@@ -62,7 +62,11 @@ def test_async_final_rows_fallback_to_results_when_children_missing():
     rows = build_async_subagent_roster_rows(record, [], now=200.0)
     text = format_subagent_roster(rows, collapsed=True)
 
-    assert text == "🤖 2 subagents · 1 ✓ · 1 ✗ · 0:10"
+    # Collapsed render now keeps the per-child breakdown under a summary header.
+    lines = text.split("\n")
+    assert lines[0] == "🤖 2 subagents · 1 ✓ · 1 ✗ · 0:10"
+    assert lines[1] == "✓ sleep 6 · 0:06"
+    assert lines[2] == "✗ sleep 10 · 0:10"
 
 
 # ---------------------------------------------------------------------------
