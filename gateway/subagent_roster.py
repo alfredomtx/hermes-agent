@@ -164,6 +164,9 @@ class SubagentRosterState:
 
 
 def _bucket_of(row: Dict[str, Any]) -> str:
+    explicit = str(row.get("bucket") or "").strip().lower()
+    if explicit:
+        return explicit
     if row["running"]:
         return "running"
     glyph = row["glyph"]
@@ -178,27 +181,39 @@ def format_subagent_roster(rows: List[Dict[str, Any]], *, collapsed: bool = Fals
     if not rows:
         return None
 
-    running = [r for r in rows if r["running"]]
-    done = [r for r in rows if (not r["running"] and r["glyph"] == "✓")]
-    errored = [r for r in rows if (not r["running"] and r["glyph"] != "✓")]
+    buckets: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        buckets.setdefault(_bucket_of(row), []).append(row)
+
+    running = buckets.get("running", [])
+    pending = buckets.get("pending", [])
+    done = buckets.get("done", [])
+    errored = buckets.get("errored", [])
+    timed_out = buckets.get("timed-out", [])
+    interrupted = buckets.get("interrupted", [])
+    failed_total = errored + timed_out + interrupted
 
     if collapsed:
         # One-line summary so a wall of done rows never sits above the answer.
         # Elapsed proxy = the longest row (~ parallel wall span).
         span = max((r["elapsed"] for r in rows), default=0.0)
         parts = [f"🤖 {len(rows)} subagent" + ("s" if len(rows) != 1 else "")]
+        if pending:
+            parts.append(f"{len(pending)} pending")
         if done:
             parts.append(f"{len(done)} ✓")
-        if errored:
-            parts.append(f"{len(errored)} ✗")
+        if failed_total:
+            parts.append(f"{len(failed_total)} ✗")
         parts.append(format_duration(span))
         return " · ".join(parts)
 
     head = f"🤖 Subagents — {len(running)} running"
+    if pending:
+        head += f", {len(pending)} pending"
     if done:
         head += f", {len(done)} done"
-    if errored:
-        head += f", {len(errored)} failed"
+    if failed_total:
+        head += f", {len(failed_total)} failed"
 
     lines = [head]
     shown = rows[:_MAX_ROWS]
