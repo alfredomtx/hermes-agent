@@ -230,15 +230,23 @@ def _tool_progress_pipeline_enabled(
     tool_completion_durations_enabled: bool,
     subagent_progress_enabled: bool,
     delegate_task_args_enabled: bool,
+    subagent_roster_enabled: bool = False,
 ) -> bool:
     """Decide whether the gateway tool-progress pipeline must stay alive.
 
     The progress queue/consumer is normally torn down when ``tool_progress``
     is ``"off"``. Several features still need the pipeline even then:
-    completion durations, subagent tool visibility, and ``delegate_task_args``
-    (surface delegate_task call parameters WITHOUT general tool noise). Webhooks
-    never get tool progress (no message editing). Extracted as a pure function
-    so the off+delegate_task_args wiring gap is unit-testable.
+    completion durations, subagent tool visibility, ``delegate_task_args``
+    (surface delegate_task call parameters WITHOUT general tool noise), and the
+    live subagent ROSTER bubble. Webhooks never get tool progress (no message
+    editing). Extracted as a pure function so these wiring gaps are
+    unit-testable. ``subagent_roster_enabled`` defaults False for back-compat
+    with existing callers/tests.
+
+    NOTE: the result gates PIPELINE creation, NOT whether ordinary tool rows
+    render. ``progress_mode`` remains the sole source of truth for tool rows
+    (the ``progress_mode == "off"`` guard in ``progress_callback``). So
+    roster-only mode keeps the queue/consumer alive without leaking tool rows.
     """
     if is_webhook:
         return False
@@ -247,6 +255,7 @@ def _tool_progress_pipeline_enabled(
         or tool_completion_durations_enabled
         or subagent_progress_enabled
         or delegate_task_args_enabled
+        or subagent_roster_enabled
     )
 
 
@@ -2037,14 +2046,12 @@ def _build_document_context_note(display_name: str, agent_path: str, mtype: str)
 
 
 def _format_duration(seconds: float) -> str:
-    total = int(round(seconds))
-    if total < 0:
-        total = 0
-    minutes, secs = divmod(total, 60)
-    if minutes >= 60:
-        hours, minutes = divmod(minutes, 60)
-        return f"{hours}:{minutes:02d}:{secs:02d}"
-    return f"{minutes}:{secs:02d}"
+    # Delegates to the shared util (gateway/duration_format.py) so pure helper
+    # modules can reuse the exact M:SS / H:MM:SS semantics without importing
+    # this 18k-line module. Kept as a thin alias for existing call sites.
+    from gateway.duration_format import format_duration
+
+    return format_duration(seconds)
 
 
 def _format_tool_progress_duration(seconds: float) -> str:
@@ -14661,12 +14668,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception:
             delegate_task_args_enabled = False
-        tool_progress_enabled = _tool_progress_pipeline_enabled(
+        # Live subagent roster bubble is an independent opt-in: it must keep the
+        # progress pipeline alive even when tool_progress is "off" (the Telegram
+        # default), exactly like delegate_task_args. Resolved once here so it
+        # gates both pipeline creation and the subagent.* relay in
+        # progress_callback below. Only renders on edit-capable adapters; the
+        # consumer no-ops on platforms without message editing.
+        try:
+            subagent_roster_enabled = is_truthy_value(
+                resolve_display_setting(
+                    user_config,
+                    platform_key,
+                    "subagent_roster",
+                    False,
+                ),
+                default=False,
+            )
+        except Exception:
+            subagent_roster_enabled = False
+        progress_pipeline_enabled = _tool_progress_pipeline_enabled(
             is_webhook=(source.platform == Platform.WEBHOOK),
             progress_mode=progress_mode,
             tool_completion_durations_enabled=tool_completion_durations_enabled,
             subagent_progress_enabled=subagent_progress_enabled,
             delegate_task_args_enabled=delegate_task_args_enabled,
+            subagent_roster_enabled=subagent_roster_enabled,
         )
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
@@ -14694,7 +14720,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             platform=source.platform,
             require_platform_override_for={Platform.MATTERMOST},
         )
-        needs_progress_queue = tool_progress_enabled or _thinking_enabled
+        needs_progress_queue = progress_pipeline_enabled or _thinking_enabled
 
 
         # Queue for progress messages (thread-safe)
@@ -14884,6 +14910,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         progress_queue.put(("__tool_start__", "__subagent__", _card))
                 return
 
+            # Live subagent roster bubble. Independent of subagent_tool_progress;
+            # gated only on display.platforms.<platform>.subagent_roster. The
+            # child's subagent.start/.complete lifecycle events are relayed from
+            # tools/delegate_tool.py with identity kwargs (subagent_id, goal,
+            # task_index, status, duration_seconds) but are otherwise dropped
+            # here. Forward them as roster sentinels; the consumer (gateway loop)
+            # owns roster state + its own edited-in-place bubble. This callback
+            # runs on a WORKER thread, so it ONLY enqueues — never touches roster
+            # state or the loop (no cross-thread scheduling, no deadlock trap).
+            if subagent_roster_enabled and event_type in {
+                "subagent.start",
+                "subagent.complete",
+            }:
+                _sid = str(kwargs.get("subagent_id") or "")
+                if not _sid:
+                    return  # no stable id -> can't track a row; drop quietly
+                if event_type == "subagent.start":
+                    progress_queue.put((
+                        "__roster_start__",
+                        _sid,
+                        kwargs.get("goal") or preview or "",
+                        int(kwargs.get("task_index", 0) or 0),
+                        time.time(),
+                    ))
+                else:
+                    progress_queue.put((
+                        "__roster_complete__",
+                        _sid,
+                        str(kwargs.get("status") or "completed").lower(),
+                        float(kwargs.get("duration_seconds") or 0.0),
+                    ))
+                return
+
             # First-touch onboarding: the first time a tool takes longer than
             # _LONG_TOOL_THRESHOLD_S during a run that's streaming every tool
             # (progress_mode == "all"), append a one-time hint suggesting
@@ -14978,7 +15037,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # If tool_progress is off, only _thinking passes through (above).
             # Regular tool calls are suppressed.
-            if not tool_progress_enabled:
+            if not progress_pipeline_enabled:
                 return
 
             # Only act on tool.started events (ignore reasoning.available, etc.)
@@ -15229,6 +15288,117 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             can_edit = progress_grouping != "separate"  # "separate" = one message per tool (pre-v0.9 behavior)
             _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
             _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
+
+            # ── Live subagent roster bubble state (display.subagent_roster) ──
+            # Its OWN message id + throttle + seed-state machine, separate from
+            # the tool bubble above (the roster is a rewritten-in-place table,
+            # not an append log). Single-writer: only THIS loop-bound coroutine
+            # mutates this state, fed by __roster_start__/__roster_complete__
+            # sentinels off progress_queue. The worker-thread callback only
+            # enqueues. Lazy import avoids a run.py <-> delegate_tool cycle.
+            from gateway.subagent_roster import (
+                ROSTER_EDIT_INTERVAL,
+                SubagentRosterState,
+                format_subagent_roster,
+            )
+            from tools.delegate_tool import (
+                list_active_subagents as _list_active_subagents,
+            )
+
+            roster = SubagentRosterState()
+            roster_msg_id = None
+            _last_roster_edit_ts = 0.0
+            _last_roster_text = None
+            roster_seed_attempted = False
+            roster_seed_failed = False
+
+            def _render_roster(collapsed: bool):
+                """Fold roster state + a fresh registry poll into bubble text."""
+                try:
+                    active = {
+                        str(r.get("subagent_id")): r
+                        for r in _list_active_subagents()
+                        if str(r.get("subagent_id")) in roster.meta
+                    }
+                except Exception:
+                    active = {}
+                rows = roster.fold(active, time.time())
+                return format_subagent_roster(rows, collapsed=collapsed)
+
+            async def _publish_roster(*, force: bool, collapsed: bool = False, allow_seed: bool = True) -> None:
+                """Seed (one send) or edit the roster bubble. Throttled + gated.
+
+                Seed is awaited INLINE on the gateway loop, so roster_msg_id is
+                resolved before the next edit — the dynamic-workflows slow-seed
+                race (seed scheduled fire-and-forget from another thread) does
+                not apply here.
+                """
+                nonlocal roster_msg_id, _last_roster_edit_ts, _last_roster_text
+                nonlocal roster_seed_attempted, roster_seed_failed
+                if not _run_still_current():
+                    return
+                text = _render_roster(collapsed)
+                if not text:
+                    return
+                now = time.monotonic()
+                # Throttle ordinary edits; the final collapse (force) bypasses.
+                if not force and (now - _last_roster_edit_ts) < ROSTER_EDIT_INTERVAL:
+                    return
+                if not force and text == _last_roster_text:
+                    return
+                if roster_msg_id is None:
+                    # Seed policy: at most one outstanding seed; do not retry-spam
+                    # on every idle tick (a transient failure that actually
+                    # delivered would duplicate bubbles).
+                    if not allow_seed or roster_seed_failed:
+                        return
+                    roster_seed_attempted = True
+                    result = await adapter.send(
+                        chat_id=source.chat_id,
+                        content=text,
+                        reply_to=_progress_reply_to,
+                        metadata=_progress_metadata,
+                    )
+                    if getattr(result, "success", False) and getattr(result, "message_id", None):
+                        roster_msg_id = str(result.message_id)
+                        if _cleanup_progress:
+                            _cleanup_msg_ids.append(str(roster_msg_id))
+                    else:
+                        roster_seed_failed = True
+                        return
+                else:
+                    kwargs: Dict[str, Any] = {
+                        "chat_id": source.chat_id,
+                        "message_id": roster_msg_id,
+                        "content": text,
+                    }
+                    if getattr(adapter, "REQUIRES_EDIT_FINALIZE", False):
+                        kwargs["finalize"] = True
+                    if _edit_accepts_metadata:
+                        kwargs["metadata"] = _progress_metadata
+                    try:
+                        await adapter.edit_message(**kwargs)
+                    except Exception:
+                        # Edits are best-effort; a transient failure just retries
+                        # on the next tick. Roster is never load-bearing.
+                        pass
+                _last_roster_edit_ts = now
+                _last_roster_text = text
+
+            async def _maybe_tick_roster() -> None:
+                """Idle-tick driver: advance running elapsed even when children
+                are silent. Throttled + change-gated inside _publish_roster."""
+                if roster_msg_id is None and not roster.has_records():
+                    return
+                await _publish_roster(force=False)
+
+            def _apply_roster_event(raw) -> None:
+                """Mutate roster state from a dequeued sentinel (loop thread)."""
+                try:
+                    roster.apply_event(raw)
+                except Exception as _roster_err:
+                    logger.debug("roster apply_event failed: %s", _roster_err)
+
 
             _progress_len_fn = (
                 adapter.message_len_fn
@@ -15617,7 +15787,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 while not progress_queue.empty():
                     try:
                         raw = progress_queue.get_nowait()
-                        if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
+                        if isinstance(raw, tuple) and raw and raw[0] in (
+                            "__roster_start__",
+                            "__roster_complete__",
+                        ):
+                            # Roster owns a separate bubble; apply state only,
+                            # the final collapse below publishes once.
+                            _apply_roster_event(raw)
+                        elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                             _, base_msg, count = raw
                             if progress_lines:
                                 progress_lines[-1] = f"{base_msg} (×{count + 1})"
@@ -15692,9 +15869,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception:
                         pass
 
+                # Collapse the roster bubble to a one-liner on the way out so it
+                # does not leave a wall of rows above the final answer. B1 fix:
+                # collapse whenever there are records, NOT only when a bubble was
+                # already seeded — a fast child (start+complete queued, parent
+                # returns before the consumer ticked) still gets ONE collapsed
+                # summary instead of silently nothing. allow_seed=True so that
+                # fast-child case can seed the one collapsed message here.
+                if roster.has_records():
+                    try:
+                        await _publish_roster(force=True, collapsed=True, allow_seed=True)
+                    except Exception:
+                        pass
+
             while True:
                 try:
                     if not _run_still_current():
+                        # B2: collapse an already-visible roster bubble before
+                        # bailing on a stale run (/stop, /new, generation
+                        # mismatch). Without this the bubble is stranded on
+                        # "▶ running" forever. Do NOT seed a new bubble after a
+                        # stop (allow_seed=False) — only finalize a live one.
+                        if roster.has_records() and roster_msg_id is not None:
+                            try:
+                                await _publish_roster(
+                                    force=True, collapsed=True, allow_seed=False
+                                )
+                            except Exception:
+                                pass
                         while not progress_queue.empty():
                             try:
                                 progress_queue.get_nowait()
@@ -15722,6 +15924,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                     # Handle structured progress messages first, then legacy
                     # plain strings.
+                    if isinstance(raw, tuple) and raw and raw[0] in (
+                        "__roster_start__",
+                        "__roster_complete__",
+                    ):
+                        # Roster owns a SEPARATE bubble; never falls through to
+                        # the tool-bubble edit logic. Apply state, then publish
+                        # via the throttled tick (Concern 1: a 10-20 child burst
+                        # must NOT fire 10-20 immediate edits — _maybe_tick_roster
+                        # is interval-throttled, so the burst coalesces into one
+                        # edit; membership/status shows up within ROSTER_EDIT_
+                        # INTERVAL).
+                        _apply_roster_event(raw)
+                        await _maybe_tick_roster()
+                        continue
                     if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                         # NOTE: this rewrites progress_lines[-1] in place. A
                         # subagent tool card (queued as a 5-tuple "__tool_start__"
@@ -15903,6 +16119,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await adapter.send_typing(source.chat_id, metadata=_progress_metadata)
 
                 except queue.Empty:
+                    # Idle: advance the roster's running elapsed even when no
+                    # tool/lifecycle events are flowing (the common parallel-
+                    # verifiers case where children are silent). Throttled +
+                    # change-gated inside _maybe_tick_roster.
+                    try:
+                        await _maybe_tick_roster()
+                    except Exception:
+                        pass
                     # A cancellation can land while we idle here.  The sleep is
                     # a sibling of the CancelledError handler below, so without
                     # this guard a cancel during the idle wait escapes the whole
@@ -16291,7 +16515,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
-            agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
+            agent.tool_progress_callback = progress_callback if progress_pipeline_enabled else None
             # Discord voice verbal-ack hook (fires once per turn on first tool
             # call; armed only when in a voice channel with the mixer running).
             agent.tool_start_callback = (
@@ -17004,7 +17228,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # Start progress message sender if enabled
         progress_task = None
-        if tool_progress_enabled:
+        if progress_pipeline_enabled:
             progress_task = asyncio.create_task(send_progress_messages())
 
         # Start stream consumer task — polls for consumer creation since it
