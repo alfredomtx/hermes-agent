@@ -17325,6 +17325,117 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
             _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
 
+            # ── Live subagent roster bubble state (display.subagent_roster) ──
+            # Its OWN message id + throttle + seed-state machine, separate from
+            # the tool bubble above (the roster is a rewritten-in-place table,
+            # not an append log). Single-writer: only THIS loop-bound coroutine
+            # mutates this state, fed by __roster_start__/__roster_complete__
+            # sentinels off progress_queue. The worker-thread callback only
+            # enqueues. Lazy import avoids a run.py <-> delegate_tool cycle.
+            from gateway.subagent_roster import (
+                ROSTER_EDIT_INTERVAL,
+                SubagentRosterState,
+                format_subagent_roster,
+            )
+            from tools.delegate_tool import (
+                list_active_subagents as _list_active_subagents,
+            )
+
+            roster = SubagentRosterState()
+            roster_msg_id = None
+            _last_roster_edit_ts = 0.0
+            _last_roster_text = None
+            roster_seed_attempted = False
+            roster_seed_failed = False
+
+            def _render_roster(collapsed: bool):
+                """Fold roster state + a fresh registry poll into bubble text."""
+                try:
+                    active = {
+                        str(r.get("subagent_id")): r
+                        for r in _list_active_subagents()
+                        if str(r.get("subagent_id")) in roster.meta
+                    }
+                except Exception:
+                    active = {}
+                rows = roster.fold(active, time.time())
+                return format_subagent_roster(rows, collapsed=collapsed)
+
+            async def _publish_roster(*, force: bool, collapsed: bool = False, allow_seed: bool = True) -> None:
+                """Seed (one send) or edit the roster bubble. Throttled + gated.
+
+                Seed is awaited INLINE on the gateway loop, so roster_msg_id is
+                resolved before the next edit — the dynamic-workflows slow-seed
+                race (seed scheduled fire-and-forget from another thread) does
+                not apply here.
+                """
+                nonlocal roster_msg_id, _last_roster_edit_ts, _last_roster_text
+                nonlocal roster_seed_attempted, roster_seed_failed
+                if not _run_still_current():
+                    return
+                text = _render_roster(collapsed)
+                if not text:
+                    return
+                now = time.monotonic()
+                # Throttle ordinary edits; the final collapse (force) bypasses.
+                if not force and (now - _last_roster_edit_ts) < ROSTER_EDIT_INTERVAL:
+                    return
+                if not force and text == _last_roster_text:
+                    return
+                if roster_msg_id is None:
+                    # Seed policy: at most one outstanding seed; do not retry-spam
+                    # on every idle tick (a transient failure that actually
+                    # delivered would duplicate bubbles).
+                    if not allow_seed or roster_seed_failed:
+                        return
+                    roster_seed_attempted = True
+                    result = await adapter.send(
+                        chat_id=source.chat_id,
+                        content=text,
+                        reply_to=_progress_reply_to,
+                        metadata=_progress_metadata,
+                    )
+                    if getattr(result, "success", False) and getattr(result, "message_id", None):
+                        roster_msg_id = str(result.message_id)
+                        if _cleanup_progress:
+                            _cleanup_msg_ids.append(str(roster_msg_id))
+                    else:
+                        roster_seed_failed = True
+                        return
+                else:
+                    kwargs: Dict[str, Any] = {
+                        "chat_id": source.chat_id,
+                        "message_id": roster_msg_id,
+                        "content": text,
+                    }
+                    if getattr(adapter, "REQUIRES_EDIT_FINALIZE", False):
+                        kwargs["finalize"] = True
+                    if _edit_accepts_metadata:
+                        kwargs["metadata"] = _progress_metadata
+                    try:
+                        await adapter.edit_message(**kwargs)
+                    except Exception:
+                        # Edits are best-effort; a transient failure just retries
+                        # on the next tick. Roster is never load-bearing.
+                        pass
+                _last_roster_edit_ts = now
+                _last_roster_text = text
+
+            async def _maybe_tick_roster() -> None:
+                """Idle-tick driver: advance running elapsed even when children
+                are silent. Throttled + change-gated inside _publish_roster."""
+                if roster_msg_id is None and not roster.has_records():
+                    return
+                await _publish_roster(force=False)
+
+            def _apply_roster_event(raw) -> None:
+                """Mutate roster state from a dequeued sentinel (loop thread)."""
+                try:
+                    roster.apply_event(raw)
+                except Exception as _roster_err:
+                    logger.debug("roster apply_event failed: %s", _roster_err)
+
+
             _progress_len_fn = (
                 adapter.message_len_fn
                 if isinstance(adapter, BasePlatformAdapter)
