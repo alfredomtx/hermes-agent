@@ -17823,7 +17823,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 while not progress_queue.empty():
                     try:
                         raw = progress_queue.get_nowait()
-                        if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
+                        if isinstance(raw, tuple) and raw and raw[0] in (
+                            "__roster_start__",
+                            "__roster_complete__",
+                        ):
+                            # Roster owns a separate bubble; apply state only,
+                            # the final collapse below publishes once.
+                            _apply_roster_event(raw)
+                        elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                             _, base_msg, count = raw
                             if progress_lines:
                                 progress_lines[-1] = f"{base_msg} (×{count + 1})"
@@ -17898,9 +17905,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception:
                         pass
 
+                # Collapse the roster bubble to a one-liner on the way out so it
+                # does not leave a wall of rows above the final answer. B1 fix:
+                # collapse whenever there are records, NOT only when a bubble was
+                # already seeded — a fast child (start+complete queued, parent
+                # returns before the consumer ticked) still gets ONE collapsed
+                # summary instead of silently nothing. allow_seed=True so that
+                # fast-child case can seed the one collapsed message here.
+                if roster.has_records():
+                    try:
+                        await _publish_roster(force=True, collapsed=True, allow_seed=True)
+                    except Exception:
+                        pass
+
             while True:
                 try:
                     if not _run_still_current():
+                        # B2: collapse an already-visible roster bubble before
+                        # bailing on a stale run (/stop, /new, generation
+                        # mismatch). Without this the bubble is stranded on
+                        # "▶ running" forever. Do NOT seed a new bubble after a
+                        # stop (allow_seed=False) — only finalize a live one.
+                        if roster.has_records() and roster_msg_id is not None:
+                            try:
+                                await _publish_roster(
+                                    force=True, collapsed=True, allow_seed=False
+                                )
+                            except Exception:
+                                pass
                         while not progress_queue.empty():
                             try:
                                 progress_queue.get_nowait()
@@ -17928,6 +17960,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                     # Handle structured progress messages first, then legacy
                     # plain strings.
+                    if isinstance(raw, tuple) and raw and raw[0] in (
+                        "__roster_start__",
+                        "__roster_complete__",
+                    ):
+                        # Roster owns a SEPARATE bubble; never falls through to
+                        # the tool-bubble edit logic. Apply state, then publish
+                        # via the throttled tick (Concern 1: a 10-20 child burst
+                        # must NOT fire 10-20 immediate edits — _maybe_tick_roster
+                        # is interval-throttled, so the burst coalesces into one
+                        # edit; membership/status shows up within ROSTER_EDIT_
+                        # INTERVAL).
+                        _apply_roster_event(raw)
+                        await _maybe_tick_roster()
+                        continue
                     if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                         # NOTE: this rewrites progress_lines[-1] in place. A
                         # subagent tool card (queued as a 5-tuple "__tool_start__"
@@ -18109,6 +18155,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await adapter.send_typing(source.chat_id, metadata=_progress_metadata)
 
                 except queue.Empty:
+                    # Idle: advance the roster's running elapsed even when no
+                    # tool/lifecycle events are flowing (the common parallel-
+                    # verifiers case where children are silent). Throttled +
+                    # change-gated inside _maybe_tick_roster.
+                    try:
+                        await _maybe_tick_roster()
+                    except Exception:
+                        pass
                     # A cancellation can land while we idle here.  The sleep is
                     # a sibling of the CancelledError handler below, so without
                     # this guard a cancel during the idle wait escapes the whole
