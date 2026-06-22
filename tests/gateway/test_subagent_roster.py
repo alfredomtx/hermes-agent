@@ -45,3 +45,155 @@ class TestSubagentRosterConfig:
 
     def test_flag_is_in_overrideable_keys(self):
         assert "subagent_roster" in OVERRIDEABLE_KEYS
+
+
+# ── shared duration formatter ───────────────────────────────────────────────
+class TestDurationFormat:
+    def test_shapes(self):
+        from gateway.duration_format import format_duration
+
+        assert format_duration(0) == "0:00"
+        assert format_duration(45) == "0:45"
+        assert format_duration(83) == "1:23"
+        assert format_duration(3665) == "1:01:05"
+
+    def test_clamps_negative_and_bad(self):
+        from gateway.duration_format import format_duration
+
+        assert format_duration(-5) == "0:00"
+        assert format_duration(None) == "0:00"
+
+
+# ── pure roster state: fold ─────────────────────────────────────────────────
+class TestFoldSubagentRoster:
+    def _state(self):
+        from gateway.subagent_roster import SubagentRosterState
+
+        return SubagentRosterState()
+
+    def test_running_row_from_active_registry(self):
+        s = self._state()
+        s.start("a", goal="verify php", task_index=0, started_at=900.0)
+        active = {"a": {"started_at": 940.0, "tool_count": 7}}
+        rows = s.fold(active, now=1000.0)
+        assert rows == [{
+            "glyph": "▶", "label": "verify php",
+            "elapsed": 60.0, "running": True, "tools": 7,
+        }]
+
+    def test_terminal_row_from_complete_map(self):
+        s = self._state()
+        s.start("a", goal="run tests", task_index=0, started_at=900.0)
+        s.complete("a", status="completed", duration=45.0)
+        rows = s.fold({}, now=1000.0)
+        assert rows[0]["glyph"] == "✓" and rows[0]["running"] is False
+        assert rows[0]["elapsed"] == 45.0
+
+    def test_status_glyph_mapping(self):
+        s = self._state()
+        for i, st in enumerate(["completed", "failed", "timeout", "interrupted"]):
+            s.start(st, goal=st, task_index=i, started_at=0.0)
+            s.complete(st, status=st, duration=1.0)
+        rows = s.fold({}, now=10.0)
+        assert [r["glyph"] for r in rows] == ["✓", "✗", "⏱", "⏹"]
+
+    def test_unknown_status_fails_closed_to_errored(self):
+        s = self._state()
+        s.start("a", goal="x", task_index=0, started_at=0.0)
+        s.complete("a", status="weird_new_state", duration=1.0)
+        rows = s.fold({}, now=10.0)
+        assert rows[0]["glyph"] == "?"  # never ✓
+
+    def test_order_follows_seen_order_no_reorder(self):
+        s = self._state()
+        s.start("a", goal="a", task_index=0, started_at=0.0)
+        s.start("b", goal="b", task_index=1, started_at=0.0)
+        s.complete("a", status="completed", duration=5.0)  # a done, b running
+        active = {"b": {"started_at": 0.0, "tool_count": 0}}
+        rows = s.fold(active, now=10.0)
+        assert [r["label"] for r in rows] == ["a", "b"]  # done row stays put
+
+    def test_missing_from_both_falls_back_to_meta_started(self):
+        s = self._state()
+        s.start("a", goal="x", task_index=0, started_at=950.0)
+        rows = s.fold({}, now=1000.0)
+        assert rows[0]["running"] is True and rows[0]["elapsed"] == 50.0
+
+    def test_complete_without_start_synthesizes_row(self):
+        s = self._state()
+        s.complete("a", status="completed", duration=6.0)
+        rows = s.fold({}, now=10.0)
+        assert len(rows) == 1 and rows[0]["glyph"] == "✓"
+
+    def test_apply_event_dispatch(self):
+        s = self._state()
+        s.apply_event(("__roster_start__", "a", "goal a", 0, 100.0))
+        s.apply_event(("__roster_complete__", "a", "completed", 3.0))
+        rows = s.fold({}, now=200.0)
+        assert rows[0]["glyph"] == "✓" and rows[0]["elapsed"] == 3.0
+
+    def test_has_records(self):
+        s = self._state()
+        assert s.has_records() is False
+        s.start("a", goal="x")
+        assert s.has_records() is True
+
+
+# ── pure roster: label + formatter ──────────────────────────────────────────
+class TestRosterLabel:
+    def test_cap_and_whitespace(self):
+        from gateway.subagent_roster import roster_label
+
+        assert roster_label("") == "subagent"
+        assert roster_label("multi\nline   goal") == "multi line goal"
+        long = "x" * 50
+        out = roster_label(long)
+        assert len(out) == _LABEL_CAP and out.endswith("…")
+
+
+class TestFormatSubagentRoster:
+    def test_empty_returns_none(self):
+        from gateway.subagent_roster import format_subagent_roster
+
+        assert format_subagent_roster([]) is None
+
+    def test_full_table_header_and_rows(self):
+        from gateway.subagent_roster import format_subagent_roster
+
+        rows = [
+            {"glyph": "▶", "label": "verify php", "elapsed": 83.0, "running": True, "tools": 8},
+            {"glyph": "▶", "label": "verify fe", "elapsed": 80.0, "running": True, "tools": 0},
+            {"glyph": "✓", "label": "run tests", "elapsed": 45.0, "running": False, "tools": 0},
+            {"glyph": "✗", "label": "check types", "elapsed": 30.0, "running": False, "tools": 0},
+        ]
+        text = format_subagent_roster(rows)
+        lines = text.split("\n")
+        assert lines[0] == "🤖 Subagents — 2 running, 1 done, 1 failed"
+        assert lines[1] == "▶ verify php · 1:23 · 8 tools"
+        assert lines[2] == "▶ verify fe · 1:20"
+        assert lines[3] == "✓ run tests · 0:45"
+        assert lines[4] == "✗ check types · 0:30"
+
+    def test_collapsed_one_liner(self):
+        from gateway.subagent_roster import format_subagent_roster
+
+        rows = [
+            {"glyph": "✓", "label": "a", "elapsed": 45.0, "running": False, "tools": 0},
+            {"glyph": "✓", "label": "b", "elapsed": 60.0, "running": False, "tools": 0},
+            {"glyph": "✗", "label": "c", "elapsed": 134.0, "running": False, "tools": 0},
+        ]
+        assert format_subagent_roster(rows, collapsed=True) == "🤖 3 subagents · 2 ✓ · 1 ✗ · 2:14"
+
+    def test_row_cap_overflow(self):
+        from gateway.subagent_roster import format_subagent_roster
+
+        rows = [
+            {"glyph": "▶", "label": f"g{i}", "elapsed": 1.0, "running": True, "tools": 0}
+            for i in range(13)
+        ]
+        text = format_subagent_roster(rows)
+        assert text.split("\n")[-1] == "… +3 more"  # 13 rows, cap 10
+
+
+_LABEL_CAP = 32
+
