@@ -26,10 +26,14 @@ from typing import Any, Dict, List, Optional, Tuple
 from gateway.duration_format import format_duration
 
 # Throttle for roster bubble edits, in seconds. Module constant so it is defined
-# once and imported by the consumer (never re-declared locally).
-ROSTER_EDIT_INTERVAL = 3.0
+# once and imported by the consumer (never re-declared locally). Set to 10s:
+# Telegram enforces a per-chat edit flood ceiling, and a busy chat with other
+# bubbles can trip "Flood control exceeded" — which froze the live timer. A
+# 10s cadence stays well under the ceiling; the final collapse (force) bypasses
+# this throttle so the terminal state always lands.
+ROSTER_EDIT_INTERVAL = 10.0
 
-_LABEL_CAP = 120
+_LABEL_CAP = 100
 _MAX_ROWS = 10
 
 
