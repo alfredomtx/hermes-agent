@@ -13245,23 +13245,259 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _enrich_async_delegation_routing(self, evt: dict) -> None:
         """Fill platform/chat_id/thread_id/chat_type on an async-delegation event.
 
-        Async-delegation completion events only carry ``session_key`` (the
-        daemon worker has no access to the per-message routing metadata the
-        terminal background watcher captures at spawn time). Parse the
-        session_key into the routing fields ``_build_process_event_source``
-        expects. Best-effort: a CLI-origin event (empty session_key) is left
-        as-is and simply won't route on the gateway.
+        Background batch events captured at dispatch time carry an explicit
+        ``routing`` dict (platform/chat_id/thread_id/message_id) AND top-level
+        copies of those fields. Honor that routing first — it is the freshest,
+        most specific origin we have. Only fall back to parsing ``session_key``
+        for fields routing did not provide. A CLI-origin event (empty routing +
+        empty session_key) is left as-is and simply won't route on the gateway.
         """
-        if evt.get("platform"):
-            return  # already enriched
+        routing = evt.get("routing") if isinstance(evt.get("routing"), dict) else {}
+        for key in (
+            "platform",
+            "chat_type",
+            "chat_id",
+            "thread_id",
+            "message_id",
+            "user_id",
+            "user_name",
+        ):
+            value = routing.get(key)
+            if value and not evt.get(key):
+                evt[key] = str(value)
+
         parsed = _parse_session_key(evt.get("session_key", "") or "")
         if not parsed:
             return
-        evt["platform"] = parsed.get("platform", "")
-        evt["chat_type"] = parsed.get("chat_type", "")
-        evt["chat_id"] = parsed.get("chat_id", "")
-        if parsed.get("thread_id"):
+
+        evt.setdefault("platform", parsed.get("platform", ""))
+        evt.setdefault("chat_type", parsed.get("chat_type", ""))
+        evt.setdefault("chat_id", parsed.get("chat_id", ""))
+        if parsed.get("thread_id") and not evt.get("thread_id"):
             evt["thread_id"] = parsed["thread_id"]
+
+    def _async_roster_bubbles(self) -> Dict[str, Dict[str, Any]]:
+        bubbles = getattr(self, "_async_subagent_roster_bubbles", None)
+        if bubbles is None:
+            bubbles = {}
+            self._async_subagent_roster_bubbles = bubbles
+        return bubbles
+
+    def _async_roster_target(self, evt: dict):
+        """Resolve (source, adapter, metadata) for a background roster bubble.
+
+        B1: build the SessionSource DIRECTLY from the routing captured at
+        dispatch time (platform/chat_id/chat_type/thread_id) instead of going
+        through ``_build_process_event_source``, which prefers the persisted
+        session-store origin (and its cached source) BEFORE explicit routing —
+        that would let a stale/foreground origin override the freshly captured
+        topic/chat. Only fall back to ``_build_process_event_source`` when
+        routing is incomplete. The reply anchor (message_id) is passed
+        separately to ``_thread_metadata_for_source`` — SessionSource has no
+        message_id field.
+        """
+        from gateway.session import SessionSource
+
+        route_evt = dict(evt)
+        self._enrich_async_delegation_routing(route_evt)
+
+        platform_name = str(route_evt.get("platform") or "").strip().lower()
+        chat_type = str(route_evt.get("chat_type") or "").strip().lower()
+        chat_id = str(route_evt.get("chat_id") or "").strip()
+
+        source = None
+        if platform_name and chat_type and chat_id:
+            try:
+                platform = Platform(platform_name)
+                if platform.value not in _BUILTIN_PLATFORM_VALUES:
+                    from gateway.platform_registry import platform_registry
+                    if not platform_registry.is_registered(platform.value):
+                        raise ValueError(platform_name)
+                source = SessionSource(
+                    platform=platform,
+                    chat_id=chat_id,
+                    chat_type=chat_type,
+                    thread_id=str(route_evt.get("thread_id") or "").strip() or None,
+                    user_id=str(route_evt.get("user_id") or "").strip() or None,
+                    user_name=str(route_evt.get("user_name") or "").strip() or None,
+                )
+            except Exception:
+                source = None
+        if source is None:
+            source = self._build_process_event_source(route_evt)
+        if not source:
+            return None
+
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            return None
+        if type(adapter).edit_message is BasePlatformAdapter.edit_message:
+            return None
+
+        try:
+            from gateway.display_config import resolve_display_setting
+
+            platform_key = _platform_config_key(source.platform)
+            enabled = is_truthy_value(
+                resolve_display_setting(
+                    _load_gateway_config(),
+                    platform_key,
+                    "subagent_roster",
+                    False,
+                ),
+                default=False,
+            )
+        except Exception:
+            enabled = False
+        if not enabled:
+            return None
+
+        reply_anchor = str(route_evt.get("message_id") or "").strip() or None
+        metadata = self._thread_metadata_for_source(source, reply_anchor)
+        metadata = _non_conversational_metadata(metadata, platform=source.platform)
+        return source, adapter, metadata
+
+    @staticmethod
+    def _adapter_edit_accepts_metadata(adapter: Any) -> bool:
+        try:
+            params = inspect.signature(adapter.edit_message).parameters
+            return (
+                "metadata" in params
+                or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+            )
+        except (TypeError, ValueError):
+            return False
+
+    async def _publish_async_delegation_roster(
+        self,
+        record: dict,
+        active_subagents: List[Dict[str, Any]],
+        *,
+        force: bool = False,
+        collapsed: bool = False,
+        allow_seed: bool = True,
+    ) -> None:
+        delegation_id = str(record.get("delegation_id") or "")
+        if not delegation_id:
+            return
+
+        target = self._async_roster_target(record)
+        if target is None:
+            return
+        source, adapter, metadata = target
+
+        from gateway.async_subagent_roster import build_async_subagent_roster_rows
+        from gateway.subagent_roster import ROSTER_EDIT_INTERVAL, format_subagent_roster
+
+        rows = build_async_subagent_roster_rows(record, active_subagents)
+        text = format_subagent_roster(rows, collapsed=collapsed)
+        if not text:
+            return
+
+        bubbles = self._async_roster_bubbles()
+        bubble = bubbles.setdefault(
+            delegation_id,
+            {
+                "message_id": None,
+                "seed_failed": False,
+                "last_text": None,
+                "last_edit_ts": 0.0,
+            },
+        )
+
+        now = time.monotonic()
+        if not force and (now - float(bubble.get("last_edit_ts") or 0.0)) < ROSTER_EDIT_INTERVAL:
+            return
+        if not force and text == bubble.get("last_text"):
+            return
+
+        if bubble.get("message_id") is None:
+            if not allow_seed or bubble.get("seed_failed"):
+                return
+            result = await adapter.send(
+                chat_id=source.chat_id,
+                content=text,
+                metadata=metadata,
+            )
+            if getattr(result, "success", False) and getattr(result, "message_id", None):
+                bubble["message_id"] = str(result.message_id)
+            else:
+                bubble["seed_failed"] = True
+                return
+        else:
+            kwargs: Dict[str, Any] = {
+                "chat_id": source.chat_id,
+                "message_id": str(bubble["message_id"]),
+                "content": text,
+            }
+            if getattr(adapter, "REQUIRES_EDIT_FINALIZE", False):
+                kwargs["finalize"] = True
+            if metadata and self._adapter_edit_accepts_metadata(adapter):
+                kwargs["metadata"] = metadata
+            try:
+                await adapter.edit_message(**kwargs)
+            except Exception:
+                logger.debug("async roster edit failed", exc_info=True)
+                return
+
+        bubble["last_text"] = text
+        bubble["last_edit_ts"] = now
+
+    async def _tick_async_delegation_rosters(
+        self,
+        records: List[Dict[str, Any]],
+        active_subagents: List[Dict[str, Any]],
+    ) -> None:
+        running_ids = set()
+        for record in records or []:
+            if record.get("type") and record.get("type") != "async_delegation":
+                continue
+            if not record.get("is_batch"):
+                continue
+            if record.get("status") != "running":
+                continue
+            did = str(record.get("delegation_id") or "")
+            if not did:
+                continue
+            running_ids.add(did)
+            try:
+                await self._publish_async_delegation_roster(
+                    record,
+                    active_subagents,
+                    force=False,
+                    collapsed=False,
+                    allow_seed=True,
+                )
+            except Exception:
+                logger.debug("async roster tick failed", exc_info=True)
+
+        bubbles = self._async_roster_bubbles()
+        for did in list(bubbles.keys()):
+            if did not in running_ids and bubbles[did].get("message_id") is None:
+                bubbles.pop(did, None)
+
+    async def _finalize_async_delegation_roster(
+        self,
+        evt: dict,
+        active_subagents: List[Dict[str, Any]],
+    ) -> None:
+        if evt.get("type") != "async_delegation":
+            return
+        if not evt.get("is_batch"):
+            return
+        did = str(evt.get("delegation_id") or "")
+        if not did:
+            return
+        try:
+            await self._publish_async_delegation_roster(
+                evt,
+                active_subagents,
+                force=True,
+                collapsed=True,
+                allow_seed=True,
+            )
+        finally:
+            self._async_roster_bubbles().pop(did, None)
 
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain async-delegation completions and inject them as new turns.
@@ -13279,8 +13515,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         await asyncio.sleep(3)  # let platforms finish connecting
         from tools.process_registry import process_registry as _pr
+        from tools.async_delegation import list_async_delegations as _list_async_delegations
+        from tools.delegate_tool import list_active_subagents as _list_active_subagents
         while self._running:
             try:
+                # Live roster tick: seed/edit the watcher-owned background
+                # subagent roster bubble for every running batch delegation
+                # BEFORE draining completions. The parent turn that dispatched
+                # these children has already ended, so this watcher is the only
+                # owner of their live progress surface.
+                try:
+                    active_subagents = _list_active_subagents()
+                except Exception:
+                    active_subagents = []
+                try:
+                    records = _list_async_delegations()
+                except Exception:
+                    records = []
+                await self._tick_async_delegation_rosters(records, active_subagents)
+
                 # Peek the queue for async-delegation events. We must NOT
                 # consume watch/completion events here (other drains own them),
                 # so requeue anything that isn't ours.
@@ -13303,6 +13556,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if not synth_text:
                         continue
                     try:
+                        await self._finalize_async_delegation_roster(evt, active_subagents)
                         await self._inject_watch_notification(synth_text, evt)
                     except Exception as e:
                         logger.error("Async delegation injection error: %s", e)
@@ -14831,6 +15085,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Queued under the "__subagent__" sentinel (not "delegate_task") so
             # these cards stay out of the parent's tool-completion FIFO and never
             # absorb a parent delegate_task duration suffix.
+            # B4 guard: background (async) children are owned by the long-lived
+            # _async_delegation_watcher roster. Their progress/tool/lifecycle
+            # events must never render on the parent-turn surface (the turn dies
+            # ~2s after dispatch, leaving a stale 0-done bubble or orphan tool
+            # cards). Drop EVERY subagent.* / subagent_progress event flagged
+            # async_background BEFORE any parent-turn handling below.
+            if kwargs.get("async_background") and (
+                str(event_type).startswith("subagent.")
+                or event_type == "subagent_progress"
+            ):
+                return
+
             if event_type in {
                 "subagent.tool",
                 "subagent.progress",
@@ -14923,6 +15189,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "subagent.start",
                 "subagent.complete",
             }:
+                if kwargs.get("async_background"):
+                    return  # B4 defensive: background rosters are watcher-owned
                 _sid = str(kwargs.get("subagent_id") or "")
                 if not _sid:
                     return  # no stable id -> can't track a row; drop quietly
@@ -14933,6 +15201,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         kwargs.get("goal") or preview or "",
                         int(kwargs.get("task_index", 0) or 0),
                         time.time(),
+                        kwargs.get("model") or "",
+                        kwargs.get("reasoning"),
                     ))
                 else:
                     progress_queue.put((

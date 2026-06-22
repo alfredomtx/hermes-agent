@@ -364,6 +364,86 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
     assert _drain_one() is None
 
 
+def test_batch_record_carries_child_metadata_routing_and_live_child_status():
+    did = ad.new_delegation_id()
+    marked = threading.Event()
+    finish = threading.Event()
+
+    def runner():
+        ad.update_batch_child_result(
+            did,
+            task_index=0,
+            subagent_id="sa-0",
+            result={
+                "status": "completed",
+                "duration_seconds": 6.0,
+                "summary": "six done",
+            },
+        )
+        marked.set()
+        finish.wait(timeout=5)
+        return {
+            "results": [
+                {
+                    "task_index": 0,
+                    "status": "completed",
+                    "summary": "six done",
+                    "duration_seconds": 6.0,
+                },
+                {
+                    "task_index": 1,
+                    "status": "completed",
+                    "summary": "ten done",
+                    "duration_seconds": 10.0,
+                },
+            ],
+            "total_duration_seconds": 10.0,
+        }
+
+    res = ad.dispatch_async_delegation_batch(
+        delegation_id=did,
+        goals=["sleep 6", "sleep 10"],
+        context="ctx",
+        toolsets=["terminal"],
+        role="leaf",
+        model="m",
+        session_key="agent:main:telegram:group:-1001:77",
+        runner=runner,
+        children=[
+            {"task_index": 0, "subagent_id": "sa-0", "goal": "sleep 6", "model": "m"},
+            {"task_index": 1, "subagent_id": "sa-1", "goal": "sleep 10", "model": "m"},
+        ],
+        routing={
+            "platform": "telegram",
+            "chat_type": "group",
+            "chat_id": "-1001",
+            "thread_id": "77",
+            "message_id": "42",
+        },
+        max_async_children=3,
+    )
+
+    assert res == {"status": "dispatched", "delegation_id": did}
+    assert marked.wait(timeout=2)
+
+    rec = next(r for r in ad.list_async_delegations() if r["delegation_id"] == did)
+    assert rec["routing"]["thread_id"] == "77"
+    assert rec["children"][0]["subagent_id"] == "sa-0"
+    assert rec["children"][0]["status"] == "completed"
+    assert rec["children"][0]["duration_seconds"] == 6.0
+    assert rec["children"][1]["status"] == "pending"
+
+    finish.set()
+    evt = _drain_one()
+    assert evt is not None
+    assert evt["type"] == "async_delegation"
+    assert evt["delegation_id"] == did
+    assert evt["children"][0]["status"] == "completed"
+    assert evt["children"][1]["status"] == "completed"
+    assert evt["routing"]["thread_id"] == "77"
+    assert evt["thread_id"] == "77"
+
+
 def test_model_dispatch_forces_background():
     """The MODEL-facing dispatch path forces background=True for any top-level
     delegation (single task OR batch), and keeps it off for an orchestrator
