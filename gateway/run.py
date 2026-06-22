@@ -2037,14 +2037,12 @@ def _build_document_context_note(display_name: str, agent_path: str, mtype: str)
 
 
 def _format_duration(seconds: float) -> str:
-    total = int(round(seconds))
-    if total < 0:
-        total = 0
-    minutes, secs = divmod(total, 60)
-    if minutes >= 60:
-        hours, minutes = divmod(minutes, 60)
-        return f"{hours}:{minutes:02d}:{secs:02d}"
-    return f"{minutes}:{secs:02d}"
+    # Delegates to the shared util (gateway/duration_format.py) so pure helper
+    # modules can reuse the exact M:SS / H:MM:SS semantics without importing
+    # this 18k-line module. Kept as a thin alias for existing call sites.
+    from gateway.duration_format import format_duration
+
+    return format_duration(seconds)
 
 
 def _format_tool_progress_duration(seconds: float) -> str:
