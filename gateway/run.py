@@ -14910,6 +14910,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         progress_queue.put(("__tool_start__", "__subagent__", _card))
                 return
 
+            # Live subagent roster bubble. Independent of subagent_tool_progress;
+            # gated only on display.platforms.<platform>.subagent_roster. The
+            # child's subagent.start/.complete lifecycle events are relayed from
+            # tools/delegate_tool.py with identity kwargs (subagent_id, goal,
+            # task_index, status, duration_seconds) but are otherwise dropped
+            # here. Forward them as roster sentinels; the consumer (gateway loop)
+            # owns roster state + its own edited-in-place bubble. This callback
+            # runs on a WORKER thread, so it ONLY enqueues — never touches roster
+            # state or the loop (no cross-thread scheduling, no deadlock trap).
+            if subagent_roster_enabled and event_type in {
+                "subagent.start",
+                "subagent.complete",
+            }:
+                _sid = str(kwargs.get("subagent_id") or "")
+                if not _sid:
+                    return  # no stable id -> can't track a row; drop quietly
+                if event_type == "subagent.start":
+                    progress_queue.put((
+                        "__roster_start__",
+                        _sid,
+                        kwargs.get("goal") or preview or "",
+                        int(kwargs.get("task_index", 0) or 0),
+                        time.time(),
+                    ))
+                else:
+                    progress_queue.put((
+                        "__roster_complete__",
+                        _sid,
+                        str(kwargs.get("status") or "completed").lower(),
+                        float(kwargs.get("duration_seconds") or 0.0),
+                    ))
+                return
+
             # First-touch onboarding: the first time a tool takes longer than
             # _LONG_TOOL_THRESHOLD_S during a run that's streaming every tool
             # (progress_mode == "all"), append a one-time hint suggesting
