@@ -248,15 +248,23 @@ def _tool_progress_pipeline_enabled(
     tool_completion_durations_enabled: bool,
     subagent_progress_enabled: bool,
     delegate_task_args_enabled: bool,
+    subagent_roster_enabled: bool = False,
 ) -> bool:
     """Decide whether the gateway tool-progress pipeline must stay alive.
 
     The progress queue/consumer is normally torn down when ``tool_progress``
     is ``"off"``. Several features still need the pipeline even then:
-    completion durations, subagent tool visibility, and ``delegate_task_args``
-    (surface delegate_task call parameters WITHOUT general tool noise). Webhooks
-    never get tool progress (no message editing). Extracted as a pure function
-    so the off+delegate_task_args wiring gap is unit-testable.
+    completion durations, subagent tool visibility, ``delegate_task_args``
+    (surface delegate_task call parameters WITHOUT general tool noise), and the
+    live subagent ROSTER bubble. Webhooks never get tool progress (no message
+    editing). Extracted as a pure function so these wiring gaps are
+    unit-testable. ``subagent_roster_enabled`` defaults False for back-compat
+    with existing callers/tests.
+
+    NOTE: the result gates PIPELINE creation, NOT whether ordinary tool rows
+    render. ``progress_mode`` remains the sole source of truth for tool rows
+    (the ``progress_mode == "off"`` guard in ``progress_callback``). So
+    roster-only mode keeps the queue/consumer alive without leaking tool rows.
     """
     if is_webhook:
         return False
@@ -265,6 +273,7 @@ def _tool_progress_pipeline_enabled(
         or tool_completion_durations_enabled
         or subagent_progress_enabled
         or delegate_task_args_enabled
+        or subagent_roster_enabled
     )
 
 
@@ -16609,12 +16618,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception:
             delegate_task_args_enabled = False
-        tool_progress_enabled = _tool_progress_pipeline_enabled(
+        # Live subagent roster bubble is an independent opt-in: it must keep the
+        # progress pipeline alive even when tool_progress is "off" (the Telegram
+        # default), exactly like delegate_task_args. Resolved once here so it
+        # gates both pipeline creation and the subagent.* relay in
+        # progress_callback below. Only renders on edit-capable adapters; the
+        # consumer no-ops on platforms without message editing.
+        try:
+            subagent_roster_enabled = is_truthy_value(
+                resolve_display_setting(
+                    user_config,
+                    platform_key,
+                    "subagent_roster",
+                    False,
+                ),
+                default=False,
+            )
+        except Exception:
+            subagent_roster_enabled = False
+        progress_pipeline_enabled = _tool_progress_pipeline_enabled(
             is_webhook=(source.platform == Platform.WEBHOOK),
             progress_mode=progress_mode,
             tool_completion_durations_enabled=tool_completion_durations_enabled,
             subagent_progress_enabled=subagent_progress_enabled,
             delegate_task_args_enabled=delegate_task_args_enabled,
+            subagent_roster_enabled=subagent_roster_enabled,
         )
         # "log" mode: tool calls are written to ~/.hermes/logs/tool_calls.log
         # instead of the chat (#3459 / #3458). Gateway-only by design.
@@ -16646,7 +16674,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             platform=source.platform,
             require_platform_override_for={Platform.MATTERMOST},
         )
-        needs_progress_queue = tool_progress_enabled or _thinking_enabled
+        needs_progress_queue = progress_pipeline_enabled or _thinking_enabled
 
 
         # Queue for progress messages (thread-safe)
@@ -16940,7 +16968,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # If tool_progress is off, only _thinking passes through (above).
             # Regular tool calls are suppressed.
-            if not tool_progress_enabled:
+            if not progress_pipeline_enabled:
                 return
 
             # Only act on tool.started events (ignore reasoning.available, etc.)
@@ -18412,14 +18440,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
-            # Gate on needs_progress_queue (tool_progress OR thinking_progress)
-            # rather than tool_progress alone: the progress_callback also relays
+            # Gate on needs_progress_queue (tool_progress / subagent roster / delegate_task args / thinking_progress)
+            # rather than progress_pipeline alone: the progress_callback also relays
             # _thinking assistant scratch text, which is gated on
-            # thinking_progress and is intentionally independent of tool
-            # progress. With the old `tool_progress_enabled`-only gate, a user
-            # who set thinking_progress:true but kept tool_progress:off got a
-            # None callback — so _thinking scratch bubbles never relayed even
-            # though the progress queue was created for them.
+            # thinking_progress and is intentionally independent of tool progress.
             agent.tool_progress_callback = (
                 progress_callback if (needs_progress_queue or log_mode_enabled) else None
             )

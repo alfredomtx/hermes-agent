@@ -195,5 +195,56 @@ class TestFormatSubagentRoster:
         assert text.split("\n")[-1] == "… +3 more"  # 13 rows, cap 10
 
 
+# ── pipeline gate: roster must keep the queue/consumer alive ────────────────
+class TestRosterPipelineGate:
+    def test_roster_keeps_pipeline_alive_with_everything_else_off(self):
+        from gateway.run import _tool_progress_pipeline_enabled
+
+        assert _tool_progress_pipeline_enabled(
+            is_webhook=False,
+            progress_mode="off",
+            tool_completion_durations_enabled=False,
+            subagent_progress_enabled=False,
+            delegate_task_args_enabled=False,
+            subagent_roster_enabled=True,
+        ) is True
+
+    def test_everything_off_is_disabled(self):
+        from gateway.run import _tool_progress_pipeline_enabled
+
+        assert _tool_progress_pipeline_enabled(
+            is_webhook=False,
+            progress_mode="off",
+            tool_completion_durations_enabled=False,
+            subagent_progress_enabled=False,
+            delegate_task_args_enabled=False,
+            subagent_roster_enabled=False,
+        ) is False
+
+    def test_webhook_always_disabled_even_with_roster(self):
+        from gateway.run import _tool_progress_pipeline_enabled
+
+        assert _tool_progress_pipeline_enabled(
+            is_webhook=True,
+            progress_mode="all",
+            tool_completion_durations_enabled=True,
+            subagent_progress_enabled=True,
+            delegate_task_args_enabled=True,
+            subagent_roster_enabled=True,
+        ) is False
+
+    def test_default_param_back_compat(self):
+        # Existing callers that omit subagent_roster_enabled still work.
+        from gateway.run import _tool_progress_pipeline_enabled
+
+        assert _tool_progress_pipeline_enabled(
+            is_webhook=False,
+            progress_mode="off",
+            tool_completion_durations_enabled=False,
+            subagent_progress_enabled=False,
+            delegate_task_args_enabled=False,
+        ) is False
+
+
 _LABEL_CAP = 32
 
