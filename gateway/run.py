@@ -14831,6 +14831,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Queued under the "__subagent__" sentinel (not "delegate_task") so
             # these cards stay out of the parent's tool-completion FIFO and never
             # absorb a parent delegate_task duration suffix.
+            # B4 guard: background (async) children are owned by the long-lived
+            # _async_delegation_watcher roster. Their progress/tool/lifecycle
+            # events must never render on the parent-turn surface (the turn dies
+            # ~2s after dispatch, leaving a stale 0-done bubble or orphan tool
+            # cards). Drop EVERY subagent.* / subagent_progress event flagged
+            # async_background BEFORE any parent-turn handling below.
+            if kwargs.get("async_background") and (
+                str(event_type).startswith("subagent.")
+                or event_type == "subagent_progress"
+            ):
+                return
+
             if event_type in {
                 "subagent.tool",
                 "subagent.progress",
@@ -14923,6 +14935,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "subagent.start",
                 "subagent.complete",
             }:
+                if kwargs.get("async_background"):
+                    return  # B4 defensive: background rosters are watcher-owned
                 _sid = str(kwargs.get("subagent_id") or "")
                 if not _sid:
                     return  # no stable id -> can't track a row; drop quietly
