@@ -1017,6 +1017,11 @@ def _build_child_progress_callback(
         # event lets UIs open/inspect the subagent's session directly.
         if session_ref and session_ref.get("session_id"):
             kw["child_session_id"] = str(session_ref["session_id"])
+        if session_ref:
+            if session_ref.get("async_delegation_id"):
+                kw["async_delegation_id"] = str(session_ref["async_delegation_id"])
+            if session_ref.get("async_background"):
+                kw["async_background"] = True
         kw["tool_count"] = _tool_count[0]
         return kw
 
@@ -1460,6 +1465,7 @@ def _build_child_agent(
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
+    child._delegate_progress_ref = child_session_ref
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = child_depth
     # Stash the post-degrade role for introspection (leaf if the
@@ -2497,7 +2503,7 @@ def delegate_task(
         # Authoritative restore: reset global to parent's tool names after all children built
         _model_tools._last_resolved_tool_names = _parent_tool_names
 
-    def _execute_and_aggregate() -> dict:
+    def _execute_and_aggregate(async_delegation_id: Optional[str] = None) -> dict:
         """Run all built children (1 or N), join on them, aggregate results,
         fire subagent_stop hooks + cost rollup, and return the combined result
         dict. Used by BOTH the synchronous path and the background runner. In
@@ -2507,11 +2513,27 @@ def delegate_task(
         results block. That is the contract: fan-out runs in the background,
         waits on each other, and returns together.
         """
+        def _mark_async_child_result(entry: Dict[str, Any], child_obj: Any) -> None:
+            if not async_delegation_id:
+                return
+            try:
+                from tools.async_delegation import update_batch_child_result
+
+                update_batch_child_result(
+                    async_delegation_id,
+                    task_index=entry.get("task_index"),
+                    subagent_id=getattr(child_obj, "_subagent_id", None),
+                    result=entry,
+                )
+            except Exception:
+                logger.debug("async child status update failed", exc_info=True)
+
         if n_tasks == 1:
             # Single task -- run directly (no thread pool overhead)
             _i, _t, child = children[0]
             result = _run_single_child(_i, _t["goal"], child, parent_agent)
             results.append(result)
+            _mark_async_child_result(result, child)
         else:
             # Batch -- run in parallel with per-task progress lines
             completed_count = 0
@@ -2575,6 +2597,7 @@ def delegate_task(
                                 }
                             results.append(entry)
                             completed_count += 1
+                            _mark_async_child_result(entry, _child_by_index.get(entry.get("task_index")))
                         break
 
                     from concurrent.futures import wait as _cf_wait, FIRST_COMPLETED
@@ -2600,6 +2623,7 @@ def delegate_task(
                             }
                         results.append(entry)
                         completed_count += 1
+                        _mark_async_child_result(entry, _child_by_index.get(entry.get("task_index")))
 
                         # Print per-task completion line above the spinner
                         idx = entry["task_index"]
@@ -2740,10 +2764,25 @@ def delegate_task(
     # not blocked in the meantime. This is the contract: dispatch N subagents,
     # keep chatting, get the combined summaries back together at the end.
     if background:
-        from tools.async_delegation import dispatch_async_delegation_batch
+        from tools.async_delegation import (
+            dispatch_async_delegation_batch,
+            new_delegation_id,
+        )
         from tools.approval import get_current_session_key
 
         _session_key = get_current_session_key(default="")
+        _delegation_id = new_delegation_id()
+        try:
+            from gateway.session_context import get_session_env
+
+            _routing = {
+                "platform": get_session_env("HERMES_SESSION_PLATFORM", ""),
+                "chat_id": get_session_env("HERMES_SESSION_CHAT_ID", ""),
+                "thread_id": get_session_env("HERMES_SESSION_THREAD_ID", ""),
+                "message_id": get_session_env("HERMES_SESSION_MESSAGE_ID", ""),
+            }
+        except Exception:
+            _routing = {}
         _child_agents = [c for (_, _, c) in children]
 
         # Detach every child from the parent's interrupt-propagation list — the
@@ -2762,7 +2801,7 @@ def delegate_task(
                     pass
 
         def _batch_runner():
-            return _execute_and_aggregate()
+            return _execute_and_aggregate(async_delegation_id=_delegation_id)
 
         def _batch_interrupt():
             for _c in _child_agents:
@@ -2775,6 +2814,29 @@ def delegate_task(
                     pass
 
         _goals = [t["goal"] for t in task_list]
+        _child_records = []
+        for _i, _t, _c in children:
+            _model = getattr(_c, "model", None)
+            _child_records.append(
+                {
+                    "task_index": _i,
+                    "subagent_id": getattr(_c, "_subagent_id", "") or "",
+                    "goal": _t["goal"],
+                    "model": _model if isinstance(_model, str) else creds["model"],
+                    "status": "pending",
+                }
+            )
+            # NOTE: these async flags are set AFTER _build_child_agent already
+            # emitted subagent.spawn_requested, so that event is intentionally
+            # UNMARKED (parent-turn). The watcher owns the background roster via
+            # the explicit _child_records above, never via spawn_requested. Every
+            # subagent.* event fired after this point carries async_background so
+            # the parent-turn callback (B4 guard) drops it.
+            _ref = getattr(_c, "_delegate_progress_ref", None)
+            if isinstance(_ref, dict):
+                _ref["async_delegation_id"] = _delegation_id
+                _ref["async_background"] = True
+
         dispatch = dispatch_async_delegation_batch(
             goals=_goals,
             context=context,
@@ -2785,6 +2847,9 @@ def delegate_task(
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
             max_async_children=_get_max_async_children(),
+            delegation_id=_delegation_id,
+            children=_child_records,
+            routing=_routing,
         )
 
         if dispatch.get("status") == "dispatched":
@@ -2819,6 +2884,11 @@ def delegate_task(
             "batch synchronously instead.",
             dispatch.get("error", "rejected"),
         )
+        for _c in _child_agents:
+            _ref = getattr(_c, "_delegate_progress_ref", None)
+            if isinstance(_ref, dict):
+                _ref.pop("async_delegation_id", None)
+                _ref.pop("async_background", None)
         return json.dumps(_execute_and_aggregate(), ensure_ascii=False)
 
     # ----- Synchronous path -----
