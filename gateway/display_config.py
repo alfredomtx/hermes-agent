@@ -67,6 +67,15 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     # A long subagent doing dozens of tools can post many permanent messages
     # on platforms with no message editing, so this stays off unless opted in.
     "subagent_tool_progress": "off",
+    # Live, edited-in-place roster bubble for delegate_task subagents. When
+    # "on", a single message shows how many children are running, each child's
+    # short goal, per-agent elapsed time, and status (running/done/errored/
+    # timed-out), collapsing to a one-liner at turn end. Independent of
+    # subagent_tool_progress (membership + status come from subagent.start/
+    # .complete lifecycle events; elapsed from a periodic registry poll). Only
+    # renders on edit-capable adapters (Telegram, Discord); silent no-op on
+    # platforms without message editing. Off by default.
+    "subagent_roster": "off",
 }
 
 # ---------------------------------------------------------------------------
@@ -272,6 +281,15 @@ def _normalise(setting: str, value: Any) -> Any:
             return "off"
         v = str(value).strip().lower()
         return v if v in {"off", "batched", "full"} else "off"
+    if setting == "subagent_roster":
+        # Binary on/off. Accept YAML 1.1 booleans (bare on->True, off->False).
+        # Unknown strings fail safe to "off".
+        if value is True:
+            return "on"
+        if value is False:
+            return "off"
+        v = str(value).strip().lower()
+        return "on" if v in {"on", "true", "1", "yes"} else "off"
     if setting == "tool_preview_length":
         try:
             return int(value)
