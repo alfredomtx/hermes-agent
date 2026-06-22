@@ -29,8 +29,60 @@ from gateway.duration_format import format_duration
 # once and imported by the consumer (never re-declared locally).
 ROSTER_EDIT_INTERVAL = 3.0
 
-_LABEL_CAP = 32
+_LABEL_CAP = 120
 _MAX_ROWS = 10
+
+
+def shorten_model(model: Optional[str]) -> str:
+    """Compact a model id for a roster row.
+
+    Strips a leading region/provider dotted prefix so a row stays readable:
+    ``us.anthropic.claude-opus-4-8`` -> ``opus-4-8``,
+    ``claude-sonnet-4-6`` -> ``sonnet-4-6``. Model ids whose only dots are a
+    version number (``gpt-5.5``) are left intact. Best-effort: unknown shapes
+    return unchanged.
+    """
+    text = str(model or "").strip()
+    if not text:
+        return ""
+    # Only treat dots as a provider/region prefix separator when EVERY segment
+    # before the last is a bare alpha token (us, anthropic, openai, ...). This
+    # avoids mangling a version dot like "gpt-5.5" (segment "5" is not alpha).
+    if "." in text:
+        segs = text.split(".")
+        if all(s.isalpha() for s in segs[:-1]):
+            text = segs[-1]
+    # Strip a redundant vendor token so "claude-opus-4-8" -> "opus-4-8".
+    for vendor in ("claude-", "anthropic-"):
+        if text.startswith(vendor):
+            text = text[len(vendor):]
+            break
+    return text
+
+
+def reasoning_tag(reasoning: Any) -> str:
+    """Render a reasoning_config dict/string into a short effort tag.
+
+    ``{"enabled": True, "effort": "high"}`` -> ``high``;
+    ``{"enabled": False}`` -> ``""`` (no reasoning, nothing to show);
+    a bare string ``"max"`` -> ``max``. Anything else -> ``""``.
+    """
+    if isinstance(reasoning, dict):
+        if not reasoning.get("enabled", True):
+            return ""
+        return str(reasoning.get("effort") or "").strip().lower()
+    if isinstance(reasoning, str):
+        return reasoning.strip().lower()
+    return ""
+
+
+def _model_suffix(row: Dict[str, Any]) -> str:
+    """`· <model> <reasoning>` suffix for a row, or '' when no model known."""
+    model = shorten_model(row.get("model"))
+    if not model:
+        return ""
+    tag = reasoning_tag(row.get("reasoning"))
+    return f" · {model} {tag}".rstrip() if tag else f" · {model}"
 
 # delegate_tool subagent.complete status string -> (glyph, display bucket).
 # Vocabulary verified in tools/delegate_tool.py: completed | failed |
@@ -76,6 +128,8 @@ class SubagentRosterState:
         goal: Optional[str] = None,
         task_index: int = 0,
         started_at: float = 0.0,
+        model: Optional[str] = None,
+        reasoning: Any = None,
     ) -> None:
         if not sid:
             return
@@ -85,6 +139,8 @@ class SubagentRosterState:
             "goal": goal or "",
             "task_index": int(task_index or 0),
             "started_at": float(started_at or 0.0),
+            "model": model or "",
+            "reasoning": reasoning,
         }
         # A re-run/restart of the same sid clears any prior terminal state.
         self.terminal.pop(sid, None)
@@ -106,6 +162,8 @@ class SubagentRosterState:
                 "goal": "",
                 "task_index": 0,
                 "started_at": float(started_at or 0.0),
+                "model": "",
+                "reasoning": None,
             }
         self.terminal[sid] = {
             "status": str(status or "completed").lower(),
@@ -115,15 +173,23 @@ class SubagentRosterState:
     def apply_event(self, raw: Tuple[Any, ...]) -> None:
         """Mutate from a dequeued sentinel tuple (loop thread only).
 
-        ``("__roster_start__", sid, goal, task_index, started_at)``
+        ``("__roster_start__", sid, goal, task_index, started_at[, model, reasoning])``
         ``("__roster_complete__", sid, status, duration)``
+
+        The start tuple's model/reasoning tail is optional so older producers
+        (and replayed queues) without them still apply cleanly.
         """
         if not raw:
             return
         kind = raw[0]
         if kind == "__roster_start__":
-            _, sid, goal, task_index, started_at = raw
-            self.start(sid, goal, task_index, started_at)
+            sid = raw[1] if len(raw) > 1 else ""
+            goal = raw[2] if len(raw) > 2 else ""
+            task_index = raw[3] if len(raw) > 3 else 0
+            started_at = raw[4] if len(raw) > 4 else 0.0
+            model = raw[5] if len(raw) > 5 else None
+            reasoning = raw[6] if len(raw) > 6 else None
+            self.start(sid, goal, task_index, started_at, model, reasoning)
         elif kind == "__roster_complete__":
             _, sid, status, duration = raw
             self.complete(sid, status, duration)
@@ -138,6 +204,8 @@ class SubagentRosterState:
         for sid in self.seen_order:
             m = self.meta.get(sid) or {}
             label = roster_label(m.get("goal"))
+            model = m.get("model") or ""
+            reasoning = m.get("reasoning")
             if sid in self.terminal:
                 t = self.terminal[sid]
                 glyph, _bucket = STATUS_GLYPH.get(
@@ -149,6 +217,8 @@ class SubagentRosterState:
                     "elapsed": float(t.get("duration") or 0.0),
                     "running": False,
                     "tools": 0,
+                    "model": model,
+                    "reasoning": reasoning,
                 })
             else:
                 rec = active_by_id.get(sid) or {}
@@ -159,6 +229,8 @@ class SubagentRosterState:
                     "elapsed": max(0.0, now - float(started)),
                     "running": True,
                     "tools": int(rec.get("tool_count") or 0),
+                    "model": model,
+                    "reasoning": reasoning,
                 })
         return rows
 
@@ -194,18 +266,32 @@ def format_subagent_roster(rows: List[Dict[str, Any]], *, collapsed: bool = Fals
     failed_total = errored + timed_out + interrupted
 
     if collapsed:
-        # One-line summary so a wall of done rows never sits above the answer.
-        # Elapsed proxy = the longest row (~ parallel wall span).
+        # Final render. Keep the per-child breakdown (each child marked with its
+        # terminal glyph) instead of collapsing to a bare one-liner — the user
+        # wants to see WHICH children did what, not just a count. The summary
+        # line becomes a header above the rows.
         span = max((r["elapsed"] for r in rows), default=0.0)
-        parts = [f"🤖 {len(rows)} subagent" + ("s" if len(rows) != 1 else "")]
+        head_parts = [f"🤖 {len(rows)} subagent" + ("s" if len(rows) != 1 else "")]
         if pending:
-            parts.append(f"{len(pending)} pending")
+            head_parts.append(f"{len(pending)} pending")
         if done:
-            parts.append(f"{len(done)} ✓")
+            head_parts.append(f"{len(done)} ✓")
         if failed_total:
-            parts.append(f"{len(failed_total)} ✗")
-        parts.append(format_duration(span))
-        return " · ".join(parts)
+            head_parts.append(f"{len(failed_total)} ✗")
+        head_parts.append(format_duration(span))
+        head = " · ".join(head_parts)
+
+        lines = [head]
+        shown = rows[:_MAX_ROWS]
+        for r in shown:
+            # On the final render a running row (shouldn't normally happen) is
+            # shown with its live glyph; terminal rows keep ✓/✗/⏱/⏹.
+            line = f"{r['glyph']} {r['label']}{_model_suffix(r)} · {format_duration(r['elapsed'])}"
+            lines.append(line)
+        extra = len(rows) - len(shown)
+        if extra > 0:
+            lines.append(f"… +{extra} more")
+        return "\n".join(lines)
 
     head = f"🤖 Subagents — {len(running)} running"
     if pending:
@@ -218,7 +304,7 @@ def format_subagent_roster(rows: List[Dict[str, Any]], *, collapsed: bool = Fals
     lines = [head]
     shown = rows[:_MAX_ROWS]
     for r in shown:
-        line = f"{r['glyph']} {r['label']} · {format_duration(r['elapsed'])}"
+        line = f"{r['glyph']} {r['label']}{_model_suffix(r)} · {format_duration(r['elapsed'])}"
         if r["running"] and r["tools"] > 0:
             line += f" · {r['tools']} tool" + ("s" if r["tools"] != 1 else "")
         lines.append(line)

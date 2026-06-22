@@ -79,6 +79,7 @@ class TestFoldSubagentRoster:
         assert rows == [{
             "glyph": "▶", "label": "verify php",
             "elapsed": 60.0, "running": True, "tools": 7,
+            "model": "", "reasoning": None,
         }]
 
     def test_terminal_row_from_complete_map(self):
@@ -146,7 +147,7 @@ class TestRosterLabel:
 
         assert roster_label("") == "subagent"
         assert roster_label("multi\nline   goal") == "multi line goal"
-        long = "x" * 50
+        long = "x" * 200
         out = roster_label(long)
         assert len(out) == _LABEL_CAP and out.endswith("…")
 
@@ -174,7 +175,10 @@ class TestFormatSubagentRoster:
         assert lines[3] == "✓ run tests · 0:45"
         assert lines[4] == "✗ check types · 0:30"
 
-    def test_collapsed_one_liner(self):
+    def test_collapsed_keeps_breakdown_with_summary_header(self):
+        # On finish the roster keeps the per-child breakdown (each marked with
+        # its terminal glyph) under a summary header — it does NOT collapse to a
+        # bare one-liner. Alfredo wants to see WHICH children did what.
         from gateway.subagent_roster import format_subagent_roster
 
         rows = [
@@ -182,7 +186,26 @@ class TestFormatSubagentRoster:
             {"glyph": "✓", "label": "b", "elapsed": 60.0, "running": False, "tools": 0},
             {"glyph": "✗", "label": "c", "elapsed": 134.0, "running": False, "tools": 0},
         ]
-        assert format_subagent_roster(rows, collapsed=True) == "🤖 3 subagents · 2 ✓ · 1 ✗ · 2:14"
+        out = format_subagent_roster(rows, collapsed=True)
+        lines = out.split("\n")
+        assert lines[0] == "🤖 3 subagents · 2 ✓ · 1 ✗ · 2:14"
+        assert lines[1] == "✓ a · 0:45"
+        assert lines[2] == "✓ b · 1:00"
+        assert lines[3] == "✗ c · 2:14"
+
+    def test_collapsed_renders_model_and_reasoning(self):
+        from gateway.subagent_roster import format_subagent_roster
+
+        rows = [
+            {
+                "glyph": "✓", "label": "review", "elapsed": 322.0,
+                "running": False, "tools": 0,
+                "model": "us.anthropic.claude-opus-4-8",
+                "reasoning": {"enabled": True, "effort": "high"},
+            },
+        ]
+        out = format_subagent_roster(rows, collapsed=True)
+        assert "✓ review · opus-4-8 high · 5:22" in out
 
     def test_row_cap_overflow(self):
         from gateway.subagent_roster import format_subagent_roster
@@ -193,6 +216,35 @@ class TestFormatSubagentRoster:
         ]
         text = format_subagent_roster(rows)
         assert text.split("\n")[-1] == "… +3 more"  # 13 rows, cap 10
+
+
+class TestShortenModel:
+    def test_strips_region_provider_prefix(self):
+        from gateway.subagent_roster import shorten_model
+
+        assert shorten_model("us.anthropic.claude-opus-4-8") == "opus-4-8"
+        assert shorten_model("claude-sonnet-4-6") == "sonnet-4-6"
+
+    def test_preserves_version_dot(self):
+        from gateway.subagent_roster import shorten_model
+
+        # A version dot must NOT be treated as a provider-prefix separator.
+        assert shorten_model("gpt-5.5") == "gpt-5.5"
+        assert shorten_model("gpt-4.1-mini") == "gpt-4.1-mini"
+
+    def test_empty(self):
+        from gateway.subagent_roster import shorten_model
+
+        assert shorten_model("") == ""
+        assert shorten_model(None) == ""
+
+    def test_reasoning_tag(self):
+        from gateway.subagent_roster import reasoning_tag
+
+        assert reasoning_tag({"enabled": True, "effort": "high"}) == "high"
+        assert reasoning_tag({"enabled": False}) == ""
+        assert reasoning_tag("max") == "max"
+        assert reasoning_tag(None) == ""
 
 
 # ── pipeline gate: roster must keep the queue/consumer alive ────────────────
@@ -246,5 +298,5 @@ class TestRosterPipelineGate:
         ) is False
 
 
-_LABEL_CAP = 32
+from gateway.subagent_roster import _LABEL_CAP
 

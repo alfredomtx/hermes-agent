@@ -74,6 +74,10 @@ def build_async_subagent_roster_rows(
         active = active_by_id.get(sid)
         status = _normalise_status(child.get("status"))
         label = roster_label(child.get("goal"))
+        model = child.get("model") or record.get("model") or ""
+        reasoning = child.get("reasoning")
+        if reasoning is None:
+            reasoning = record.get("reasoning")
 
         if active is not None and status == "pending":
             started = (
@@ -94,6 +98,8 @@ def build_async_subagent_roster_rows(
                     "running": True,
                     "tools": int(active.get("tool_count") or 0),
                     "bucket": "running",
+                    "model": model,
+                    "reasoning": reasoning,
                 }
             )
             continue
@@ -107,6 +113,8 @@ def build_async_subagent_roster_rows(
                     "running": False,
                     "tools": 0,
                     "bucket": "pending",
+                    "model": model,
+                    "reasoning": reasoning,
                 }
             )
             continue
@@ -129,6 +137,8 @@ def build_async_subagent_roster_rows(
                 "running": False,
                 "tools": 0,
                 "bucket": bucket,
+                "model": model,
+                "reasoning": reasoning,
             }
         )
 
