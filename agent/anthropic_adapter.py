@@ -829,7 +829,7 @@ def build_anthropic_client(
     return _anthropic_sdk.Anthropic(**kwargs)
 
 
-def build_anthropic_bedrock_client(region: str):
+def build_anthropic_bedrock_client(region: str, timeout: Optional[float] = None):
     """Create an AnthropicBedrock client for Bedrock Claude models.
 
     Uses the Anthropic SDK's native Bedrock adapter, which provides full
@@ -842,6 +842,16 @@ def build_anthropic_bedrock_client(region: str):
     unlocks the 1M context window for Opus 4.6/4.7/4.8 and Sonnet 4.6 on
     Bedrock — without it, some Bedrock routes cap these models at 200K
     even though the Anthropic API serves them with 1M natively.
+
+    If *timeout* is provided (a positive number) it overrides the default
+    900s read timeout; the connect timeout stays at 10s. Callers pass this
+    from the per-provider / per-model ``request_timeout_seconds`` config
+    (resolved via ``get_provider_request_timeout``) so Bedrock-hosted Claude
+    respects the same knob as the Anthropic-native and OpenAI-wire providers.
+    A high-reasoning Opus review that streams for longer than 900s would
+    otherwise have its underlying API call killed by the hard-coded read
+    timeout; this lets that ceiling be raised in ``config.yaml`` without a
+    code change.
 
     Auth uses the boto3 default credential chain (IAM roles, SSO, env vars).
     """
@@ -858,9 +868,11 @@ def build_anthropic_bedrock_client(region: str):
         )
     from httpx import Timeout
 
+    _read_timeout = timeout if (isinstance(timeout, (int, float)) and timeout > 0) else 900.0
+
     return _anthropic_sdk.AnthropicBedrock(
         aws_region=region,
-        timeout=Timeout(timeout=900.0, connect=10.0),
+        timeout=Timeout(timeout=float(_read_timeout), connect=10.0),
         # Delegate retry to hermes's outer loop (honors Retry-After); the SDK
         # default max_retries=2 ignores it and double-retries. (#26293)
         max_retries=0,

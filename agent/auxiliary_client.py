@@ -4858,7 +4858,16 @@ def resolve_provider_client(
         default_model = "anthropic.claude-haiku-4-5-20251001-v1:0"
         final_model = _normalize_resolved_model(model or default_model, provider)
         try:
-            real_client = build_anthropic_bedrock_client(region)
+            # final_model is the normalized Bedrock id. For Bedrock,
+            # normalize_model_for_provider is effectively identity (native
+            # ids pass through unchanged), so this matches the same config
+            # key as the raw-model lookups in agent_init.py / run_agent.py.
+            from hermes_cli.timeouts import get_provider_request_timeout
+            _aux_timeout = get_provider_request_timeout(provider, final_model)
+        except Exception:
+            _aux_timeout = None
+        try:
+            real_client = build_anthropic_bedrock_client(region, timeout=_aux_timeout)
         except ImportError as exc:
             logger.warning("resolve_provider_client: cannot create Bedrock "
                            "client: %s", exc)
