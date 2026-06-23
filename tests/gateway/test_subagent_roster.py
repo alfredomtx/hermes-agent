@@ -229,10 +229,51 @@ class TestFormatSubagentRoster:
         ]
         out = format_subagent_roster(rows, collapsed=True)
         lines = out.split("\n")
-        assert lines[0] == "🤖 3 subagents · 2 ✓ · 1 ✗ · 2:14"
+        # A failure is present -> ⚠️ leads (a green check there would lie).
+        assert lines[0] == "⚠️ 3 subagents · 2 ✓ · 1 ✗ · 2:14"
         assert lines[1] == "✓ a · 0:45"
         assert lines[2] == "✓ b · 1:00"
         assert lines[3] == "✗ c · 2:14"
+
+    def test_collapsed_all_success_leads_with_green_check(self):
+        # Clear "all done" indicator: when every child finished successfully the
+        # header LEADS with ✅ instead of the 🤖 robot, so finished is obvious.
+        from gateway.subagent_roster import format_subagent_roster
+
+        rows = [
+            {"glyph": "✓", "label": "a", "elapsed": 45.0, "running": False, "tools": 0},
+            {"glyph": "✓", "label": "b", "elapsed": 60.0, "running": False, "tools": 0},
+        ]
+        out = format_subagent_roster(rows, collapsed=True)
+        lines = out.split("\n")
+        assert lines[0] == "✅ 2 subagents · 2 ✓ · 1:00"
+
+    def test_collapsed_single_success_leads_with_green_check(self):
+        from gateway.subagent_roster import format_subagent_roster
+
+        rows = [{"glyph": "✓", "label": "a", "elapsed": 5.0, "running": False, "tools": 0}]
+        out = format_subagent_roster(rows, collapsed=True)
+        assert out.split("\n")[0] == "✅ 1 subagent · 1 ✓ · 0:05"
+
+    def test_collapsed_with_running_row_keeps_robot(self):
+        # Defensive: if a running row somehow reaches the collapsed render, do
+        # NOT claim finished — keep the 🤖 robot.
+        from gateway.subagent_roster import format_subagent_roster
+
+        rows = [
+            {"glyph": "▶", "label": "a", "elapsed": 5.0, "running": True, "tools": 1},
+            {"glyph": "✓", "label": "b", "elapsed": 6.0, "running": False, "tools": 0},
+        ]
+        out = format_subagent_roster(rows, collapsed=True)
+        assert out.split("\n")[0].startswith("🤖 ")
+
+    def test_collapsed_timeout_only_leads_with_warning(self):
+        # timed-out / interrupted count as not-all-clean -> ⚠️, never ✅.
+        from gateway.subagent_roster import format_subagent_roster
+
+        rows = [{"glyph": "⏱", "label": "a", "elapsed": 900.0, "running": False, "tools": 3}]
+        out = format_subagent_roster(rows, collapsed=True)
+        assert out.split("\n")[0].startswith("⚠️ ")
 
     def test_collapsed_keeps_tool_count_on_done_rows(self):
         from gateway.subagent_roster import format_subagent_roster

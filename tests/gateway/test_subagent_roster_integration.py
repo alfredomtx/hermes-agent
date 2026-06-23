@@ -277,7 +277,11 @@ async def test_fast_child_still_collapses(monkeypatch, tmp_path):
     # B1: child finishes before the first tick; must still emit ONE summary.
     adapter, result = await _run(monkeypatch, tmp_path, FastChildAgent, "sess-fast")
     blob = "\n".join(_all_text(adapter))
-    assert "🤖" in blob, "fast child produced no roster output at all (B1 regression)"
+    # A roster lead marker must be present: 🤖 (live) or, when the child
+    # finished before the first tick, the collapsed finished marker ✅ / ⚠️.
+    assert any(m in blob for m in ("🤖", "✅", "⚠️")), (
+        "fast child produced no roster output at all (B1 regression)"
+    )
     # the collapsed one-liner form
     assert "subagent" in blob
 

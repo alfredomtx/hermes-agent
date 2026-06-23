@@ -329,7 +329,17 @@ def format_subagent_roster(rows: List[Dict[str, Any]], *, collapsed: bool = Fals
         # wants to see WHICH children did what, not just a count. The summary
         # line becomes a header above the rows.
         span = max((r["elapsed"] for r in rows), default=0.0)
-        head_parts = [f"🤖 {len(rows)} subagent" + ("s" if len(rows) != 1 else "")]
+        # Clear "finished" indicator on the header, replacing the 🤖 robot:
+        #   ✅  every child finished and NONE failed/timed-out/interrupted
+        #   ⚠️  finished but at least one child failed (a green check would lie)
+        #   🤖  defensive: something is still running/pending at collapse time
+        if running or pending:
+            lead = "🤖"
+        elif failed_total:
+            lead = "⚠️"
+        else:
+            lead = "✅"
+        head_parts = [f"{lead} {len(rows)} subagent" + ("s" if len(rows) != 1 else "")]
         if pending:
             head_parts.append(f"{len(pending)} pending")
         if done:
