@@ -90,6 +90,31 @@ class TestFoldSubagentRoster:
         assert rows[0]["glyph"] == "✓" and rows[0]["running"] is False
         assert rows[0]["elapsed"] == 45.0
 
+    def test_terminal_row_keeps_final_tool_count(self):
+        # A finished child must KEEP its tool count, not drop it to 0. The
+        # registry deletes the child on completion, so the count is carried on
+        # the complete() event and stored in terminal state.
+        s = self._state()
+        s.start("a", goal="run tests", task_index=0, started_at=900.0)
+        s.complete("a", status="completed", duration=45.0, tools=56)
+        rows = s.fold({}, now=1000.0)
+        assert rows[0]["tools"] == 56
+
+    def test_complete_sentinel_carries_tool_count(self):
+        s = self._state()
+        s.apply_event(("__roster_start__", "a", "goal a", 0, 100.0))
+        s.apply_event(("__roster_complete__", "a", "completed", 3.0, 12))
+        rows = s.fold({}, now=200.0)
+        assert rows[0]["glyph"] == "✓" and rows[0]["tools"] == 12
+
+    def test_complete_sentinel_without_tool_count_is_zero(self):
+        # Older producers / replayed queues omit the tool tail; must not crash.
+        s = self._state()
+        s.apply_event(("__roster_start__", "a", "goal a", 0, 100.0))
+        s.apply_event(("__roster_complete__", "a", "completed", 3.0))
+        rows = s.fold({}, now=200.0)
+        assert rows[0]["tools"] == 0
+
     def test_status_glyph_mapping(self):
         s = self._state()
         for i, st in enumerate(["completed", "failed", "timeout", "interrupted"]):
@@ -175,6 +200,22 @@ class TestFormatSubagentRoster:
         assert lines[3] == "✓ run tests · 0:45"
         assert lines[4] == "✗ check types · 0:30"
 
+    def test_terminal_rows_keep_tool_count(self):
+        # Tool count must persist on a DONE row, not vanish when running flips
+        # to False. Alfredo asked to keep the count after the agent finishes.
+        from gateway.subagent_roster import format_subagent_roster
+
+        rows = [
+            {"glyph": "✓", "label": "review", "elapsed": 949.0, "running": False, "tools": 56},
+            {"glyph": "✗", "label": "audit", "elapsed": 30.0, "running": False, "tools": 1},
+            {"glyph": "✓", "label": "noop", "elapsed": 5.0, "running": False, "tools": 0},
+        ]
+        text = format_subagent_roster(rows)
+        lines = text.split("\n")
+        assert lines[1] == "✓ review · 15:49 · 56 tools"
+        assert lines[2] == "✗ audit · 0:30 · 1 tool"  # singular
+        assert lines[3] == "✓ noop · 0:05"  # 0 tools -> omit suffix
+
     def test_collapsed_keeps_breakdown_with_summary_header(self):
         # On finish the roster keeps the per-child breakdown (each marked with
         # its terminal glyph) under a summary header — it does NOT collapse to a
@@ -192,6 +233,18 @@ class TestFormatSubagentRoster:
         assert lines[1] == "✓ a · 0:45"
         assert lines[2] == "✓ b · 1:00"
         assert lines[3] == "✗ c · 2:14"
+
+    def test_collapsed_keeps_tool_count_on_done_rows(self):
+        from gateway.subagent_roster import format_subagent_roster
+
+        rows = [
+            {"glyph": "✓", "label": "a", "elapsed": 45.0, "running": False, "tools": 9},
+            {"glyph": "✗", "label": "b", "elapsed": 60.0, "running": False, "tools": 0},
+        ]
+        out = format_subagent_roster(rows, collapsed=True)
+        lines = out.split("\n")
+        assert lines[1] == "✓ a · 0:45 · 9 tools"
+        assert lines[2] == "✗ b · 1:00"
 
     def test_collapsed_renders_model_and_reasoning(self):
         from gateway.subagent_roster import format_subagent_roster

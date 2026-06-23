@@ -49,6 +49,39 @@ def test_async_rows_use_record_status_for_live_done_counts():
     assert "▶ sleep 10 · 0:08" in text
 
 
+def test_async_terminal_row_keeps_final_tool_count():
+    # A finished background child keeps its tool count. The child record carries
+    # the final count (tool_count, falling back to api_calls); the registry has
+    # already dropped the live entry by the time it completes.
+    record = {
+        "delegation_id": "deleg_1",
+        "children": [
+            {
+                "task_index": 0,
+                "subagent_id": "sa-0",
+                "goal": "review",
+                "status": "completed",
+                "duration_seconds": 949.0,
+                "tool_count": 56,
+            },
+            {
+                "task_index": 1,
+                "subagent_id": "sa-1",
+                "goal": "audit",
+                "status": "completed",
+                "duration_seconds": 287.0,
+                "api_calls": 23,
+            },
+        ],
+    }
+    rows = build_async_subagent_roster_rows(record, [], now=2000.0)
+    assert rows[0]["tools"] == 56
+    assert rows[1]["tools"] == 23  # falls back to api_calls
+    text = format_subagent_roster(rows, collapsed=True)
+    assert "✓ review · 15:49 · 56 tools" in text
+    assert "✓ audit · 4:47 · 23 tools" in text
+
+
 def test_async_final_rows_fallback_to_results_when_children_missing():
     record = {
         "delegation_id": "deleg_1",

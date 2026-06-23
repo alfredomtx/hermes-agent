@@ -115,6 +115,21 @@ def _model_suffix(row: Dict[str, Any]) -> str:
     tag = reasoning_tag(row.get("reasoning"))
     return f" · {model} {tag}".rstrip() if tag else f" · {model}"
 
+
+def _tools_suffix(row: Dict[str, Any]) -> str:
+    """`· N tool(s)` suffix for a row, or '' when the count is 0/missing.
+
+    Shown for BOTH running and finished rows — a done child keeps the count of
+    tools it actually ran (Alfredo asked to keep it after the agent finishes).
+    """
+    try:
+        n = int(row.get("tools") or 0)
+    except (TypeError, ValueError):
+        return ""
+    if n <= 0:
+        return ""
+    return f" · {n} tool" + ("s" if n != 1 else "")
+
 # delegate_tool subagent.complete status string -> (glyph, display bucket).
 # Vocabulary verified in tools/delegate_tool.py: completed | failed |
 # interrupted | timeout | error. Unknown -> fail-CLOSED to errored (never render
@@ -182,6 +197,7 @@ class SubagentRosterState:
         status: str = "completed",
         duration: float = 0.0,
         started_at: float = 0.0,
+        tools: int = 0,
     ) -> None:
         if not sid:
             return
@@ -196,19 +212,27 @@ class SubagentRosterState:
                 "model": "",
                 "reasoning": None,
             }
+        try:
+            _tools = int(tools or 0)
+        except (TypeError, ValueError):
+            _tools = 0
         self.terminal[sid] = {
             "status": str(status or "completed").lower(),
             "duration": float(duration or 0.0),
+            # Final tool count: the registry drops the live entry on completion,
+            # so the count is carried on the complete event and kept here.
+            "tools": _tools,
         }
 
     def apply_event(self, raw: Tuple[Any, ...]) -> None:
         """Mutate from a dequeued sentinel tuple (loop thread only).
 
         ``("__roster_start__", sid, goal, task_index, started_at[, model, reasoning])``
-        ``("__roster_complete__", sid, status, duration)``
+        ``("__roster_complete__", sid, status, duration[, tool_count])``
 
-        The start tuple's model/reasoning tail is optional so older producers
-        (and replayed queues) without them still apply cleanly.
+        The start tuple's model/reasoning tail and the complete tuple's
+        tool_count tail are optional so older producers (and replayed queues)
+        without them still apply cleanly.
         """
         if not raw:
             return
@@ -222,8 +246,11 @@ class SubagentRosterState:
             reasoning = raw[6] if len(raw) > 6 else None
             self.start(sid, goal, task_index, started_at, model, reasoning)
         elif kind == "__roster_complete__":
-            _, sid, status, duration = raw
-            self.complete(sid, status, duration)
+            sid = raw[1] if len(raw) > 1 else ""
+            status = raw[2] if len(raw) > 2 else "completed"
+            duration = raw[3] if len(raw) > 3 else 0.0
+            tools = raw[4] if len(raw) > 4 else 0
+            self.complete(sid, status, duration, tools=tools)
 
     def fold(self, active_by_id: Dict[str, Dict[str, Any]], now: float) -> List[Dict[str, Any]]:
         """Build ordered display rows from current state + a registry snapshot.
@@ -247,7 +274,7 @@ class SubagentRosterState:
                     "label": label,
                     "elapsed": float(t.get("duration") or 0.0),
                     "running": False,
-                    "tools": 0,
+                    "tools": int(t.get("tools") or 0),
                     "model": model,
                     "reasoning": reasoning,
                 })
@@ -316,8 +343,12 @@ def format_subagent_roster(rows: List[Dict[str, Any]], *, collapsed: bool = Fals
         shown = rows[:_MAX_ROWS]
         for r in shown:
             # On the final render a running row (shouldn't normally happen) is
-            # shown with its live glyph; terminal rows keep ✓/✗/⏱/⏹.
-            line = f"{r['glyph']} {r['label']}{_model_suffix(r)} · {format_duration(r['elapsed'])}"
+            # shown with its live glyph; terminal rows keep ✓/✗/⏱/⏹. Tool count
+            # is kept on done rows too, not dropped when running flips to False.
+            line = (
+                f"{r['glyph']} {r['label']}{_model_suffix(r)}"
+                f" · {format_duration(r['elapsed'])}{_tools_suffix(r)}"
+            )
             lines.append(line)
         extra = len(rows) - len(shown)
         if extra > 0:
@@ -335,9 +366,10 @@ def format_subagent_roster(rows: List[Dict[str, Any]], *, collapsed: bool = Fals
     lines = [head]
     shown = rows[:_MAX_ROWS]
     for r in shown:
-        line = f"{r['glyph']} {r['label']}{_model_suffix(r)} · {format_duration(r['elapsed'])}"
-        if r["running"] and r["tools"] > 0:
-            line += f" · {r['tools']} tool" + ("s" if r["tools"] != 1 else "")
+        line = (
+            f"{r['glyph']} {r['label']}{_model_suffix(r)}"
+            f" · {format_duration(r['elapsed'])}{_tools_suffix(r)}"
+        )
         lines.append(line)
     extra = len(rows) - len(shown)
     if extra > 0:
