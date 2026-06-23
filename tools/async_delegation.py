@@ -217,6 +217,16 @@ def _update_child_result_locked(
             target["duration_seconds"] = float(result.get("duration_seconds") or 0.0)
         except Exception:
             target["duration_seconds"] = 0.0
+    # Final tool count for the roster's finished row. Prefer the explicit
+    # tool_count; fall back to api_calls when a runner only reports that.
+    _tc = result.get("tool_count")
+    if _tc is None:
+        _tc = result.get("api_calls")
+    if _tc is not None:
+        try:
+            target["tool_count"] = int(_tc or 0)
+        except (TypeError, ValueError):
+            pass
     if result.get("error"):
         target["error"] = str(result.get("error") or "")
 

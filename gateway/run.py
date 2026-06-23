@@ -17185,6 +17185,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _sid,
                         str(kwargs.get("status") or "completed").lower(),
                         float(kwargs.get("duration_seconds") or 0.0),
+                        int(kwargs.get("tool_count") or 0),
                     ))
                 return
 

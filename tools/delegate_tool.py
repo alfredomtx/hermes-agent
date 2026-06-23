@@ -2343,6 +2343,10 @@ def _run_single_child(
             "status": status,
             "summary": summary,
             "api_calls": api_calls,
+            # Final tool-call count for this child. The live registry entry is
+            # dropped on completion, so the roster needs this on the record to
+            # keep showing the count on the finished row.
+            "tool_count": len(tool_trace),
             "duration_seconds": duration,
             "model": _model if isinstance(_model, str) else None,
             "exit_reason": exit_reason,

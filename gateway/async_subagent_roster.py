@@ -43,6 +43,8 @@ def _children_from_record(record: Dict[str, Any]) -> List[Dict[str, Any]]:
                     "model": record.get("model"),
                     "status": result.get("status") or "pending",
                     "duration_seconds": result.get("duration_seconds"),
+                    "tool_count": result.get("tool_count"),
+                    "api_calls": result.get("api_calls"),
                     "completed_at": record.get("completed_at"),
                 }
             )
@@ -129,13 +131,21 @@ def build_async_subagent_roster_rows(
             except Exception:
                 duration = 0.0
 
+        # Final tool count: the child record carries tool_count (falling back to
+        # api_calls). The live registry entry is gone once the child completes,
+        # so the finished row keeps the count from the record.
+        try:
+            tools = int(child.get("tool_count") or child.get("api_calls") or 0)
+        except (TypeError, ValueError):
+            tools = 0
+
         rows.append(
             {
                 "glyph": glyph,
                 "label": label,
                 "elapsed": float(duration or 0.0),
                 "running": False,
-                "tools": 0,
+                "tools": tools,
                 "bucket": bucket,
                 "model": model,
                 "reasoning": reasoning,
