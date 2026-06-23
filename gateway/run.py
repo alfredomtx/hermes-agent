@@ -15218,7 +15218,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source, adapter, metadata = target
 
         from gateway.async_subagent_roster import build_async_subagent_roster_rows
-        from gateway.subagent_roster import ROSTER_EDIT_INTERVAL, format_subagent_roster
+        from gateway.subagent_roster import (
+            format_subagent_roster,
+            resolve_roster_interval,
+        )
 
         rows = build_async_subagent_roster_rows(record, active_subagents)
         text = format_subagent_roster(rows, collapsed=collapsed)
@@ -15236,8 +15239,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             },
         )
 
+        try:
+            interval = resolve_roster_interval(
+                _load_gateway_config(), _platform_config_key(source.platform)
+            )
+        except Exception:
+            from gateway.subagent_roster import ROSTER_EDIT_INTERVAL
+            interval = ROSTER_EDIT_INTERVAL
+
         now = time.monotonic()
-        if not force and (now - float(bubble.get("last_edit_ts") or 0.0)) < ROSTER_EDIT_INTERVAL:
+        if not force and (now - float(bubble.get("last_edit_ts") or 0.0)) < interval:
             return
         if not force and text == bubble.get("last_text"):
             return
@@ -17603,9 +17614,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # sentinels off progress_queue. The worker-thread callback only
             # enqueues. Lazy import avoids a run.py <-> delegate_tool cycle.
             from gateway.subagent_roster import (
-                ROSTER_EDIT_INTERVAL,
                 SubagentRosterState,
                 format_subagent_roster,
+                resolve_roster_interval,
             )
             from tools.delegate_tool import (
                 list_active_subagents as _list_active_subagents,
@@ -17617,6 +17628,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _last_roster_text = None
             roster_seed_attempted = False
             roster_seed_failed = False
+            # Per-platform configurable edit cadence
+            # (display.platforms.<platform>.subagent_roster_interval), clamped
+            # to a 1.0s floor. Resolved once per turn here.
+            try:
+                _roster_edit_interval = resolve_roster_interval(user_config, platform_key)
+            except Exception:
+                from gateway.subagent_roster import ROSTER_EDIT_INTERVAL
+                _roster_edit_interval = ROSTER_EDIT_INTERVAL
 
             def _render_roster(collapsed: bool):
                 """Fold roster state + a fresh registry poll into bubble text."""
@@ -17648,7 +17667,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return
                 now = time.monotonic()
                 # Throttle ordinary edits; the final collapse (force) bypasses.
-                if not force and (now - _last_roster_edit_ts) < ROSTER_EDIT_INTERVAL:
+                if not force and (now - _last_roster_edit_ts) < _roster_edit_interval:
                     return
                 if not force and text == _last_roster_text:
                     return
