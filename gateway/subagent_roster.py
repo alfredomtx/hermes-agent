@@ -30,8 +30,35 @@ from gateway.duration_format import format_duration
 # Telegram enforces a per-chat edit flood ceiling, and a busy chat with other
 # bubbles can trip "Flood control exceeded" — which froze the live timer. A
 # 10s cadence stays well under the ceiling; the final collapse (force) bypasses
-# this throttle so the terminal state always lands.
+# this throttle so the terminal state always lands. This is the DEFAULT; the
+# effective value is per-platform configurable via
+# display.platforms.<platform>.subagent_roster_interval (see resolve_roster_interval).
 ROSTER_EDIT_INTERVAL = 10.0
+
+# Hard floor so a misconfigured tiny interval can never flood the platform's
+# edit rate limiter. Mirrors the clamp in gateway.display_config._normalise.
+ROSTER_EDIT_INTERVAL_FLOOR = 1.0
+
+
+def resolve_roster_interval(user_config: Any, platform_key: str) -> float:
+    """Resolve the effective roster edit interval (seconds) for a platform.
+
+    Reads ``display.platforms.<platform>.subagent_roster_interval`` (falling
+    back through the global setting and the built-in default) and clamps to a
+    1.0s floor. Best-effort: any error returns the default ``ROSTER_EDIT_INTERVAL``.
+    """
+    try:
+        from gateway.display_config import resolve_display_setting
+
+        raw = resolve_display_setting(
+            user_config,
+            platform_key,
+            "subagent_roster_interval",
+            ROSTER_EDIT_INTERVAL,
+        )
+        return max(ROSTER_EDIT_INTERVAL_FLOOR, float(raw))
+    except Exception:
+        return ROSTER_EDIT_INTERVAL
 
 _LABEL_CAP = 100
 _MAX_ROWS = 10

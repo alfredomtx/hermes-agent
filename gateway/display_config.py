@@ -76,6 +76,12 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     # renders on edit-capable adapters (Telegram, Discord); silent no-op on
     # platforms without message editing. Off by default.
     "subagent_roster": "off",
+    # Minimum seconds between live roster bubble edits. Telegram enforces a
+    # per-chat edit flood ceiling; a busy chat with other bubbles can trip
+    # "Flood control exceeded" and freeze the roster's live timer. 10s stays
+    # well under the ceiling. The final collapse (force) bypasses this throttle
+    # so the terminal state always lands. Clamped to a 1.0s floor.
+    "subagent_roster_interval": 10.0,
 }
 
 # ---------------------------------------------------------------------------
@@ -295,4 +301,12 @@ def _normalise(setting: str, value: Any) -> Any:
             return int(value)
         except (TypeError, ValueError):
             return 0
+    if setting == "subagent_roster_interval":
+        # Seconds between roster edits. Parse to float and clamp to a 1.0s
+        # floor so a typo / 0 can never flood Telegram's edit rate limiter.
+        try:
+            secs = float(value)
+        except (TypeError, ValueError):
+            return 10.0
+        return max(1.0, secs)
     return value

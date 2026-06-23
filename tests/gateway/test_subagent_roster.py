@@ -247,6 +247,48 @@ class TestShortenModel:
         assert reasoning_tag(None) == ""
 
 
+class TestResolveRosterInterval:
+    def test_default_when_unset(self):
+        from gateway.subagent_roster import (
+            ROSTER_EDIT_INTERVAL,
+            resolve_roster_interval,
+        )
+
+        assert resolve_roster_interval({}, "telegram") == ROSTER_EDIT_INTERVAL
+
+    def test_per_platform_override_wins(self):
+        from gateway.subagent_roster import resolve_roster_interval
+
+        cfg = {"display": {"platforms": {"telegram": {"subagent_roster_interval": 15}}}}
+        assert resolve_roster_interval(cfg, "telegram") == 15.0
+
+    def test_global_setting_applies(self):
+        from gateway.subagent_roster import resolve_roster_interval
+
+        cfg = {"display": {"subagent_roster_interval": 7}}
+        assert resolve_roster_interval(cfg, "discord") == 7.0
+
+    def test_clamped_to_floor(self):
+        from gateway.subagent_roster import (
+            ROSTER_EDIT_INTERVAL_FLOOR,
+            resolve_roster_interval,
+        )
+
+        # A too-small / zero value must clamp up to the floor, never flood.
+        cfg = {"display": {"platforms": {"telegram": {"subagent_roster_interval": 0}}}}
+        assert resolve_roster_interval(cfg, "telegram") == ROSTER_EDIT_INTERVAL_FLOOR
+
+    def test_garbage_falls_back_to_default(self):
+        from gateway.subagent_roster import (
+            ROSTER_EDIT_INTERVAL,
+            resolve_roster_interval,
+        )
+
+        cfg = {"display": {"platforms": {"telegram": {"subagent_roster_interval": "nonsense"}}}}
+        # _normalise returns 10.0 for unparseable, then clamp keeps it.
+        assert resolve_roster_interval(cfg, "telegram") == ROSTER_EDIT_INTERVAL
+
+
 # ── pipeline gate: roster must keep the queue/consumer alive ────────────────
 class TestRosterPipelineGate:
     def test_roster_keeps_pipeline_alive_with_everything_else_off(self):
