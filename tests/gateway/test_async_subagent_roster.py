@@ -97,7 +97,7 @@ def test_async_final_rows_fallback_to_results_when_children_missing():
 
     # Collapsed render now keeps the per-child breakdown under a summary header.
     lines = text.split("\n")
-    assert lines[0] == "🤖 2 subagents · 1 ✓ · 1 ✗ · 0:10"
+    assert lines[0] == "⚠️ 2 subagents · 1 ✓ · 1 ✗ · 0:10"
     assert lines[1] == "✓ sleep 6 · 0:06"
     assert lines[2] == "✗ sleep 10 · 0:10"
 
@@ -234,7 +234,7 @@ async def test_watcher_roster_seeds_edits_and_collapses(monkeypatch):
 
     await runner._finalize_async_delegation_roster(final_evt, [])
 
-    assert "🤖 2 subagents · 2 ✓ · 0:10" in adapter.edits[-1]["content"]
+    assert "✅ 2 subagents · 2 ✓ · 0:10" in adapter.edits[-1]["content"]
     assert "deleg_bg" not in runner._async_subagent_roster_bubbles
 
 
@@ -349,7 +349,7 @@ async def test_watcher_roster_collapses_when_batch_finished_before_first_tick(mo
 
     # Exactly one SEND (the collapsed seed), no edits, bubble popped.
     assert len(adapter.sent) == 1
-    assert "🤖 2 subagents · 2 ✓" in adapter.sent[0]["content"]
+    assert "✅ 2 subagents · 2 ✓" in adapter.sent[0]["content"]
     assert adapter.edits == []
     assert "deleg_bg" not in runner._async_subagent_roster_bubbles
 
