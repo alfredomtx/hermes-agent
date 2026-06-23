@@ -4113,7 +4113,10 @@ class AIAgent:
         if getattr(self, "provider", None) == "bedrock":
             from agent.anthropic_adapter import build_anthropic_bedrock_client
             region = getattr(self, "_bedrock_region", "us-east-1") or "us-east-1"
-            self._anthropic_client = build_anthropic_bedrock_client(region)
+            self._anthropic_client = build_anthropic_bedrock_client(
+                region,
+                timeout=get_provider_request_timeout(self.provider, self.model),
+            )
         else:
             from agent.anthropic_adapter import build_anthropic_client
             self._anthropic_client = build_anthropic_client(

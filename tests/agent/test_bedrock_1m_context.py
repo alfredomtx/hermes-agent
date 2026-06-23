@@ -85,3 +85,58 @@ class TestBedrockContext1MBeta:
         )
 
         assert "additionalModelRequestFields" not in kwargs
+
+
+class TestBedrockClientTimeout:
+    """The AnthropicBedrock read timeout must default to 900s and be overridable.
+
+    The httpx read timeout caps how long a single Bedrock streaming response
+    may run. A high-reasoning Opus review can stream past the hard-coded 900s
+    and have its API call killed. ``build_anthropic_bedrock_client`` now takes
+    an optional ``timeout`` so ``providers.bedrock.request_timeout_seconds``
+    (resolved via ``get_provider_request_timeout``) can raise that ceiling
+    from config without a code change.
+    """
+
+    def _timeout_obj(self, fake_sdk):
+        return fake_sdk.AnthropicBedrock.call_args.kwargs["timeout"]
+
+    def test_default_timeout_is_900(self):
+        """No timeout arg → preserve the historical 900s read timeout."""
+        import agent.anthropic_adapter as adapter
+
+        fake_sdk = MagicMock()
+        fake_sdk.AnthropicBedrock = MagicMock()
+
+        with patch.object(adapter, "_anthropic_sdk", fake_sdk):
+            adapter.build_anthropic_bedrock_client(region="us-west-2")
+
+        timeout_obj = self._timeout_obj(fake_sdk)
+        assert timeout_obj.read == 900.0
+        assert timeout_obj.connect == 10.0
+
+    def test_explicit_timeout_overrides_default(self):
+        """A positive timeout overrides 900s; connect stays at 10s."""
+        import agent.anthropic_adapter as adapter
+
+        fake_sdk = MagicMock()
+        fake_sdk.AnthropicBedrock = MagicMock()
+
+        with patch.object(adapter, "_anthropic_sdk", fake_sdk):
+            adapter.build_anthropic_bedrock_client(region="us-west-2", timeout=1800)
+
+        timeout_obj = self._timeout_obj(fake_sdk)
+        assert timeout_obj.read == 1800.0
+        assert timeout_obj.connect == 10.0
+
+    def test_none_and_nonpositive_timeout_fall_back_to_900(self):
+        """None / 0 / negative are ignored — the 900s default holds."""
+        import agent.anthropic_adapter as adapter
+
+        for bad in (None, 0, -5):
+            fake_sdk = MagicMock()
+            fake_sdk.AnthropicBedrock = MagicMock()
+            with patch.object(adapter, "_anthropic_sdk", fake_sdk):
+                adapter.build_anthropic_bedrock_client(region="us-west-2", timeout=bad)
+            timeout_obj = self._timeout_obj(fake_sdk)
+            assert timeout_obj.read == 900.0, f"timeout={bad!r} should fall back to 900"
