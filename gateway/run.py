@@ -599,6 +599,83 @@ _GATEWAY_PROVIDER_ERROR_SHAPE_RE = re.compile(
 )
 
 
+def _merge_pre_dispatch_results(hook_results):
+    """Merge pre_gateway_dispatch hook results into a single directive.
+
+    Pure function (no I/O, no event mutation) so it is unit-testable in
+    isolation from the 19k-line gateway. ``invoke_hook`` already ran every
+    callback; this decides what their combined effect is:
+
+      * skip            -> terminal: caller drops the turn.
+      * session_binding -> pin the session. >1 DISTINCT binding across hooks is
+                           a conflict -> refuse ALL (fail-closed), never guess.
+      * rewrite text    -> first rewrite in registration order wins; later
+                           rewrites are reported in ``extra_rewrites``.
+      * allow / None     -> no-op; never suppresses the above.
+
+    A ``session_binding`` result value may be a SessionBinding instance OR a
+    ``{"namespace","key"}`` dict; both normalize via SessionBinding.from_dict.
+
+    Returns a dict:
+      {
+        "skip": bool, "skip_reason": Any,
+        "rewrite_text": Optional[str], "extra_rewrites": int,
+        "binding": Optional[SessionBinding], "binding_conflict": Optional[list],
+      }
+    """
+    skip = False
+    skip_reason = None
+    rewrite_text = None
+    rewrite_seen = False
+    extra_rewrites = 0
+    bindings = []
+
+    for result in hook_results or []:
+        if not isinstance(result, dict):
+            continue
+        action = result.get("action")
+        if action == "skip":
+            skip = True
+            skip_reason = result.get("reason")
+            continue
+        rb = result.get("session_binding")
+        if rb is not None:
+            binding_obj = rb if isinstance(rb, SessionBinding) else None
+            if binding_obj is None:
+                try:
+                    binding_obj = SessionBinding.from_dict(rb)
+                except Exception:
+                    binding_obj = None
+            if binding_obj is not None:
+                bindings.append(binding_obj)
+        if action == "rewrite":
+            new_text = result.get("text")
+            if isinstance(new_text, str):
+                if not rewrite_seen:
+                    rewrite_text = new_text
+                    rewrite_seen = True
+                else:
+                    extra_rewrites += 1
+
+    binding = None
+    binding_conflict = None
+    if bindings:
+        distinct = sorted({(b.namespace, b.key) for b in bindings})
+        if len(distinct) == 1:
+            binding = bindings[0]
+        else:
+            binding_conflict = distinct
+
+    return {
+        "skip": skip,
+        "skip_reason": skip_reason,
+        "rewrite_text": rewrite_text,
+        "extra_rewrites": extra_rewrites,
+        "binding": binding,
+        "binding_conflict": binding_conflict,
+    }
+
+
 def _looks_like_gateway_provider_error(text: str) -> bool:
     """True when text is infrastructure/provider failure, not normal content.
 
@@ -1884,6 +1961,7 @@ from gateway.config import (
 from gateway.session import (
     SessionStore,
     SessionSource,
+    SessionBinding,
     SessionContext,
     build_session_context,
     build_session_context_prompt,
@@ -5479,6 +5557,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if getattr(event, "internal", False):
             return False
 
+        # --- Synthetic webhook turns: strict FIFO, never steer/interrupt ---
+        # A webhook delivery (chat_type=="webhook" + an intake-stamped
+        # arrival_seq) that resolves to an active session binding must become
+        # the NEXT ordered turn, not steer into / interrupt / coalesce with the
+        # running turn. This is the FIFO half of the topic-ordering fix: two
+        # same-binding GitHub "Ask Hermes" deliveries (Q1, Q2) serialize so Q2
+        # runs after Q1 and sees its transcript, regardless of busy_input_mode
+        # (steer/interrupt would otherwise splice or drop Q2). _queue_or_replace
+        # _pending_event routes through the per-turn FIFO (no merge_text
+        # coalescing), preserving each delivery as its own turn in arrival order.
+        if (
+            getattr(event.source, "chat_type", None) == "webhook"
+            and getattr(event, "arrival_seq", None) is not None
+        ):
+            logger.info(
+                "Queuing synthetic webhook turn FIFO for session %s "
+                "(arrival_seq=%s; no steer/interrupt)",
+                session_key, event.arrival_seq,
+            )
+            self._queue_or_replace_pending_event(session_key, event)
+            return True
+
         running_agent = self._running_agents.get(session_key)
 
         effective_mode = self._busy_input_mode
@@ -8908,26 +9008,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
                 _hook_results = []
 
-            for _result in _hook_results:
-                if not isinstance(_result, dict):
-                    continue
-                _action = _result.get("action")
-                if _action == "skip":
-                    logger.info(
-                        "pre_gateway_dispatch skip: reason=%s platform=%s chat=%s",
-                        _result.get("reason"),
-                        source.platform.value if source.platform else "unknown",
-                        source.chat_id or "unknown",
+            # ---- pre_gateway_dispatch result MERGE contract ----------------
+            # invoke_hook already ran every callback. _merge_pre_dispatch_results
+            # (pure, unit-tested) decides the combined effect so independent
+            # plugins each contribute: skip (terminal), session_binding (pin the
+            # session; conflicting distinct bindings refuse fail-closed), and a
+            # single first-wins text rewrite. This lets the gh-review binding
+            # hook and the topic-rename seed rewrite hook BOTH apply on one turn.
+            _merged = _merge_pre_dispatch_results(_hook_results)
+
+            if _merged["skip"]:
+                logger.info(
+                    "pre_gateway_dispatch skip: reason=%s platform=%s chat=%s",
+                    _merged["skip_reason"],
+                    source.platform.value if source.platform else "unknown",
+                    source.chat_id or "unknown",
+                )
+                return None
+
+            if _merged["extra_rewrites"]:
+                logger.warning(
+                    "pre_gateway_dispatch: ignored %d extra rewrite(s) "
+                    "(first-in-registration-order won)",
+                    _merged["extra_rewrites"],
+                )
+            if _merged["binding_conflict"]:
+                logger.warning(
+                    "pre_gateway_dispatch: %d distinct session bindings from "
+                    "hooks (%s) — refusing all (fail-closed)",
+                    len(_merged["binding_conflict"]), _merged["binding_conflict"],
+                )
+
+            _rewrite_text = _merged["rewrite_text"]
+            _binding_to_apply = _merged["binding"]
+            if _rewrite_text is not None or _binding_to_apply is not None:
+                _new_source = source
+                if _binding_to_apply is not None:
+                    _new_source = dataclasses.replace(
+                        source, session_binding=_binding_to_apply
                     )
-                    return None
-                if _action == "rewrite":
-                    _new_text = _result.get("text")
-                    if isinstance(_new_text, str):
-                        event = dataclasses.replace(event, text=_new_text)
-                        source = event.source
-                    break
-                if _action == "allow":
-                    break
+                event = dataclasses.replace(
+                    event,
+                    text=_rewrite_text if _rewrite_text is not None else event.text,
+                    source=_new_source,
+                )
+                source = event.source
 
         if is_internal:
             pass
