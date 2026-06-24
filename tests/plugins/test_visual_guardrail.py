@@ -325,3 +325,39 @@ def test_e2e_note_rides_api_user_message_and_is_not_persisted(vg, monkeypatch):
     assert SENTINEL not in sysc, "note leaked into system prompt (cache-bust regression)"
     # (c) B2 — persisted transcript stays clean
     assert SENTINEL not in (persisted.get("last_user") or ""), "note leaked into persisted transcript"
+
+
+# --- Vendored-classifier drift guard --------------------------------------
+
+
+def test_vendored_classifier_matches_source_of_truth():
+    """The plugin's vendored visual_trigger.py must stay byte-identical to the
+    source of truth at ~/.hermes/scripts/visual_trigger.py.
+
+    Two copies exist by design (the plugin vendors the classifier so it is
+    self-contained and survives `hermes update`). If they diverge, the live
+    guardrail would nudge on a different rule than the daily audit measures —
+    a silent correctness bug. This test makes that drift fail loudly at
+    pre-push time. Skips when the install copies aren't present (CI / temp
+    HERMES_HOME), since it guards the real environment, not a fixture.
+    """
+    import hashlib
+
+    # conftest.py forces HERMES_HOME to a temp dir for hermetic tests, but this
+    # guard must check the REAL install copies, not the sandbox. _PLUGIN_DIR is
+    # already resolved at import time (before conftest's autouse fixture runs),
+    # so derive the source path from its real grandparent (~/.hermes).
+    real_home = _PLUGIN_DIR.parent.parent  # .../.hermes/plugins/visual-guardrail -> .hermes
+    source = real_home / "scripts" / "visual_trigger.py"
+    plugin = _PLUGIN_DIR / "visual_trigger.py"
+    if not source.exists() or not plugin.exists():
+        pytest.skip("visual_trigger source/plugin copies not both present in this env")
+
+    src_h = hashlib.sha256(source.read_bytes()).hexdigest()
+    plg_h = hashlib.sha256(plugin.read_bytes()).hexdigest()
+    assert src_h == plg_h, (
+        "visual_trigger.py DRIFT: plugin copy != source of truth.\n"
+        f"  source {source} sha256={src_h}\n"
+        f"  plugin {plugin} sha256={plg_h}\n"
+        f"  Resync: cp '{source}' '{plugin}' (then commit both repos)."
+    )
