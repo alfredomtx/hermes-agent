@@ -153,6 +153,15 @@ VALID_HOOKS: Set[str] = {
     #   {"action": "allow"}  /  None             -> normal dispatch
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
+    # Session-binding resolution hook. Fired SYNCHRONOUSLY by an adapter at
+    # message INTAKE (before the event is scheduled for processing), so the
+    # session binding is known before the active-session guard computes the
+    # session key. This lets unrelated physical deliveries (e.g. distinct
+    # GitHub webhook deliveries) resolve to ONE shared, ordered session.
+    # A plugin returns a SessionBinding, a {"namespace","key"} dict, or a dict
+    # carrying "session_binding"; None to abstain. The adapter resolves a single
+    # binding fail-closed (>1 distinct -> refuse). Kwargs: event, gateway.
+    "pre_session_binding",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs user approval -- fires BOTH for CLI-interactive prompts
     # and for gateway/ACP approvals (Telegram, Discord, Slack, TUI, etc.).

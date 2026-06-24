@@ -1476,6 +1476,12 @@ class MessageEvent:
     # completion notifications) that must bypass user authorization checks.
     internal: bool = False
 
+    # Monotonic receipt sequence stamped by an adapter at INTAKE (before the
+    # event is scheduled for processing), so that turns which resolve to the
+    # same session binding can be drained in true arrival order regardless of
+    # task-scheduling jitter. None for adapters that don't stamp it.
+    arrival_seq: Optional[int] = None
+
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
     
@@ -3969,11 +3975,31 @@ class BasePlatformAdapter(ABC):
         # downstream delivery all agree on the same lane.
         self._apply_topic_recovery(event)
 
-        session_key = build_session_key(
-            event.source,
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-        )
+        # Derive the active-session guard key the SAME way the session store
+        # does, so the guard, the runner, and the store all agree. Routing
+        # through the store honors profile namespacing (multiplex) AND any
+        # session_binding on the source — without it, two same-binding webhook
+        # deliveries under different profiles would collide on one guard key,
+        # or a profile-prefixed route would guard under a different key than it
+        # later runs under. Falls back to build_session_key when no store is
+        # wired (tests / minimal setups); that path is byte-identical for the
+        # default profile + no-binding case, so this is a no-op for normal traffic.
+        _store = getattr(self, "_session_store", None)
+        if _store is not None and hasattr(_store, "_generate_session_key"):
+            try:
+                session_key = _store._generate_session_key(event.source)
+            except Exception:
+                session_key = build_session_key(
+                    event.source,
+                    group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+                    thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+                )
+        else:
+            session_key = build_session_key(
+                event.source,
+                group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+                thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            )
 
         # On-entry self-heal: if the adapter still has an _active_sessions
         # entry for this key but the owner task has already exited (done or
