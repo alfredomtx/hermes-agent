@@ -28,7 +28,7 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
 )
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from toolsets import TOOLSETS
 
@@ -429,45 +429,182 @@ def _get_max_async_children() -> int:
     return _DEFAULT_MAX_ASYNC_CHILDREN
 
 
-def _get_child_timeout() -> Optional[float]:
-    """Read delegation.child_timeout_seconds from config.
+_CHILD_TIMEOUT_UNSET = object()
+_CHILD_BUILD_LOCK = threading.RLock()
 
-    Returns the number of seconds a single child agent is allowed to run
-    before being cut off, or ``None`` when no wall-clock cap applies.
 
-    Default: ``None`` (no timeout). Subagents doing legitimate heavy work
-    (deep code review, large research fan-outs, slow reasoning models) were
-    routinely killed mid-task by the old blanket cap even though they were
-    making steady progress. Failures should come from what the child is
-    actually doing — API errors, tool errors, iteration budget — not from a
-    generic delegation-level stopwatch. Stuck-child protection is handled
-    separately by the heartbeat staleness monitor, which stops refreshing
-    parent activity so the gateway inactivity timeout can fire.
+def _coerce_child_timeout(raw: Any, *, label: str) -> Any:
+    """Parse a child timeout value.
 
-    Set ``delegation.child_timeout_seconds`` to a positive number to opt back
-    in to a hard cap (floor 30 s); ``0`` or a negative value means disabled.
+    Returns:
+      - float >= 30.0 for enabled timeouts
+      - None for explicit disable via 0 or negative
+      - _CHILD_TIMEOUT_UNSET for missing or invalid values
     """
-    cfg = _load_config()
-    val = cfg.get("child_timeout_seconds")
-    if val is not None:
-        try:
-            parsed = float(val)
-        except (TypeError, ValueError):
-            logger.warning(
-                "delegation.child_timeout_seconds=%r is not a valid number; "
-                "using default (no timeout)",
-                val,
+    if raw is None:
+        return _CHILD_TIMEOUT_UNSET
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("%s=%r is not a valid number; ignoring", label, raw)
+        return _CHILD_TIMEOUT_UNSET
+    return None if parsed <= 0 else max(30.0, parsed)
+
+
+def _route_identity_from_values(
+    provider: Any,
+    model: Any,
+    base_url: Any = "",
+) -> tuple[str, str, str]:
+    return (
+        str(provider or "").strip().lower(),
+        str(model or "").strip(),
+        str(base_url or "").strip().rstrip("/").lower(),
+    )
+
+
+def _route_identity(route: Dict[str, Any]) -> tuple[str, str, str]:
+    return _route_identity_from_values(
+        route.get("provider"),
+        route.get("model"),
+        route.get("base_url"),
+    )
+
+
+def _route_label(route: Dict[str, Any]) -> str:
+    provider = str(route.get("provider") or "unknown").strip() or "unknown"
+    model = str(route.get("model") or "unknown").strip() or "unknown"
+    return f"{provider}/{model}"
+
+
+def _child_timeout_attempt_routes(child: Any) -> List[Dict[str, Any]]:
+    """Return initial child route plus distinct fallback routes.
+
+    Dedupes exact provider/model/base_url identities. Same provider with a
+    different model is kept because config chain order is authoritative.
+    """
+    routes: List[Dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    current = {
+        "provider": getattr(child, "provider", None),
+        "model": getattr(child, "model", None),
+        "base_url": getattr(child, "base_url", None),
+        "api_mode": getattr(child, "api_mode", None),
+    }
+    current_identity = _route_identity(current)
+    if current_identity[0] or current_identity[1]:
+        routes.append(current)
+        seen.add(current_identity)
+
+    for raw in getattr(child, "_fallback_chain", None) or []:
+        if not isinstance(raw, dict):
+            continue
+        provider = str(raw.get("provider") or "").strip()
+        model = str(raw.get("model") or "").strip()
+        if not provider or not model:
+            continue
+        route = {
+            "provider": provider,
+            "model": model,
+            "base_url": str(raw.get("base_url") or "").strip(),
+            "api_key": str(raw.get("api_key") or "").strip(),
+            "api_mode": str(raw.get("api_mode") or "").strip(),
+            "key_env": str(raw.get("key_env") or raw.get("api_key_env") or "").strip(),
+        }
+        identity = _route_identity(route)
+        if identity in seen:
+            logger.info(
+                "Subagent timeout failover skipping duplicate route %s",
+                _route_label(route),
             )
-        else:
-            return None if parsed <= 0 else max(30.0, parsed)
-    env_val = os.getenv("DELEGATION_CHILD_TIMEOUT_SECONDS")
-    if env_val:
-        try:
-            parsed = float(env_val)
-        except (TypeError, ValueError):
-            pass
-        else:
-            return None if parsed <= 0 else max(30.0, parsed)
+            continue
+        seen.add(identity)
+        routes.append(route)
+
+    if not routes:
+        routes.append({"provider": "unknown", "model": "unknown", "base_url": ""})
+    return routes
+
+
+def _delegation_cfg_for_timeout_fallback(
+    base_cfg: Optional[dict],
+    route: Dict[str, Any],
+) -> dict:
+    """Build a delegation config for a fallback timeout attempt.
+
+    Keep non-routing policy from the merged task/profile config, but replace
+    provider/model/base_url/api_key/api_mode with the fallback route. This
+    prevents a root delegation.base_url from accidentally overriding a provider
+    fallback entry.
+    """
+    routing_keys = {"provider", "model", "base_url", "api_key", "api_mode"}
+    cfg = {
+        k: v
+        for k, v in (base_cfg or {}).items()
+        if k not in routing_keys
+    }
+    cfg["provider"] = str(route.get("provider") or "").strip()
+    cfg["model"] = str(route.get("model") or "").strip()
+
+    base_url = str(route.get("base_url") or "").strip()
+    if base_url:
+        cfg["base_url"] = base_url
+
+    api_key = str(route.get("api_key") or "").strip()
+    if not api_key:
+        key_env = str(route.get("key_env") or "").strip()
+        if key_env:
+            api_key = os.getenv(key_env, "").strip()
+    if api_key:
+        cfg["api_key"] = api_key
+
+    api_mode = str(route.get("api_mode") or "").strip()
+    if api_mode:
+        cfg["api_mode"] = api_mode
+
+    return cfg
+
+
+def _get_child_timeout(cfg: Optional[dict] = None) -> Optional[float]:
+    """Resolve child timeout from merged delegation config.
+
+    Precedence:
+      1. delegation.profiles.<name>.child_timeout_seconds, when the merged
+         profile provided it
+      2. delegation.child_timeout_seconds
+      3. DEFAULT_CHILD_TIMEOUT
+
+    A value <= 0 disables the wall-clock cap. Positive values are floored at
+    30 seconds.
+    """
+    cfg = cfg if cfg is not None else _load_config()
+    cfg = cfg or {}
+
+    profile_name = _normalize_profile_name(cfg.get("_profile"))
+    profile_overrode = bool(cfg.get("_profile_child_timeout_overridden"))
+
+    if profile_overrode:
+        label = f"delegation.profiles.{profile_name}.child_timeout_seconds"
+        parsed = _coerce_child_timeout(cfg.get("child_timeout_seconds"), label=label)
+        if parsed is not _CHILD_TIMEOUT_UNSET:
+            return parsed
+
+        parsed_global = _coerce_child_timeout(
+            cfg.get("_global_child_timeout_seconds"),
+            label="delegation.child_timeout_seconds",
+        )
+        if parsed_global is not _CHILD_TIMEOUT_UNSET:
+            return parsed_global
+        return DEFAULT_CHILD_TIMEOUT
+
+    parsed = _coerce_child_timeout(
+        cfg.get("child_timeout_seconds"),
+        label="delegation.child_timeout_seconds",
+    )
+    if parsed is not _CHILD_TIMEOUT_UNSET:
+        return parsed
+
     return DEFAULT_CHILD_TIMEOUT
 
 
@@ -661,11 +798,19 @@ def _merge_delegation_profile(cfg: dict, profile: Optional[str]) -> dict:
     if not isinstance(profile_cfg, dict):
         raise ValueError(f"Delegation profile '{profile_name}' must be a mapping.")
 
+    base_child_timeout = base.get("child_timeout_seconds")
+    profile_child_timeout_overridden = (
+        "child_timeout_seconds" in profile_cfg
+        and profile_cfg.get("child_timeout_seconds") is not None
+    )
+
     merged = dict(base)
     for key, value in profile_cfg.items():
         if value is not None:
             merged[key] = value
     merged["_profile"] = profile_name
+    merged["_profile_child_timeout_overridden"] = profile_child_timeout_overridden
+    merged["_global_child_timeout_seconds"] = base_child_timeout
     return merged
 
 
@@ -1689,7 +1834,173 @@ def _run_single_child(
     goal: str,
     child=None,
     parent_agent=None,
+    *,
+    child_timeout: Any = _CHILD_TIMEOUT_UNSET,
+    child_builder: Optional[Callable[[Dict[str, Any]], Any]] = None,
     **_kwargs,
+) -> Dict[str, Any]:
+    """Run a child with timeout-triggered fallback attempts.
+
+    Only parent-side wall-clock timeout advances through the fallback chain.
+    Non-timeout exceptions preserve the existing one-and-done error behavior.
+    """
+    resolved_timeout = (
+        _get_child_timeout()
+        if child_timeout is _CHILD_TIMEOUT_UNSET
+        else child_timeout
+    )
+
+    routes = _child_timeout_attempt_routes(child)
+    if child_builder is None or resolved_timeout is None:
+        routes = routes[:1]
+
+    total_budget = (
+        float(resolved_timeout) * len(routes)
+        if resolved_timeout is not None
+        else None
+    )
+    total_deadline = (
+        time.monotonic() + total_budget
+        if total_budget is not None
+        else None
+    )
+
+    overall_start = time.monotonic()
+    current_child = child
+    providers_tried: List[str] = []
+    last_timeout_result: Optional[Dict[str, Any]] = None
+
+    for attempt_index, route in enumerate(routes):
+        route_label = _route_label(route)
+        providers_tried.append(route_label)
+
+        attempt_timeout = resolved_timeout
+        if total_deadline is not None and resolved_timeout is not None:
+            remaining = total_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            attempt_timeout = min(float(resolved_timeout), remaining)
+
+        result = _run_single_child_attempt(
+            task_index=task_index,
+            goal=goal,
+            child=current_child,
+            parent_agent=parent_agent,
+            child_timeout=attempt_timeout,
+        )
+        result["providers_tried"] = list(providers_tried)
+        result["attempt_count"] = len(providers_tried)
+        if total_budget is not None:
+            result["timeout_budget_seconds"] = round(total_budget, 2)
+
+        if result.get("status") != "timeout":
+            if len(providers_tried) > 1:
+                result["duration_seconds"] = round(time.monotonic() - overall_start, 2)
+            return result
+
+        last_timeout_result = result
+        if attempt_index >= len(routes) - 1:
+            break
+
+        next_route = routes[attempt_index + 1]
+        next_label = _route_label(next_route)
+        duration = float(result.get("duration_seconds") or 0.0)
+
+        logger.warning(
+            "Subagent %d timed out on %s after %.1fs - failing over to %s (attempt %d/%d)",
+            task_index,
+            route_label,
+            duration,
+            next_label,
+            attempt_index + 2,
+            len(routes),
+        )
+
+        child_progress_cb = getattr(current_child, "tool_progress_callback", None)
+        if child_progress_cb:
+            try:
+                child_progress_cb(
+                    "subagent.failover",
+                    preview=(
+                        f"Timed out on {route_label}; failing over to {next_label} "
+                        f"(attempt {attempt_index + 2}/{len(routes)})"
+                    ),
+                    status="timeout",
+                    from_provider=route.get("provider"),
+                    from_model=route.get("model"),
+                    to_provider=next_route.get("provider"),
+                    to_model=next_route.get("model"),
+                    attempt=attempt_index + 2,
+                    total_attempts=len(routes),
+                    providers_tried=list(providers_tried),
+                )
+            except Exception:
+                logger.debug("Progress callback failover relay failed", exc_info=True)
+
+        try:
+            current_child = child_builder(next_route)
+        except Exception as exc:
+            logger.warning(
+                "Subagent %d timed out on %s but fallback child build for %s failed: %s",
+                task_index,
+                route_label,
+                next_label,
+                exc,
+            )
+            return {
+                "task_index": task_index,
+                "status": "error",
+                "summary": None,
+                "error": (
+                    f"Subagent timed out on {route_label}, then failed to build "
+                    f"fallback child {next_label}: {exc}"
+                ),
+                "exit_reason": "error",
+                "api_calls": int(result.get("api_calls") or 0),
+                "duration_seconds": round(time.monotonic() - overall_start, 2),
+                "providers_tried": list(providers_tried),
+                "attempt_count": len(providers_tried),
+                "timeout_budget_seconds": round(total_budget, 2) if total_budget is not None else None,
+                "_child_role": result.get("_child_role"),
+                "_child_session_id": result.get("_child_session_id"),
+                "_child_subagent_id": result.get("_child_subagent_id"),
+            }
+
+    if last_timeout_result is not None:
+        attempts = len(providers_tried)
+        tried = ", ".join(providers_tried)
+        base_error = last_timeout_result.get("error") or "Subagent timed out."
+        last_timeout_result["error"] = (
+            f"{base_error} Timed out on {tried} ({attempts} "
+            f"{'attempt' if attempts == 1 else 'attempts'})."
+        )
+        last_timeout_result["providers_tried"] = list(providers_tried)
+        last_timeout_result["attempt_count"] = attempts
+        if total_budget is not None:
+            last_timeout_result["timeout_budget_seconds"] = round(total_budget, 2)
+        last_timeout_result["duration_seconds"] = round(time.monotonic() - overall_start, 2)
+        return last_timeout_result
+
+    return {
+        "task_index": task_index,
+        "status": "error",
+        "summary": None,
+        "error": "Subagent did not run.",
+        "exit_reason": "error",
+        "api_calls": 0,
+        "duration_seconds": round(time.monotonic() - overall_start, 2),
+        "providers_tried": list(providers_tried),
+        "attempt_count": len(providers_tried),
+    }
+
+
+def _run_single_child_attempt(
+    task_index: int,
+    goal: str,
+    child=None,
+    parent_agent=None,
+    *,
+    child_timeout: Optional[float],
 ) -> Dict[str, Any]:
     """
     Run a pre-built child agent. Called from within a thread.
@@ -1852,10 +2163,10 @@ def _run_single_child(
             list(file_state.known_reads(parent_task_id)) if parent_task_id else []
         )
 
-        # Run child with an optional hard timeout (off by default —
-        # result(timeout=None) blocks until the child finishes). Stuck-child
-        # protection comes from the heartbeat staleness monitor instead.
-        child_timeout = _get_child_timeout()
+        # Run this attempt with the resolved per-attempt hard timeout.
+        # result(timeout=None) blocks until the child finishes. Stuck-child
+        # protection still comes from the heartbeat staleness monitor when no
+        # hard cap is configured.
         _timeout_executor = ThreadPoolExecutor(
             max_workers=1,
             # Install a non-interactive approval callback in the worker thread
@@ -1982,6 +2293,8 @@ def _run_single_child(
                 "api_calls": child_api_calls,
                 "duration_seconds": duration,
                 "_child_role": getattr(child, "_delegate_role", None),
+                "_child_session_id": getattr(child, "session_id", None),
+                "_child_subagent_id": getattr(child, "_subagent_id", None),
                 "diagnostic_path": diagnostic_path,
             }
         finally:
@@ -2087,6 +2400,8 @@ def _run_single_child(
             # parent thread can fire subagent_stop with the correct role.
             # Stripped before the dict is serialised back to the model.
             "_child_role": getattr(child, "_delegate_role", None),
+            "_child_session_id": getattr(child, "session_id", None),
+            "_child_subagent_id": getattr(child, "_subagent_id", None),
             # Captured before child.close() so the parent aggregator can fold
             # the child's total spend into the parent's session cost.  Port of
             # Kilo-Org/kilocode#9448 — previously the footer only reflected the
@@ -2222,6 +2537,8 @@ def _run_single_child(
             "api_calls": 0,
             "duration_seconds": duration,
             "_child_role": getattr(child, "_delegate_role", None),
+            "_child_session_id": getattr(child, "session_id", None),
+            "_child_subagent_id": getattr(child, "_subagent_id", None),
         }
 
     finally:
@@ -2460,6 +2777,8 @@ def delegate_task(
                 "creds": task_creds,
                 "toolsets": task_toolsets,
                 "max_iterations": _profile_max_iterations(task_cfg, default_max_iter),
+                "child_timeout": _get_child_timeout(task_cfg),
+                "profile": task_profile,
                 "role": _normalize_role(task.get("role") or top_role),
             }
         )
@@ -2485,38 +2804,64 @@ def delegate_task(
     try:
         for i, spec in enumerate(task_specs):
             t = spec["task"]
-            creds = spec["creds"]
-            task_acp_args = t.get("acp_args") if "acp_args" in t else None
-            child = _build_child_agent(
-                task_index=i,
-                goal=t["goal"],
-                context=t.get("context"),
-                toolsets=spec["toolsets"],
-                model=creds["model"],
-                max_iterations=spec["max_iterations"],
-                task_count=n_tasks,
-                parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_acp_command=t.get("acp_command")
-                or acp_command
-                or creds.get("command"),
-                override_acp_args=(
-                    task_acp_args
-                    if task_acp_args is not None
-                    else (acp_args if acp_args is not None else creds.get("args"))
-                ),
-                role=spec["role"],
-                delegation_cfg=spec["cfg"],
-            )
-            # Override with correct parent tool names (before child construction mutated global)
-            child._delegate_saved_tool_names = _parent_tool_names
-            children.append((i, t, child))
+
+            def _make_child(
+                route: Optional[Dict[str, Any]] = None,
+                *,
+                _i: int = i,
+                _spec: dict = spec,
+                _t: dict = t,
+            ):
+                if route is None:
+                    creds = _spec["creds"]
+                    child_cfg = _spec["cfg"]
+                else:
+                    child_cfg = _delegation_cfg_for_timeout_fallback(_spec["cfg"], route)
+                    creds = _resolve_delegation_credentials(child_cfg, parent_agent)
+
+                task_acp_args = _t.get("acp_args") if "acp_args" in _t else None
+
+                with _CHILD_BUILD_LOCK:
+                    child_obj = _build_child_agent(
+                        task_index=_i,
+                        goal=_t["goal"],
+                        context=_t.get("context"),
+                        toolsets=_spec["toolsets"],
+                        model=creds["model"],
+                        max_iterations=_spec["max_iterations"],
+                        task_count=n_tasks,
+                        parent_agent=parent_agent,
+                        override_provider=creds["provider"],
+                        override_base_url=creds["base_url"],
+                        override_api_key=creds["api_key"],
+                        override_api_mode=creds["api_mode"],
+                        override_acp_command=_t.get("acp_command")
+                        or acp_command
+                        or creds.get("command"),
+                        override_acp_args=(
+                            task_acp_args
+                            if task_acp_args is not None
+                            else (acp_args if acp_args is not None else creds.get("args"))
+                        ),
+                        role=_spec["role"],
+                        delegation_cfg=child_cfg,
+                    )
+                    child_obj._delegate_saved_tool_names = _parent_tool_names
+                    _model_tools._last_resolved_tool_names = _parent_tool_names
+                    return child_obj
+
+            child = _make_child()
+            children.append((i, t, child, _make_child, spec["child_timeout"]))
     finally:
         # Authoritative restore: reset global to parent's tool names after all children built
         _model_tools._last_resolved_tool_names = _parent_tool_names
+
+    # Preserve the prior behavior where `creds` referred to the last built
+    # child's resolved credentials (used by the background dispatch path for
+    # the batch-level model label). The build loop now resolves creds inside
+    # the per-task `_make_child` closure, so re-expose the last spec's creds
+    # here for those downstream references.
+    creds = task_specs[-1]["creds"] if task_specs else {"model": None}
 
     def _execute_and_aggregate(async_delegation_id: Optional[str] = None) -> dict:
         """Run all built children (1 or N), join on them, aggregate results,
@@ -2534,19 +2879,30 @@ def delegate_task(
             try:
                 from tools.async_delegation import update_batch_child_result
 
+                public_entry = {
+                    k: v for k, v in entry.items() if not str(k).startswith("_")
+                }
                 update_batch_child_result(
                     async_delegation_id,
                     task_index=entry.get("task_index"),
-                    subagent_id=getattr(child_obj, "_subagent_id", None),
-                    result=entry,
+                    subagent_id=entry.get("_child_subagent_id")
+                    or getattr(child_obj, "_subagent_id", None),
+                    result=public_entry,
                 )
             except Exception:
                 logger.debug("async child status update failed", exc_info=True)
 
         if n_tasks == 1:
             # Single task -- run directly (no thread pool overhead)
-            _i, _t, child = children[0]
-            result = _run_single_child(_i, _t["goal"], child, parent_agent)
+            _i, _t, child, child_builder, child_timeout = children[0]
+            result = _run_single_child(
+                _i,
+                _t["goal"],
+                child,
+                parent_agent,
+                child_timeout=child_timeout,
+                child_builder=child_builder,
+            )
             results.append(result)
             _mark_async_child_result(result, child)
         else:
@@ -2556,13 +2912,15 @@ def delegate_task(
 
             with ThreadPoolExecutor(max_workers=max_children) as executor:
                 futures = {}
-                for i, t, child in children:
+                for i, t, child, child_builder, child_timeout in children:
                     future = executor.submit(
                         _run_single_child,
                         task_index=i,
                         goal=t["goal"],
                         child=child,
                         parent_agent=parent_agent,
+                        child_timeout=child_timeout,
+                        child_builder=child_builder,
                     )
                     futures[future] = i
 
@@ -2573,7 +2931,7 @@ def delegate_task(
                 # when the parent is interrupted.
                 # Map task_index -> child agent, so fabricated entries for
                 # still-pending futures can carry the correct _delegate_role.
-                _child_by_index = {i: child for (i, _, child) in children}
+                _child_by_index = {i: child for (i, _, child, _, _) in children}
 
                 pending = set(futures.keys())
                 while pending:
@@ -2723,6 +3081,8 @@ def delegate_task(
             if _invoke_hook is None:
                 continue
             try:
+                _child_session_id = entry.pop("_child_session_id", None)
+                _child_subagent_id = entry.pop("_child_subagent_id", None)
                 _child_index = entry.get("task_index", -1)
                 _child_agent = (
                     children[_child_index][2]
@@ -2733,7 +3093,8 @@ def delegate_task(
                     "subagent_stop",
                     parent_session_id=_parent_session_id,
                     parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "",
-                    child_session_id=getattr(_child_agent, "session_id", None),
+                    child_session_id=_child_session_id or getattr(_child_agent, "session_id", None),
+                    child_subagent_id=_child_subagent_id or getattr(_child_agent, "_subagent_id", None),
                     child_role=child_role,
                     child_summary=entry.get("summary"),
                     child_status=entry.get("status"),
@@ -2798,7 +3159,7 @@ def delegate_task(
             }
         except Exception:
             _routing = {}
-        _child_agents = [c for (_, _, c) in children]
+        _child_agents = [c for (_, _, c, _, _) in children]
 
         # Detach every child from the parent's interrupt-propagation list — the
         # batch's lifecycle is owned by the async registry now, not the parent
@@ -2830,7 +3191,7 @@ def delegate_task(
 
         _goals = [t["goal"] for t in task_list]
         _child_records = []
-        for _i, _t, _c in children:
+        for _i, _t, _c, _, _ in children:
             _model = getattr(_c, "model", None)
             _reasoning = getattr(_c, "reasoning_config", None)
             _child_records.append(
