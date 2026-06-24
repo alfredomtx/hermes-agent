@@ -1422,6 +1422,13 @@ DEFAULT_CONFIG = {
     # Only used when model.provider is "bedrock".
     "bedrock": {
         "region": "",  # AWS region for Bedrock API calls (empty = AWS_REGION env var → us-east-1)
+        # Botocore client timeouts for Bedrock runtime and control-plane clients.
+        # These are config.yaml knobs, not env vars. The runtime client cache keeps
+        # the Config used at construction time until reset_client_cache() or process restart.
+        "read_timeout": 600,          # seconds, covers non-streaming converse() and IAM fallback paths
+        "connect_timeout": 10,        # seconds
+        "retries_max_attempts": 3,    # botocore retry attempts
+        "retries_mode": "adaptive",   # botocore retry mode
         "discovery": {
             "enabled": True,           # Auto-discover models via ListFoundationModels
             "provider_filter": [],     # Only show models from these providers (e.g. ["anthropic", "amazon"])
@@ -2116,7 +2123,9 @@ DEFAULT_CONFIG = {
                                      # = no timeout: children fail only from real errors
                                      # (API, tools, iteration budget), never a delegation
                                      # stopwatch. Set a positive number of seconds
-                                     # (floor 30s) to enforce a hard cap.
+                                     # (floor 30s) to enforce a hard cap. Profiles may
+                                     # override this with
+                                     # delegation.profiles.<name>.child_timeout_seconds.
         "reasoning_effort": "",  # reasoning effort for subagents: "xhigh", "high", "medium",
                                  # "low", "minimal", "none" (empty = inherit parent's level)
         "service_tier": "",  # priority processing for subagents: "fast"/"priority"/"on" => priority;
@@ -2135,6 +2144,7 @@ DEFAULT_CONFIG = {
             #     "service_tier": "fast",
             #     "toolsets": ["file", "terminal"],
             #     "max_iterations": 25,
+            #     "child_timeout_seconds": 300,
             # },
         },
         # When true, direct reviewer-codex / reviewer-opus profile requests fail.
