@@ -81,6 +81,22 @@ def test_todo_progress_reading_state():
     assert format_todo_progress({}) == "📋 Todo\nReading task list"
 
 
+def test_todo_progress_default_content_limit_is_100():
+    long = (
+        "gate.py: docstring + constants (TTL 6h->30m, subject defaults) + config "
+        "readers (_cfg_float, _credit_max_age, subject_* )"
+    )
+    card = format_todo_progress(
+        {"todos": [{"id": "1", "content": long, "status": "in_progress"}]}
+    )
+    assert card is not None
+    line = next(ln for ln in card.splitlines() if ln.startswith("1."))
+    body = line.split(" - ", 1)[1]
+    assert len(body) == 100
+    assert body.endswith("...")
+    assert body == long[:97] + "..."
+
+
 def test_todo_progress_renders_durations_from_result():
     result = {
         "todos": [
