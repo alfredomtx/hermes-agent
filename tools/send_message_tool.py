@@ -713,7 +713,7 @@ async def _send_via_adapter(
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
+async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, allow_thread_fallback=True):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -791,6 +791,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 thread_id=thread_id,
                 disable_link_previews=disable_link_previews,
                 force_document=force_document,
+                allow_thread_fallback=allow_thread_fallback,
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
@@ -980,7 +981,7 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
     return "thread not found" in str(error).lower()
 
 
-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
+async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False, allow_thread_fallback=True):
     """Send via Telegram Bot API (one-shot, no polling needed).
 
     Applies markdown→MarkdownV2 formatting (same as the gateway adapter)
@@ -1068,6 +1069,13 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
 
         last_msg = None
         warnings = []
+        # Dead-thread self-heal signal for the cron delivery path. When
+        # allow_thread_fallback is False (cron topic self-heal), a deleted topic
+        # is REPORTED (error dict with thread_not_found) instead of silently
+        # retried without the thread. When True (default), legacy behavior: drop
+        # the thread and report thread_fallback in the success result.
+        requested_thread_id_signal = thread_kwargs.get("message_thread_id")
+        used_thread_fallback = False
 
         if formatted.strip():
             try:
@@ -1081,10 +1089,24 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                 # message still delivers (matching the gateway adapter's
                 # fallback behaviour, issue #27012).
                 if _is_telegram_thread_not_found(md_error) and thread_kwargs:
+                    if not allow_thread_fallback:
+                        # Cron topic self-heal: report the dead thread instead of
+                        # silently dropping it, so the caller can recreate + resend.
+                        return {
+                            "error": _sanitize_error_text(str(md_error)),
+                            "thread_not_found": True,
+                            "requested_thread_id": requested_thread_id_signal,
+                            "raw_response": {
+                                "requested_thread_id": requested_thread_id_signal,
+                                "thread_not_found": True,
+                                "thread_fallback": False,
+                            },
+                        }
                     logger.warning(
                         "Thread %s not found in _send_telegram, retrying without message_thread_id",
                         thread_kwargs.get("message_thread_id"),
                     )
+                    used_thread_fallback = True
                     text_kwargs.pop("message_thread_id", None)
                     last_msg = await _send_telegram_message_with_retry(
                         bot,
@@ -1147,12 +1169,25 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                             )
                     except Exception as media_err:
                         if _is_telegram_thread_not_found(media_err) and media_kwargs.get("message_thread_id"):
+                            if not allow_thread_fallback:
+                                # Cron topic self-heal: report the dead thread.
+                                return {
+                                    "error": _sanitize_error_text(str(media_err)),
+                                    "thread_not_found": True,
+                                    "requested_thread_id": requested_thread_id_signal,
+                                    "raw_response": {
+                                        "requested_thread_id": requested_thread_id_signal,
+                                        "thread_not_found": True,
+                                        "thread_fallback": False,
+                                    },
+                                }
                             # Thread not found for media — retry without
                             # message_thread_id (issue #27012).
                             logger.warning(
                                 "Thread %s not found for media send, retrying without message_thread_id",
                                 media_kwargs["message_thread_id"],
                             )
+                            used_thread_fallback = True
                             # Re-seek the file since the first attempt consumed it
                             f.seek(0)
                             media_kwargs.pop("message_thread_id", None)
@@ -1195,6 +1230,16 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             "chat_id": chat_id,
             "message_id": str(last_msg.message_id),
         }
+        if used_thread_fallback:
+            # Legacy fallback fired (allow_thread_fallback=True): message landed
+            # in the group root. Surface it so the cron delivery path can record
+            # the misroute (parity with the live adapter's thread_fallback).
+            result["thread_fallback"] = True
+            result["requested_thread_id"] = requested_thread_id_signal
+            result["raw_response"] = {
+                "requested_thread_id": requested_thread_id_signal,
+                "thread_fallback": True,
+            }
         if warnings:
             result["warnings"] = warnings
         return result
