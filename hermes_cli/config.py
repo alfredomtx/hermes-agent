@@ -2866,6 +2866,19 @@ DEFAULT_CONFIG = {
             "max_messages": 15,
             # Only messages newer than this many hours are considered.
             "max_age_hours": 24,
+            # Second source: raw Bot-API topic posts (cron digests, watchdog
+            # alerts, the review bridge) logged by local scripts to a per-topic
+            # rolling JSON log. These never create a Hermes session/state.db row,
+            # so the SessionDB-sibling scan above is blind to them. When true,
+            # the reader merges that log as a second source.
+            "recent_posts_enabled": True,
+            # Read/render-side caps only. The pure-stdlib writer
+            # (~/.hermes/scripts/tg_topic_recent_posts.py) cannot import this
+            # config, so it carries its own hardcoded storage caps; these two
+            # only bound what the reader considers (further bounded by
+            # max_messages / max_age_hours on the combined set).
+            "recent_posts_max_entries": 200,
+            "recent_posts_retention_hours": 168,
         },
     },
 

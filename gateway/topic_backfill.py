@@ -198,30 +198,21 @@ def _coerce_timestamp(raw: Any) -> Optional[float]:
         return None
 
 
-def get_recent_topic_messages(
+def _collect_session_messages(
     platform: str,
     chat_id: str,
     thread_id: Optional[str],
     exclude_session_id: Optional[str],
-    max_messages: int = 15,
-    max_age_hours: int = 24,
+    now: float,
+    max_age_seconds: Optional[float],
 ) -> List[Dict[str, Any]]:
-    """Pull, merge, filter, sort, dedup and cap topic messages.
+    """SOURCE 1: recent user/assistant rows from sibling Hermes sessions.
 
-    Returns a list of dicts ``{"label", "role", "text", "timestamp"}`` in
-    chronological order, at most ``max_messages`` (the most RECENT ones).
-
-    Filters applied per message:
-      - role in (user, assistant)
-      - ``isinstance(content, str)`` (multimodal rows are decoded to lists and
-        must be skipped, per the reviewer caveat)
-      - non-empty after strip
-      - within ``max_age_hours`` of now (when a timestamp is present)
-
-    Cross-sibling ordering: ``SessionDB.get_messages`` orders by id, not
-    timestamp, so we sort the MERGED set by timestamp ourselves.
-    Dedup key is ``(role, normalized-content)`` so the same line mirrored into
-    multiple sibling transcripts only shows once.
+    Returns raw candidate rows (no dedup, no cap — those run on the COMBINED
+    set in ``get_recent_topic_messages``). Degrades to ``[]`` when there are no
+    siblings OR ``state.db`` cannot be opened, WITHOUT short-circuiting the
+    caller — the Bot-API log source must still run in a pristine home that has
+    no ``state.db`` at all (dual-review blocker B1).
     """
     session_ids = collect_sibling_session_ids(
         platform, chat_id, thread_id, exclude_session_id
@@ -234,10 +225,6 @@ def get_recent_topic_messages(
         return []
 
     origin_map = _session_origin_map(session_ids)
-
-    now = time.time()
-    max_age_seconds = max_age_hours * 3600 if max_age_hours and max_age_hours > 0 else None
-
     collected: List[Dict[str, Any]] = []
     for sid in session_ids:
         try:
@@ -258,8 +245,7 @@ def get_recent_topic_messages(
             text = content.strip()
             if not text:
                 continue
-            # Skip mirror/observed bookkeeping rows that are not real turns?
-            # We keep observed rows: they ARE prior topic activity. Only the
+            # Keep observed rows: they ARE prior topic activity. Only the
             # role/text/age filters gate inclusion.
             ts = _coerce_timestamp(row.get("timestamp"))
             if max_age_seconds is not None and ts is not None:
@@ -270,17 +256,111 @@ def get_recent_topic_messages(
                     "label": label,
                     "role": role,
                     "text": text,
-                    # Sort key: rows with no timestamp sink to the front so a
-                    # present-timestamp recent row always wins the cap.
                     "timestamp": ts if ts is not None else 0.0,
                 }
             )
+    return collected
+
+
+def _collect_recent_post_messages(
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str],
+    now: float,
+    max_age_seconds: Optional[float],
+) -> List[Dict[str, Any]]:
+    """SOURCE 2: raw Bot-API posts from the per-topic recent-posts log.
+
+    These posts (cron digests, watchdog alerts, the review bridge) never create
+    a Hermes session, so SOURCE 1 is blind to them. The reader lives in its own
+    module and never raises; any failure degrades to ``[]`` so a log problem can
+    never break message handling.
+    """
+    try:
+        from gateway.topic_recent_posts import read_recent_bot_posts
+
+        rows = read_recent_bot_posts(platform, chat_id, thread_id)
+    except Exception as e:
+        logger.debug("topic_backfill: recent-post source failed: %s", e)
+        return []
+
+    collected: List[Dict[str, Any]] = []
+    for row in rows:
+        role = row.get("role")
+        if role not in _BACKFILL_ROLES:
+            continue
+        text = row.get("text")
+        if not isinstance(text, str):
+            continue
+        text = text.strip()
+        if not text:
+            continue
+        ts = _coerce_timestamp(row.get("timestamp"))
+        if max_age_seconds is not None and ts is not None:
+            if (now - ts) > max_age_seconds:
+                continue
+        collected.append(
+            {
+                "label": row.get("label") or "bot",
+                "role": role,
+                "text": text,
+                "timestamp": ts if ts is not None else 0.0,
+            }
+        )
+    return collected
+
+
+def get_recent_topic_messages(
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str],
+    exclude_session_id: Optional[str],
+    max_messages: int = 15,
+    max_age_hours: int = 24,
+    include_bot_posts: bool = True,
+) -> List[Dict[str, Any]]:
+    """Pull, merge, filter, sort, dedup and cap topic messages from TWO sources.
+
+    SOURCE 1 — sibling Hermes sessions (``state.db`` via ``sessions.json``).
+    SOURCE 2 — raw Bot-API posts (the per-topic recent-posts log), included
+    when ``include_bot_posts`` is True.
+
+    Returns a list of dicts ``{"label", "role", "text", "timestamp"}`` in
+    chronological order, at most ``max_messages`` (the most RECENT ones).
+
+    Filters applied per message: role in (user, assistant); str content only
+    (multimodal decoded-list rows skipped); non-empty after strip; within
+    ``max_age_hours`` of now when a timestamp is present.
+
+    Cross-source ordering: ``SessionDB.get_messages`` is id-ordered per session
+    and the log is its own order, so we sort the MERGED set by timestamp. Dedup
+    key ``(role, normalized-content)`` collapses a post that appears in BOTH a
+    sibling transcript and the log (bot posts are role ``assistant`` to match the
+    delivery-mirror row). The cap applies to the COMBINED set.
+
+    Neither source short-circuits the other: a pristine home with only the
+    Bot-API log and no ``state.db`` still yields the log rows (B1).
+    """
+    now = time.time()
+    max_age_seconds = max_age_hours * 3600 if max_age_hours and max_age_hours > 0 else None
+
+    collected: List[Dict[str, Any]] = []
+    collected.extend(
+        _collect_session_messages(
+            platform, chat_id, thread_id, exclude_session_id, now, max_age_seconds
+        )
+    )
+    if include_bot_posts:
+        collected.extend(
+            _collect_recent_post_messages(
+                platform, chat_id, thread_id, now, max_age_seconds
+            )
+        )
 
     if not collected:
         return []
 
-    # Sort the MERGED set chronologically (get_messages is id-ordered per
-    # session, not across siblings).
+    # Sort the MERGED set chronologically (sources are not mutually ordered).
     collected.sort(key=lambda m: m["timestamp"])
 
     # Dedup by (role, normalized text), keeping the FIRST (earliest)
@@ -336,12 +416,15 @@ def build_topic_backfill(
     exclude_session_id: Optional[str] = None,
     max_messages: int = 15,
     max_age_hours: int = 24,
+    include_bot_posts: bool = True,
 ) -> Optional[str]:
     """Top-level resolve + render. NEVER raises; None on error or empty.
 
     This is the single entry point the Telegram adapter calls. Any failure
     (missing index, DB error, malformed rows) degrades to ``None`` so message
-    handling is never broken by a backfill problem.
+    handling is never broken by a backfill problem. ``include_bot_posts`` gates
+    the second (Bot-API recent-posts log) source; it maps to the
+    ``gateway.topic_backfill.recent_posts_enabled`` config knob.
     """
     try:
         messages = get_recent_topic_messages(
@@ -351,6 +434,7 @@ def build_topic_backfill(
             exclude_session_id=exclude_session_id,
             max_messages=max_messages,
             max_age_hours=max_age_hours,
+            include_bot_posts=include_bot_posts,
         )
         return render_backfill_block(messages)
     except Exception as e:  # pragma: no cover - defensive catch-all
