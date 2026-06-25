@@ -127,7 +127,7 @@ def format_todo_progress(
     *,
     result: Any = None,
     max_items: int = 12,
-    content_limit: int = 160,
+    content_limit: int = 100,
 ) -> Optional[str]:
     """Render ``todo`` tool args as a compact plan card.
 
