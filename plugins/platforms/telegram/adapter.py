@@ -741,6 +741,22 @@ class TelegramAdapter(BasePlatformAdapter):
         return str(thread_id) if thread_id is not None else None
 
     @classmethod
+    def _metadata_no_thread_fallback(cls, metadata: Optional[Dict[str, Any]]) -> bool:
+        """Whether the caller wants a dead-thread reported (failure) instead of a
+        silent fallback to the group root.
+
+        Cron topic self-heal sets this so the delivery path can RECREATE the
+        deleted topic before anything lands in the group root. Normal sends
+        leave it unset and keep the legacy root-fallback behavior.
+        """
+        if not metadata:
+            return False
+        return bool(
+            metadata.get("telegram_no_thread_fallback")
+            or metadata.get("telegram_fail_on_thread_not_found")
+        )
+
+    @classmethod
     def _metadata_direct_messages_topic_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
         if not metadata:
             return None
@@ -2413,6 +2429,62 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             return None
 
+    async def create_forum_topic(
+        self,
+        chat_id: str,
+        name: str,
+        icon_color: Optional[int] = None,
+        icon_custom_emoji_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Create a forum topic in ANY chat (supergroup or private-topic) and
+        return its message_thread_id as a string, or None on failure.
+
+        Public, chat-agnostic wrapper around Bot API createForumTopic. Used by
+        the cron delivery self-heal path (cron/scheduler.py) to recreate a topic
+        the user deleted. Retries once without the custom emoji id if Telegram
+        rejects it (mirrors tg-create-topic.py). Reuses _create_dm_topic, which
+        already calls bot.create_forum_topic and works for any chat type.
+        """
+        topic_name = str(name or "").strip()[:128]
+        if not topic_name:
+            return None
+        try:
+            chat_id_arg = int(chat_id)
+        except (TypeError, ValueError):
+            return None
+        thread_id = await self._create_dm_topic(
+            chat_id=chat_id_arg,
+            name=topic_name,
+            icon_color=icon_color,
+            icon_custom_emoji_id=icon_custom_emoji_id,
+        )
+        if thread_id is None and icon_custom_emoji_id:
+            # A bad custom emoji id is the most common create failure; retry plain.
+            thread_id = await self._create_dm_topic(
+                chat_id=chat_id_arg,
+                name=topic_name,
+                icon_color=icon_color,
+            )
+        return str(thread_id) if thread_id else None
+
+    async def delete_forum_topic(self, chat_id: str, thread_id: str) -> bool:
+        """Best-effort delete of a forum topic (used to roll back a just-created
+        topic when the seed write fails). Returns True on success."""
+        if not self._bot:
+            return False
+        try:
+            await self._bot.delete_forum_topic(
+                chat_id=int(chat_id),
+                message_thread_id=int(thread_id),
+            )
+            return True
+        except Exception as e:
+            logger.debug(
+                "[%s] delete_forum_topic rollback failed for %s:%s: %s",
+                self.name, chat_id, thread_id, e, exc_info=True,
+            )
+            return False
+
     async def create_handoff_thread(
         self,
         parent_chat_id: str,
@@ -3338,6 +3410,7 @@ class TelegramAdapter(BasePlatformAdapter):
             thread_id = self._metadata_thread_id(metadata)
             requested_thread_id = self._message_thread_id_for_send(thread_id)
             used_thread_fallback = False
+            no_thread_fallback = self._metadata_no_thread_fallback(metadata)
             
             try:
                 from telegram.error import NetworkError as _NetErr
@@ -3460,6 +3533,27 @@ class TelegramAdapter(BasePlatformAdapter):
                                     )
                                     continue
                                 # Second failure: the thread is genuinely gone.
+                                if no_thread_fallback:
+                                    # Caller (cron topic self-heal) wants the dead
+                                    # thread REPORTED, not silently dumped to the
+                                    # group root, so it can recreate the topic and
+                                    # re-send. Return failure with the dead-thread
+                                    # signal instead of falling back.
+                                    logger.warning(
+                                        "[%s] Thread %s not found; reporting (fallback disabled) so caller can recreate",
+                                        self.name, effective_thread_id,
+                                    )
+                                    return SendResult(
+                                        success=False,
+                                        error=str(send_err),
+                                        retryable=False,
+                                        raw_response={
+                                            "message_ids": message_ids,
+                                            "requested_thread_id": requested_thread_id,
+                                            "thread_not_found": True,
+                                            "thread_fallback": False,
+                                        },
+                                    )
                                 # Retry without ``message_thread_id`` so the
                                 # message still reaches the chat, and prune
                                 # the stale binding so future inbound

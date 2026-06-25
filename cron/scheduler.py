@@ -1309,6 +1309,21 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
 
+        # Cron Telegram forum-topic self-heal: when this job targets a forum
+        # topic AND carries recreate metadata, a deleted topic is recreated +
+        # repointed inline (no separate sweep cron). Resolved once per target.
+        from cron.topic_heal import (
+            is_telegram_forum_topic_target,
+            topic_metadata_for_job,
+            thread_not_found_in_result,
+            requested_thread_from_result,
+            heal_dead_thread,
+            NO_THREAD_FALLBACK_METADATA,
+        )
+        topic_meta = None
+        if is_telegram_forum_topic_target(platform_name, chat_id, thread_id):
+            topic_meta = topic_metadata_for_job(job)
+
         # Diagnostic: log thread_id for topic-aware delivery debugging
         origin = _resolve_origin(job) or {}
         origin_thread = origin.get("thread_id")
@@ -1475,7 +1490,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 route_thread_id = str(thread_id) if thread_id is not None else None
                 route_metadata = {"job_id": job["id"]}
                 media_metadata = {"thread_id": thread_id} if thread_id else None
-
+            if thread_id and topic_meta:
+                # Tell the adapter to REPORT a dead thread instead of dumping to
+                # the group root, so we can recreate the topic and re-send.
+                route_metadata[NO_THREAD_FALLBACK_METADATA] = True
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content.
                 # Route through the gateway's DeliveryRouter so the live send
@@ -1574,6 +1592,65 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             # confirmation/thread-fallback inspection below.
                             pass
                         else:
+                            # Cron topic self-heal: a deleted forum topic is reported
+                            # (thread_not_found) when topic_meta is present. Recreate
+                            # the topic, repoint co-located jobs, and re-send to the
+                            # fresh thread before treating it as a failure.
+                            if (
+                                topic_meta
+                                and thread_id
+                                and thread_not_found_in_result(send_result)
+                            ):
+                                old_thread = requested_thread_from_result(send_result, thread_id)
+                                new_tid = heal_dead_thread(
+                                    job, chat_id, str(old_thread),
+                                    adapter=runtime_adapter, loop=loop,
+                                    token=getattr(pconfig, "token", None),
+                                )
+                                if new_tid:
+                                    thread_id = str(new_tid)
+                                    resend_meta = {"thread_id": thread_id, NO_THREAD_FALLBACK_METADATA: True}
+                                    resend_future = safe_schedule_threadsafe(
+                                        runtime_adapter.send(chat_id, text_to_send, metadata=resend_meta),
+                                        loop,
+                                    )
+                                    if resend_future is None:
+                                        adapter_ok = False
+                                        target_errors.append("live adapter scheduling failed after topic recreate")
+                                    else:
+                                        try:
+                                            send_result = resend_future.result(timeout=60)
+                                        except Exception as ex:
+                                            target_errors.append(f"live adapter resend after topic recreate failed: {ex}")
+                                            raise
+                                        logger.info(
+                                            "Job '%s': self-healed dead topic %s -> %s and re-delivered",
+                                            job["id"], old_thread, new_tid,
+                                        )
+                                else:
+                                    # Could not recreate (no metadata / API fail).
+                                    # Preserve the legacy fallback so the alert is not
+                                    # lost: re-send WITHOUT the no-fallback flag so it
+                                    # lands in the group root, and record the misroute.
+                                    resend_future = safe_schedule_threadsafe(
+                                        runtime_adapter.send(
+                                            chat_id, text_to_send,
+                                            metadata={"thread_id": thread_id} if thread_id else None,
+                                        ),
+                                        loop,
+                                    )
+                                    if resend_future is not None:
+                                        try:
+                                            send_result = resend_future.result(timeout=60)
+                                        except Exception:
+                                            pass
+                                    msg = (
+                                        f"configured thread_id {old_thread} for {platform_name}:{chat_id} "
+                                        f"was not found; topic recreate failed, delivered without thread_id"
+                                    )
+                                    logger.warning("Job '%s': %s", job["id"], msg)
+                                    delivery_errors.append(msg)
+
                             # _deliver_to_platform returns either a SendResult
                             # (.success attr) or, when the silence-narration
                             # filter drops the message, a plain dict
@@ -1587,6 +1664,40 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             else:
                                 send_success = _confirm_adapter_delivery(send_result)
                                 send_raw_response = getattr(send_result, "raw_response", None)
+
+                            if not send_success:
+                                if isinstance(send_result, dict):
+                                    err = send_result.get("error", "unknown")
+                                    shape = "dict"
+                                elif send_result is not None:
+                                    err = getattr(send_result, "error", None)
+                                    shape = type(send_result).__name__
+                                else:
+                                    err = "no response from adapter"
+                                    shape = "None"
+                                msg = (
+                                    f"live adapter send to {platform_name}:{chat_id} "
+                                    f"returned unconfirmed result ({shape}, error={err})"
+                                )
+                                logger.warning(
+                                    "Job '%s': %s, falling back to standalone",
+                                    job["id"], msg,
+                                )
+                                target_errors.append(msg)
+                                adapter_ok = False  # fall through to standalone path
+                            elif (
+                                send_raw_response
+                                and thread_id
+                                and not topic_meta
+                                and send_raw_response.get("thread_fallback")
+                            ):
+                                requested_thread_id = send_raw_response.get("requested_thread_id") or thread_id
+                                msg = (
+                                    f"configured thread_id {requested_thread_id} for "
+                                    f"{platform_name}:{chat_id} was not found; delivered without thread_id"
+                                )
+                                logger.warning("Job '%s': %s", job["id"], msg)
+                                delivery_errors.append(msg)
 
                             if not send_success:
                                 if isinstance(send_result, dict):
@@ -1687,7 +1798,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
         if not delivered:
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            coro = _send_to_platform(
+                platform, pconfig, chat_id, cleaned_delivery_content,
+                thread_id=thread_id, media_files=media_files,
+                allow_thread_fallback=not bool(topic_meta),
+            )
             try:
                 result = asyncio.run(coro)
             except RuntimeError:
@@ -1707,7 +1822,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        future = pool.submit(asyncio.run, _send_to_platform(
+                            platform, pconfig, chat_id, cleaned_delivery_content,
+                            thread_id=thread_id, media_files=media_files,
+                            allow_thread_fallback=not bool(topic_meta),
+                        ))
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)
@@ -1724,12 +1843,79 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
 
+            # Cron topic self-heal (standalone): a deleted forum topic is reported
+            # (thread_not_found) when topic_meta is present. Recreate + repoint +
+            # re-send to the fresh thread before treating it as an error.
+            if topic_meta and thread_id and thread_not_found_in_result(result):
+                old_thread = requested_thread_from_result(result, thread_id)
+                new_tid = heal_dead_thread(
+                    job, chat_id, str(old_thread),
+                    adapter=None, loop=None,
+                    token=getattr(pconfig, "token", None),
+                )
+                if new_tid:
+                    thread_id = str(new_tid)
+                    retry = _send_to_platform(
+                        platform, pconfig, chat_id, cleaned_delivery_content,
+                        thread_id=thread_id, media_files=media_files,
+                        allow_thread_fallback=False,
+                    )
+                    try:
+                        result = asyncio.run(retry)
+                    except RuntimeError:
+                        retry.close()
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                            result = pool.submit(asyncio.run, _send_to_platform(
+                                platform, pconfig, chat_id, cleaned_delivery_content,
+                                thread_id=thread_id, media_files=media_files,
+                                allow_thread_fallback=False,
+                            )).result(timeout=30)
+                    logger.info(
+                        "Job '%s': self-healed dead topic %s -> %s (standalone) and re-delivered",
+                        job["id"], old_thread, new_tid,
+                    )
+                else:
+                    # Recreate failed: re-send WITH fallback so the alert still
+                    # reaches the chat (group root), and record the misroute.
+                    retry = _send_to_platform(
+                        platform, pconfig, chat_id, cleaned_delivery_content,
+                        thread_id=thread_id, media_files=media_files,
+                        allow_thread_fallback=True,
+                    )
+                    try:
+                        result = asyncio.run(retry)
+                    except RuntimeError:
+                        retry.close()
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                            result = pool.submit(asyncio.run, _send_to_platform(
+                                platform, pconfig, chat_id, cleaned_delivery_content,
+                                thread_id=thread_id, media_files=media_files,
+                                allow_thread_fallback=True,
+                            )).result(timeout=30)
+                    msg = (
+                        f"configured thread_id {old_thread} for {platform_name}:{chat_id} "
+                        f"was not found; topic recreate failed, delivered without thread_id"
+                    )
+                    logger.warning("Job '%s': %s", job["id"], msg)
+                    delivery_errors.append(msg)
+
             if result and result.get("error"):
                 msg = f"delivery error: {result['error']}"
                 logger.error("Job '%s': %s", job["id"], msg)
                 target_errors.extend([msg])
                 delivery_errors.extend(target_errors)
                 continue
+
+            # No topic_meta: a legacy standalone thread_fallback is surfaced in
+            # the result so the misroute is recorded (parity with live adapter).
+            if result and thread_id and not topic_meta and isinstance(result, dict) and result.get("thread_fallback"):
+                requested_thread_id = result.get("requested_thread_id") or thread_id
+                msg = (
+                    f"configured thread_id {requested_thread_id} for "
+                    f"{platform_name}:{chat_id} was not found; delivered without thread_id"
+                )
+                logger.warning("Job '%s': %s", job["id"], msg)
+                delivery_errors.append(msg)
 
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
             _maybe_mirror_cron_delivery(
