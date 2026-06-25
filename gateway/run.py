@@ -2949,6 +2949,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Per-session model overrides from /model command.
         # Key: session_key, Value: dict with model/provider/api_key/base_url/api_mode
         self._session_model_overrides: Dict[str, Dict[str, str]] = {}
+        # Persistent cross-turn todo plan card, keyed by session_key. Value:
+        # {"message_id", "last_text", "finished", "thread_sig", "seeded_at"}.
+        # ONE living card is edited in place across turns instead of stacking a
+        # new card per todo call. Written only by the progress consumer
+        # coroutine (loop thread) and the session-boundary handlers.
+        # Presentation-only; never persisted to conversation history (prompt
+        # caching is sacred). Capped OrderedDict + LRU: the boundary clears only
+        # fire on session transitions, so an idle-abandoned session would leak a
+        # plain dict entry forever; the cap bounds it like _session_sources.
+        self._todo_card_state: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self._todo_card_state_max = 512
         # Per-session reasoning effort overrides from /reasoning.
         # Key: session_key, Value: parsed reasoning config dict.
         self._session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
@@ -6494,6 +6505,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         self._set_session_reasoning_override(key, None)
                         if hasattr(self, "_pending_model_notes"):
                             self._pending_model_notes.pop(key, None)
+                        if isinstance(getattr(self, "_todo_card_state", None), dict):
+                            self._todo_card_state.pop(key, None)
                         _pending_approvals = getattr(self, "_pending_approvals", None)
                         if isinstance(_pending_approvals, dict):
                             _pending_approvals.pop(key, None)
@@ -9205,6 +9218,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._set_session_reasoning_override(session_key, None)
             if hasattr(self, "_pending_model_notes"):
                 self._pending_model_notes.pop(session_key, None)
+            if isinstance(getattr(self, "_todo_card_state", None), dict):
+                self._todo_card_state.pop(session_key, None)
         
         # Emit session:start for new or auto-reset sessions
         _is_new_session = (
@@ -10128,6 +10143,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._set_session_reasoning_override(session_key, None)
                 if hasattr(self, "_pending_model_notes"):
                     self._pending_model_notes.pop(session_key, None)
+                if isinstance(getattr(self, "_todo_card_state", None), dict):
+                    self._todo_card_state.pop(session_key, None)
                 if new_entry is not None:
                     # Drop the stale reference to the bloated compressed child and
                     # re-point the Telegram topic binding at the fresh session.
@@ -14133,6 +14150,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not session_key:
             return
 
+        # Persistent todo plan card belongs to the prior conversation. Drop the
+        # stored message_id so a fresh session seeds its own card instead of
+        # editing a pre-reset message. Placed FIRST so a later import/return in
+        # this method can never skip it.
+        todo_card_state = getattr(self, "_todo_card_state", None)
+        if isinstance(todo_card_state, dict):
+            todo_card_state.pop(session_key, None)
+
         pending_skills_reload_notes = getattr(
             self, "_pending_skills_reload_notes", None
         )
@@ -15221,6 +15246,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # same "📋 Plan" vs "📋 Plan update" title the start card used. The
         # agent emits started/completed in parsed-call (FIFO) order.
         _todo_merge_flags: List[bool] = []
+        # FIFO of the persistent-card `new_plan` flag (write call with
+        # merge=False) pushed at todo tool.started and popped at tool.completed.
+        # Separate from _todo_merge_flags so the persistent path and the legacy
+        # shared-bubble path never share a queue. Only one path runs per call
+        # (gated on todo_progress_enabled). Per-turn scoped, so an interrupt-
+        # cancelled todo (start without completion) self-heals next turn; the
+        # `pop(0) if flags else False` at the completion site tolerates under-pop.
+        _todo_card_new_plan_flags: List[bool] = []
 
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
@@ -15403,18 +15436,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         logger.debug("tool-progress onboarding hint failed: %s", _hint_err)
 
                 if tool_name == "todo":
-                    # Todo completion: the result carries per-item wall-clock
-                    # durations the start card could not (args have no timing).
-                    # Re-render the card from the result and REPLACE the start
-                    # row in place, instead of appending a "· 0ms" suffix that
-                    # only measures the in-memory list write, not task time.
-                    # Skip when progress is off UNLESS todo_progress opted in —
-                    # in that case the start branch above (gated on the same
-                    # off+todo_progress_enabled condition) queued a card and a
-                    # merge flag, so we must supersede them here too. When
-                    # progress is fully off (no opt-in), nothing was queued, so
-                    # there is nothing to re-render.
-                    if progress_mode == "off" and not todo_progress_enabled:
+                    # Persistent cross-turn plan card supersedes the shared-bubble
+                    # append for the todo tool whenever todo_progress is on. The
+                    # result carries the full current list + per-item timing; the
+                    # card publisher edits ONE living message in place.
+                    if todo_progress_enabled:
+                        # B2: pop the new_plan FIFO UNCONDITIONALLY and FIRST.
+                        # A guardrail-appended result makes format_todo_progress
+                        # return None (json.loads fails); popping inside the
+                        # `if card:` branch would desync the FIFO for the rest of
+                        # the turn. Mirror the legacy pop-before-check ordering.
+                        _new_plan = (
+                            _todo_card_new_plan_flags.pop(0)
+                            if _todo_card_new_plan_flags else False
+                        )
+                        _todo_result = kwargs.get("result")
+                        _card = None
+                        _finished = False
+                        if _todo_result is not None:
+                            try:
+                                from gateway.todo_progress import (
+                                    format_todo_progress,
+                                    extract_todo_items,
+                                )
+                                from gateway.todo_card import todo_list_finished
+
+                                _card = format_todo_progress(
+                                    {"merge": False}, result=_todo_result
+                                )
+                                _finished = todo_list_finished(
+                                    extract_todo_items(_todo_result)
+                                )
+                            except Exception:
+                                _card = None
+                        # M4: do not enqueue None (unusable/guardrail result) —
+                        # leave the existing card untouched, do not clobber.
+                        if _card:
+                            last_was_terminal_block[0] = False
+                            progress_queue.put(
+                                ("__todo_card__", _card, _finished, _new_plan)
+                            )
+                        return
+                    # Legacy shared-bubble path (todo_progress off): the result
+                    # carries per-item wall-clock durations the start card could
+                    # not. Re-render and REPLACE the start row in place. Skip
+                    # entirely when progress is fully off (nothing was queued).
+                    if progress_mode == "off":
                         return
                     _merge_flag = _todo_merge_flags.pop(0) if _todo_merge_flags else False
                     _todo_done_card = None
@@ -15492,34 +15559,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     progress_queue.put(("__tool_start__", tool_name, _card))
                 return
 
-            # Todo plan card is INDEPENDENT of tool_progress, mirroring
-            # delegate_task_args: Telegram keeps tool_progress "off" (no general
-            # tool noise) yet still surfaces the multi-step plan + per-item
-            # status. Emit BEFORE the progress_mode=="off" guard below so the
-            # card isn't swallowed. Only fires in the off+opted-in case; when
-            # tool_progress is on, the normal todo path further down renders it
-            # (this branch is skipped) so the card is never double-emitted.
-            # Push the merge flag here so the completion re-render stays FIFO-
-            # aligned with the pop in the tool.completed branch (the normal-path
-            # push below is unreachable once this branch returns).
-            if (
-                tool_name == "todo"
-                and todo_progress_enabled
-                and progress_mode == "off"
-            ):
-                try:
-                    _todo_merge_flags.append(bool((args or {}).get("merge", False)))
-                except Exception:
-                    _todo_merge_flags.append(False)
-                try:
-                    from gateway.todo_progress import format_todo_progress
-
-                    _todo_card = format_todo_progress(args)
-                except Exception:
-                    _todo_card = None
-                if _todo_card:
-                    last_was_terminal_block[0] = False
-                    progress_queue.put(("__tool_start__", tool_name, _todo_card))
+            # Persistent todo plan card is INDEPENDENT of tool_progress,
+            # mirroring delegate_task_args. When enabled it SUPERSEDES the
+            # per-turn shared-bubble todo rendering (both off and on modes), so
+            # a todo call never appears twice. Placed BEFORE the
+            # progress_mode=="off" guard so it fires in todo-only mode too.
+            # The card itself renders on COMPLETION (the result is the
+            # authoritative full list; a merge=True start carries only changed
+            # items and would clobber the living plan). Here we only push the
+            # new_plan flag for the completion re-render and suppress every
+            # shared-bubble append for the todo tool.
+            if tool_name == "todo" and todo_progress_enabled:
+                _args = args or {}
+                _is_write = isinstance(_args.get("todos"), list)
+                _new_plan = _is_write and not bool(_args.get("merge", False))
+                _todo_card_new_plan_flags.append(_new_plan)
                 return
 
             if progress_mode == "off":
@@ -15869,6 +15923,60 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     roster.apply_event(raw)
                 except Exception as _roster_err:
                     logger.debug("roster apply_event failed: %s", _roster_err)
+
+            # ── Persistent cross-turn todo plan card (display.todo_progress) ──
+            # Edits ONE message id stored on self._todo_card_state[session_key]
+            # so the card lives across turns. This consumer is the single writer;
+            # the worker callback only enqueues "__todo_card__" sentinels. Edits
+            # are throttled + coalesced (latest snapshot wins) to stay under
+            # Telegram's per-chat edit flood ceiling, mirroring the roster. The
+            # force=True path (drain on turn-end) bypasses the throttle so a
+            # stashed terminal "all completed" card is never lost (B1).
+            from gateway.todo_card import (
+                publish_todo_card as _publish_todo_card_io,
+                TODO_CARD_EDIT_INTERVAL as _TODO_CARD_EDIT_INTERVAL,
+            )
+            _todo_card_last_edit = [0.0]
+            _todo_card_pending: list = [None]  # (text, finished, new_plan) or None
+            _todo_thread_sig = str(_progress_thread_id or "")
+
+            async def _flush_todo_card(text, finished, new_plan) -> None:
+                if not _run_still_current():
+                    return
+                try:
+                    await _publish_todo_card_io(
+                        adapter=adapter,
+                        store=self._todo_card_state,
+                        session_key=session_key or session_id or "",
+                        card_text=text,
+                        finished=finished,
+                        new_plan=new_plan,
+                        chat_id=source.chat_id,
+                        metadata=_progress_metadata,
+                        reply_to=_progress_reply_to,
+                        edit_accepts_metadata=_edit_accepts_metadata,
+                        thread_sig=_todo_thread_sig,
+                    )
+                    # Enforce the cap after a write (publish may have seeded a
+                    # new entry). Mirrors the _session_sources LRU bound.
+                    try:
+                        _cap = int(getattr(self, "_todo_card_state_max", 512) or 512)
+                        while len(self._todo_card_state) > _cap:
+                            self._todo_card_state.popitem(last=False)
+                    except Exception:
+                        pass
+                except Exception as _tc_err:
+                    logger.debug("todo plan card publish failed: %s", _tc_err)
+                _todo_card_last_edit[0] = time.monotonic()
+
+            async def _maybe_flush_todo_card() -> None:
+                """Flush a throttle-stashed snapshot (idle tick + drain)."""
+                if _todo_card_pending[0] is None:
+                    return
+                _p = _todo_card_pending[0]
+                _todo_card_pending[0] = None
+                await _flush_todo_card(*_p)
+
 
 
             _progress_len_fn = (
@@ -16311,6 +16419,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             if _replace_pending_tool_line(_todo_tool_name, _todo_card) is None:
                                 progress_lines.append(str(_todo_card))
                             await _roll_progress_overflow_if_needed()
+                        elif isinstance(raw, tuple) and len(raw) == 4 and raw[0] == "__todo_card__":
+                            # Persistent plan card during drain: flush directly
+                            # (force=True bypasses the throttle below). Stash the
+                            # latest so the post-loop force-flush sends it once.
+                            _, _tc_text, _tc_finished, _tc_new_plan = raw
+                            _todo_card_pending[0] = (_tc_text, _tc_finished, _tc_new_plan)
                         elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
                             # Content-bubble marker during drain: close off the
                             # current bubble but carry in-flight tool rows so a
@@ -16352,6 +16466,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await _publish_roster(force=True, collapsed=True, allow_seed=True)
                     except Exception:
                         pass
+
+                # B1: force-flush any throttle-stashed plan card on the way out.
+                # The final all-completed card often lands <1.5s after the prior
+                # edit, so it sits in _todo_card_pending and would be lost on
+                # turn-end without this. force semantics: _maybe_flush_todo_card
+                # bypasses the live-loop throttle (it only gates enqueue, not the
+                # flush itself), so the terminal state always lands.
+                try:
+                    await _maybe_flush_todo_card()
+                except Exception:
+                    pass
 
             while True:
                 try:
@@ -16409,6 +16534,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _apply_roster_event(raw)
                         await _maybe_tick_roster()
                         continue
+
+                    # Persistent todo plan card: edit the ONE living message in
+                    # place. Throttle + coalesce so a burst of todo calls in one
+                    # turn does not flood edits; the idle tick + drain flush the
+                    # latest stashed snapshot. Like the roster, it owns a SEPARATE
+                    # message and never enters progress_lines.
+                    if isinstance(raw, tuple) and len(raw) == 4 and raw[0] == "__todo_card__":
+                        _, _tc_text, _tc_finished, _tc_new_plan = raw
+                        if (time.monotonic() - _todo_card_last_edit[0]) < _TODO_CARD_EDIT_INTERVAL:
+                            _todo_card_pending[0] = (_tc_text, _tc_finished, _tc_new_plan)
+                            continue
+                        _todo_card_pending[0] = None
+                        await _flush_todo_card(_tc_text, _tc_finished, _tc_new_plan)
+                        continue
+
                     if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                         # NOTE: this rewrites progress_lines[-1] in place. A
                         # subagent tool card (queued as a 5-tuple "__tool_start__"
@@ -16596,6 +16736,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # change-gated inside _maybe_tick_roster.
                     try:
                         await _maybe_tick_roster()
+                    except Exception:
+                        pass
+                    # Idle: flush a throttle-stashed plan card snapshot so a
+                    # within-throttle update lands during a quiet stretch instead
+                    # of waiting for the next todo call or turn-end drain.
+                    try:
+                        await _maybe_flush_todo_card()
                     except Exception:
                         pass
                     # A cancellation can land while we idle here.  The sleep is
