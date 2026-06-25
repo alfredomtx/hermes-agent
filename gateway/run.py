@@ -249,22 +249,25 @@ def _tool_progress_pipeline_enabled(
     subagent_progress_enabled: bool,
     delegate_task_args_enabled: bool,
     subagent_roster_enabled: bool = False,
+    todo_progress_enabled: bool = False,
 ) -> bool:
     """Decide whether the gateway tool-progress pipeline must stay alive.
 
     The progress queue/consumer is normally torn down when ``tool_progress``
     is ``"off"``. Several features still need the pipeline even then:
     completion durations, subagent tool visibility, ``delegate_task_args``
-    (surface delegate_task call parameters WITHOUT general tool noise), and the
-    live subagent ROSTER bubble. Webhooks never get tool progress (no message
-    editing). Extracted as a pure function so these wiring gaps are
-    unit-testable. ``subagent_roster_enabled`` defaults False for back-compat
-    with existing callers/tests.
+    (surface delegate_task call parameters WITHOUT general tool noise), the
+    live subagent ROSTER bubble, and ``todo_progress`` (surface the todo plan
+    card WITHOUT general tool noise). Webhooks never get tool progress (no
+    message editing). Extracted as a pure function so these wiring gaps are
+    unit-testable. ``subagent_roster_enabled`` / ``todo_progress_enabled``
+    default False for back-compat with existing callers/tests.
 
     NOTE: the result gates PIPELINE creation, NOT whether ordinary tool rows
     render. ``progress_mode`` remains the sole source of truth for tool rows
     (the ``progress_mode == "off"`` guard in ``progress_callback``). So
-    roster-only mode keeps the queue/consumer alive without leaking tool rows.
+    roster-only / todo-only mode keeps the queue/consumer alive without
+    leaking other tool rows.
     """
     if is_webhook:
         return False
@@ -274,6 +277,7 @@ def _tool_progress_pipeline_enabled(
         or subagent_progress_enabled
         or delegate_task_args_enabled
         or subagent_roster_enabled
+        or todo_progress_enabled
     )
 
 
@@ -17026,6 +17030,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception:
             subagent_roster_enabled = False
+        # Todo plan card is an independent opt-in: it must keep the progress
+        # pipeline alive even when tool_progress is "off" (the Telegram
+        # default), exactly like delegate_task_args / subagent_roster. Resolved
+        # once here so it gates both pipeline creation and the todo branches in
+        # progress_callback below. Only renders on edit-capable adapters; the
+        # consumer no-ops on platforms without message editing.
+        try:
+            todo_progress_enabled = is_truthy_value(
+                resolve_display_setting(
+                    user_config,
+                    platform_key,
+                    "todo_progress",
+                    False,
+                ),
+                default=False,
+            )
+        except Exception:
+            todo_progress_enabled = False
         progress_pipeline_enabled = _tool_progress_pipeline_enabled(
             is_webhook=(source.platform == Platform.WEBHOOK),
             progress_mode=progress_mode,
@@ -17033,6 +17055,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             subagent_progress_enabled=subagent_progress_enabled,
             delegate_task_args_enabled=delegate_task_args_enabled,
             subagent_roster_enabled=subagent_roster_enabled,
+            todo_progress_enabled=todo_progress_enabled,
         )
         # "log" mode: tool calls are written to ~/.hermes/logs/tool_calls.log
         # instead of the chat (#3459 / #3458). Gateway-only by design.
@@ -17349,10 +17372,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Re-render the card from the result and REPLACE the start
                     # row in place, instead of appending a "· 0ms" suffix that
                     # only measures the in-memory list write, not task time.
-                    # Skip entirely when progress is off — the start branch
-                    # (gated on progress_mode below) never queued a card or a
-                    # merge flag, so there is nothing to supersede.
-                    if progress_mode == "off":
+                    # Skip when progress is off UNLESS todo_progress opted in —
+                    # in that case the start branch above (gated on the same
+                    # off+todo_progress_enabled condition) queued a card and a
+                    # merge flag, so we must supersede them here too. When
+                    # progress is fully off (no opt-in), nothing was queued, so
+                    # there is nothing to re-render.
+                    if progress_mode == "off" and not todo_progress_enabled:
                         return
                     _merge_flag = _todo_merge_flags.pop(0) if _todo_merge_flags else False
                     _todo_done_card = None
@@ -17428,6 +17454,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 last_was_terminal_block[0] = False
                 for _card in _format_delegate_task_args_progress(args):
                     progress_queue.put(("__tool_start__", tool_name, _card))
+                return
+
+            # Todo plan card is INDEPENDENT of tool_progress, mirroring
+            # delegate_task_args: Telegram keeps tool_progress "off" (no general
+            # tool noise) yet still surfaces the multi-step plan + per-item
+            # status. Emit BEFORE the progress_mode=="off" guard below so the
+            # card isn't swallowed. Only fires in the off+opted-in case; when
+            # tool_progress is on, the normal todo path further down renders it
+            # (this branch is skipped) so the card is never double-emitted.
+            # Push the merge flag here so the completion re-render stays FIFO-
+            # aligned with the pop in the tool.completed branch (the normal-path
+            # push below is unreachable once this branch returns).
+            if (
+                tool_name == "todo"
+                and todo_progress_enabled
+                and progress_mode == "off"
+            ):
+                try:
+                    _todo_merge_flags.append(bool((args or {}).get("merge", False)))
+                except Exception:
+                    _todo_merge_flags.append(False)
+                try:
+                    from gateway.todo_progress import format_todo_progress
+
+                    _todo_card = format_todo_progress(args)
+                except Exception:
+                    _todo_card = None
+                if _todo_card:
+                    last_was_terminal_block[0] = False
+                    progress_queue.put(("__tool_start__", tool_name, _todo_card))
                 return
 
             if progress_mode == "off":

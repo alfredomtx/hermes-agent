@@ -88,6 +88,13 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     # well under the ceiling. The final collapse (force) bypasses this throttle
     # so the terminal state always lands. Clamped to a 1.0s floor.
     "subagent_roster_interval": 10.0,
+    # Surface the `todo` tool's plan/status card in gateway progress WITHOUT
+    # turning on general tool_progress. Mirrors delegate_task_args: a single
+    # tool's card is rendered even when tool_progress is "off" (the Telegram
+    # default), so the multi-step plan + per-item status/timing shows up
+    # without the rest of the tool noise. Binary on/off; off by default.
+    # Only renders on edit-capable adapters; harmless no-op elsewhere.
+    "todo_progress": "off",
 }
 
 # ---------------------------------------------------------------------------
@@ -299,7 +306,7 @@ def _normalise(setting: str, value: Any) -> Any:
             return "off"
         v = str(value).strip().lower()
         return v if v in {"off", "batched", "full"} else "off"
-    if setting == "subagent_roster":
+    if setting in {"subagent_roster", "todo_progress"}:
         # Binary on/off. Accept YAML 1.1 booleans (bare on->True, off->False).
         # Unknown strings fail safe to "off".
         if value is True:
