@@ -23,7 +23,6 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from gateway.duration_format import format_duration
 
 # Throttle for roster bubble edits, in seconds. Module constant so it is defined
 # once and imported by the consumer (never re-declared locally). Set to 10s:
@@ -60,8 +59,32 @@ def resolve_roster_interval(user_config: Any, platform_key: str) -> float:
     except Exception:
         return ROSTER_EDIT_INTERVAL
 
-_LABEL_CAP = 100
+_LABEL_CAP = 80
 _MAX_ROWS = 10
+
+
+def format_elapsed(seconds: float) -> str:
+    """Human elapsed for a roster row: ``3m 9s`` / ``45s`` / ``1h 2m``.
+
+    Distinct from ``gateway.duration_format.format_duration`` (clock-style
+    ``M:SS``), which is shared with media/audio durations and must stay
+    clock-style. Here seconds are NOT zero-padded (``3m 9s``, not ``3m 09s``)
+    and a trailing zero unit is dropped (``1m``, not ``1m 0s``). Clamps < 0.
+    """
+    try:
+        total = int(round(float(seconds)))
+    except (TypeError, ValueError):
+        total = 0
+    if total < 0:
+        total = 0
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        out = f"{hours}h {minutes}m"
+        return f"{out} {secs}s" if secs else out
+    if minutes:
+        return f"{minutes}m {secs}s" if secs else f"{minutes}m"
+    return f"{secs}s"
 
 
 def shorten_model(model: Optional[str]) -> str:
@@ -145,8 +168,12 @@ _UNKNOWN_GLYPH = ("?", "errored")
 
 
 def roster_label(goal: Optional[str]) -> str:
-    """Collapse whitespace/newlines and hard-cap a child goal for one row."""
-    text = " ".join(str(goal or "").split())
+    """Collapse whitespace/newlines and hard-cap a child goal for one row.
+
+    Backticks are stripped: the label is rendered inside an inline code span
+    (`` `label` ``) so a stray backtick would break the span on Telegram.
+    """
+    text = " ".join(str(goal or "").replace("`", "").split())
     if not text:
         return "subagent"
     if len(text) > _LABEL_CAP:
@@ -346,7 +373,7 @@ def format_subagent_roster(rows: List[Dict[str, Any]], *, collapsed: bool = Fals
             head_parts.append(f"{len(done)} ✓")
         if failed_total:
             head_parts.append(f"{len(failed_total)} ✗")
-        head_parts.append(format_duration(span))
+        head_parts.append(format_elapsed(span))
         head = " · ".join(head_parts)
 
         lines = [head]
@@ -356,8 +383,8 @@ def format_subagent_roster(rows: List[Dict[str, Any]], *, collapsed: bool = Fals
             # shown with its live glyph; terminal rows keep ✓/✗/⏱/⏹. Tool count
             # is kept on done rows too, not dropped when running flips to False.
             line = (
-                f"{r['glyph']} {r['label']}{_model_suffix(r)}"
-                f" · {format_duration(r['elapsed'])}{_tools_suffix(r)}"
+                f"{r['glyph']} `{r['label']}`{_model_suffix(r)}"
+                f" · {format_elapsed(r['elapsed'])}{_tools_suffix(r)}"
             )
             lines.append(line)
         extra = len(rows) - len(shown)
@@ -377,8 +404,8 @@ def format_subagent_roster(rows: List[Dict[str, Any]], *, collapsed: bool = Fals
     shown = rows[:_MAX_ROWS]
     for r in shown:
         line = (
-            f"{r['glyph']} {r['label']}{_model_suffix(r)}"
-            f" · {format_duration(r['elapsed'])}{_tools_suffix(r)}"
+            f"{r['glyph']} `{r['label']}`{_model_suffix(r)}"
+            f" · {format_elapsed(r['elapsed'])}{_tools_suffix(r)}"
         )
         lines.append(line)
     extra = len(rows) - len(shown)
