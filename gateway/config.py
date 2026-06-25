@@ -456,6 +456,17 @@ class StreamingConfig:
 # DEFAULT_CONFIG, and the load_gateway_config bridge agree.
 DEFAULT_TOPIC_BACKFILL_MAX_MESSAGES: int = 15
 DEFAULT_TOPIC_BACKFILL_MAX_AGE_HOURS: int = 24
+# Second source: raw Bot-API topic posts (cron digests, watchdog alerts, the
+# review bridge) logged by local scripts. These never create a Hermes session
+# or state.db row, so the SessionDB-sibling scan is blind to them.
+DEFAULT_TOPIC_BACKFILL_RECENT_POSTS_ENABLED: bool = True
+# NOTE: these two caps are READ/RENDER-side knobs only. The pure-stdlib writer
+# (~/.hermes/scripts/tg_topic_recent_posts.py) cannot import gateway config, so
+# it carries its OWN hardcoded storage caps (MAX_ENTRIES / RETENTION_HOURS).
+# These values gate how many log rows the reader considers and are otherwise
+# bounded by max_messages / max_age_hours on the combined set.
+DEFAULT_TOPIC_BACKFILL_RECENT_POSTS_MAX_ENTRIES: int = 200
+DEFAULT_TOPIC_BACKFILL_RECENT_POSTS_RETENTION_HOURS: int = 168
 
 
 @dataclass
@@ -464,19 +475,30 @@ class TopicBackfillConfig:
 
     When a Telegram message opens a NEW session in a SHARED topic/group, the
     adapter pulls recent text from OTHER Hermes sessions in the same topic
-    (platform+chat_id+thread_id) out of state.db and sets it as the event's
-    ``channel_context`` so the fresh session has the prior topic activity.
-    Mirrors the Discord ``_fetch_channel_context`` delivery seam.
+    (platform+chat_id+thread_id) out of state.db AND from the per-topic
+    raw-Bot-API recent-posts log, and sets it as the event's ``channel_context``
+    so the fresh session has the prior topic activity. Mirrors the Discord
+    ``_fetch_channel_context`` delivery seam.
     """
     enabled: bool = True
     max_messages: int = DEFAULT_TOPIC_BACKFILL_MAX_MESSAGES
     max_age_hours: int = DEFAULT_TOPIC_BACKFILL_MAX_AGE_HOURS
+
+    # Second source: raw Bot-API topic posts logged by local scripts. The
+    # ``recent_posts_enabled`` master switch gates the source; the two caps are
+    # read/render-side only (the pure-stdlib writer has its own storage caps).
+    recent_posts_enabled: bool = DEFAULT_TOPIC_BACKFILL_RECENT_POSTS_ENABLED
+    recent_posts_max_entries: int = DEFAULT_TOPIC_BACKFILL_RECENT_POSTS_MAX_ENTRIES
+    recent_posts_retention_hours: int = DEFAULT_TOPIC_BACKFILL_RECENT_POSTS_RETENTION_HOURS
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "enabled": self.enabled,
             "max_messages": self.max_messages,
             "max_age_hours": self.max_age_hours,
+            "recent_posts_enabled": self.recent_posts_enabled,
+            "recent_posts_max_entries": self.recent_posts_max_entries,
+            "recent_posts_retention_hours": self.recent_posts_retention_hours,
         }
 
     @classmethod
@@ -490,6 +512,18 @@ class TopicBackfillConfig:
             ),
             max_age_hours=_coerce_int(
                 data.get("max_age_hours"), DEFAULT_TOPIC_BACKFILL_MAX_AGE_HOURS,
+            ),
+            recent_posts_enabled=_coerce_bool(
+                data.get("recent_posts_enabled"),
+                DEFAULT_TOPIC_BACKFILL_RECENT_POSTS_ENABLED,
+            ),
+            recent_posts_max_entries=_coerce_int(
+                data.get("recent_posts_max_entries"),
+                DEFAULT_TOPIC_BACKFILL_RECENT_POSTS_MAX_ENTRIES,
+            ),
+            recent_posts_retention_hours=_coerce_int(
+                data.get("recent_posts_retention_hours"),
+                DEFAULT_TOPIC_BACKFILL_RECENT_POSTS_RETENTION_HOURS,
             ),
         )
 

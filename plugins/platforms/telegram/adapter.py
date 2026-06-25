@@ -7063,6 +7063,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 exclude_session_id=current_session_id,
                 max_messages=getattr(cfg, "max_messages", 15),
                 max_age_hours=getattr(cfg, "max_age_hours", 24),
+                include_bot_posts=getattr(cfg, "recent_posts_enabled", True),
             )
         except Exception as e:
             logger.debug("[%s] topic backfill skipped: %s", getattr(self, "name", "telegram"), e)
