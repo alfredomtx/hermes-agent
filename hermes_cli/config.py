@@ -2848,6 +2848,25 @@ DEFAULT_CONFIG = {
             # request flood. Set to 0 to disable the cap entirely.
             "max_concurrent_runs": 10,
         },
+        # Shared-topic context backfill. When a Telegram message opens a NEW
+        # session in a SHARED topic/group, pull recent text from OTHER Hermes
+        # sessions in the same topic (platform+chat_id+thread_id) out of
+        # state.db and inject it as the fresh session's channel_context, so a
+        # new topic session starts with the prior topic activity (e.g. the
+        # dual-review bridge / cron posts that never arrive as bot updates).
+        # Mirrors the Discord channel-history backfill but sourced from the
+        # local session DB since the Telegram Bot API cannot fetch topic
+        # history. DMs and established (non-empty) sessions are never
+        # backfilled. Read via gateway.topic_backfill in load_gateway_config.
+        "topic_backfill": {
+            # Master switch. When false, no backfill block is ever produced.
+            "enabled": True,
+            # Cap on how many of the most recent merged topic messages are
+            # rendered into the backfill block.
+            "max_messages": 15,
+            # Only messages newer than this many hours are considered.
+            "max_age_hours": 24,
+        },
     },
 
     # Real-time token streaming to messaging platforms (Telegram, Discord,

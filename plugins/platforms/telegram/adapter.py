@@ -8153,6 +8153,13 @@ class TelegramAdapter(BasePlatformAdapter):
             _chat_id_str if thread_id_str else None,
         )
 
+        # Shared-topic context backfill. When this message opens a NEW session
+        # window in a SHARED topic/group, pull recent activity from OTHER
+        # Hermes sessions bound to the same topic out of state.db and hand it
+        # to the run.py channel_context fold (mirrors Discord adapter.py:5560).
+        # DMs and established (non-empty transcript) sessions never backfill.
+        _channel_context = self._compute_topic_backfill_context(source)
+
         return MessageEvent(
             text=message.text or "",
             message_type=msg_type,
@@ -8164,8 +8171,107 @@ class TelegramAdapter(BasePlatformAdapter):
             reply_to_text=reply_to_text,
             auto_skill=topic_skill,
             channel_prompt=_channel_prompt,
+            channel_context=_channel_context,
             timestamp=message.date,
         )
+
+    def _compute_topic_backfill_context(self, source) -> Optional[str]:
+        """Return a shared-topic backfill block for a new-session message.
+
+        Gated on: shared multi-user session (skips DMs), ``topic_backfill``
+        enabled in gateway config, and a NEW-session window detected via the
+        session store (OPTION A: empty/absent transcript for this topic's
+        session key). Established sessions (non-empty transcript) skip so the
+        block is only injected once, at the start of a topic session.
+
+        Never raises — returns ``None`` on any error so message handling is
+        never broken by a backfill failure.
+        """
+        try:
+            from gateway.session import is_shared_multi_user_session
+
+            group_per_user = self.config.extra.get("group_sessions_per_user", True)
+            thread_per_user = self.config.extra.get("thread_sessions_per_user", False)
+
+            if not is_shared_multi_user_session(
+                source,
+                group_sessions_per_user=group_per_user,
+                thread_sessions_per_user=thread_per_user,
+            ):
+                return None
+
+            # Resolve the topic_backfill config block.
+            try:
+                from gateway.config import load_gateway_config
+
+                _gw_cfg = load_gateway_config()
+                cfg = getattr(_gw_cfg, "topic_backfill", None)
+            except Exception:
+                cfg = None
+            if cfg is None or not getattr(cfg, "enabled", False):
+                return None
+
+            # OPTION A: new-session-window detection via the session store,
+            # READ-ONLY. We must NOT call get_or_create_session here: that
+            # bumps the entry's updated_at, so run.py's later
+            # get_or_create_session reuse path sets updated_at > created_at and
+            # _is_new_session (created_at == updated_at) flips to False on the
+            # very first message — suppressing the session:start hook and the
+            # first-turn skill/channel-prompt injection. Peek the existing
+            # entry instead and only read its transcript.
+            store = getattr(self, "_session_store", None)
+            if store is None:
+                # No session-store handle — cannot tell new from established,
+                # so do not risk re-injecting into an active session.
+                return None
+
+            # Resolve this source's session key the same way the store does,
+            # then peek the entry WITHOUT creating/mutating it.
+            try:
+                session_key = store._generate_session_key(source)
+            except Exception:
+                return None
+            entry = None
+            try:
+                with store._lock:
+                    store._ensure_loaded_locked()
+                    entry = store._entries.get(session_key)
+            except Exception:
+                entry = None
+
+            current_session_id = getattr(entry, "session_id", None) if entry else None
+
+            # Brand-new key (no entry yet) is a new window by definition.
+            # An existing entry is a new window only if its transcript has no
+            # real (non-observed) user/assistant turns yet.
+            if entry is not None:
+                try:
+                    transcript = store.load_transcript(current_session_id)
+                except Exception:
+                    transcript = []
+                real_turns = [
+                    m for m in (transcript or [])
+                    if isinstance(m, dict)
+                    and m.get("role") in ("user", "assistant")
+                    and not m.get("observed")
+                ]
+                if real_turns:
+                    # Established session: inject only once, at window start.
+                    return None
+
+            from gateway.topic_backfill import build_topic_backfill
+
+            return build_topic_backfill(
+                platform="telegram",
+                chat_id=str(source.chat_id),
+                thread_id=source.thread_id,
+                exclude_session_id=current_session_id,
+                max_messages=getattr(cfg, "max_messages", 15),
+                max_age_hours=getattr(cfg, "max_age_hours", 24),
+            )
+        except Exception as e:
+            logger.debug("[%s] topic backfill skipped: %s", getattr(self, "name", "telegram"), e)
+            return None
 
     # ── Message reactions (processing lifecycle) ──────────────────────────
 
