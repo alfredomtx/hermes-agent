@@ -186,3 +186,83 @@ class TestHealDeadThread:
         seed = hermes_home / "state" / "topic-seeds" / "777.json"
         assert json.loads(seed.read_text())["seed_text"] == "ctx seed"
         assert load_jobs()[0]["deliver"] == "telegram:-100:777"
+
+    def test_concurrent_colocated_jobs_create_one_topic(self, hermes_home):
+        """BLOCKER B1 regression: two co-located jobs healing the SAME dead thread
+        must NOT each recreate a topic. The lock + live-thread re-read means the
+        second job reuses the first's new thread."""
+        import threading
+        from cron.jobs import save_jobs, load_jobs
+        from cron import topic_heal
+
+        save_jobs([
+            {"id": "a", "enabled": True, "deliver": "telegram:-100:500",
+             "origin": {"platform": "telegram", "chat_id": "-100", "thread_id": "500"},
+             "telegram_topic": {"name": "Slack Monitor", "seed": "ctx", "icon_emoji_id": "9"},
+             "schedule": {"kind": "interval", "minutes": 30}},
+            {"id": "b", "enabled": True, "deliver": "telegram:-100:500",
+             "origin": {"platform": "telegram", "chat_id": "-100", "thread_id": "500"},
+             "telegram_topic": {"name": "Slack Monitor", "seed": "ctx", "icon_emoji_id": "9"},
+             "schedule": {"kind": "interval", "minutes": 30}},
+        ])
+
+        created = []
+        gate = threading.Barrier(2)
+
+        # recreate_topic returns a NEW id each call + records it; if both threads
+        # call it, we'd see 2 ids (the bug). The lock+re-read must limit it to 1.
+        counter = {"n": 0}
+        clock = threading.Lock()
+
+        def fake_recreate(chat_id, meta, *, adapter=None, loop=None, token=None):
+            with clock:
+                counter["n"] += 1
+                tid = 800 + counter["n"]
+            created.append(tid)
+            return tid
+
+        # Both threads start from the SAME stale snapshot (thread 500).
+        job_a = dict(load_jobs()[0])
+        job_b = dict(load_jobs()[1])
+
+        results = {}
+
+        def run(job, key):
+            gate.wait()  # maximize overlap
+            results[key] = topic_heal.heal_dead_thread(job, "-100", "500", token="tok")
+
+        orig = topic_heal.recreate_topic
+        topic_heal.recreate_topic = fake_recreate
+        try:
+            t1 = threading.Thread(target=run, args=(job_a, "a"))
+            t2 = threading.Thread(target=run, args=(job_b, "b"))
+            t1.start(); t2.start(); t1.join(); t2.join()
+        finally:
+            topic_heal.recreate_topic = orig
+
+        # Exactly ONE topic created; both jobs converge on it.
+        assert len(created) == 1, f"expected 1 recreate, got {created}"
+        assert results["a"] == results["b"] == created[0]
+        by_id = {j["id"]: j for j in load_jobs()}
+        assert by_id["a"]["deliver"] == f"telegram:-100:{created[0]}"
+        assert by_id["b"]["deliver"] == f"telegram:-100:{created[0]}"
+
+
+class TestMultiTargetRepoint:
+    """CONCERN C1 regression: a co-located job whose dead thread is its SECOND
+    (non-first) target must still be repointed."""
+
+    def test_dead_thread_in_second_target_is_repointed(self, hermes_home):
+        from cron.jobs import save_jobs, load_jobs
+        from cron.topic_heal import repoint_colocated_jobs
+
+        save_jobs([
+            {"id": "multi", "enabled": True,
+             "deliver": "telegram:-100:999,telegram:-100:500",  # dead 500 is SECOND
+             "origin": {}, "schedule": {"kind": "interval", "minutes": 30}},
+        ])
+        repointed = repoint_colocated_jobs("-100", "500", 777, {"name": "T", "seed": "s"})
+        assert repointed == ["multi"]
+        # Only the dead part rewritten; the other target preserved.
+        assert load_jobs()[0]["deliver"] == "telegram:-100:999,telegram:-100:777"
+

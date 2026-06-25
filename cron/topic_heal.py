@@ -40,6 +40,7 @@ import concurrent.futures
 import json
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -208,12 +209,41 @@ def _run_on_gateway_loop(coro, loop, timeout: int = 30):
 
 
 def _run_standalone(coro_factory, timeout: int = 30):
-    """Run an async coro factory in a fresh event loop, safe from any thread."""
+    """Run an async coro factory in a fresh event loop, safe from any thread.
+
+    Only the 'event loop is already running' RuntimeError is handled by retrying
+    in a worker thread; any other RuntimeError (raised by the coroutine itself) is
+    re-raised so a real error is not silently retried (which could double a
+    create/delete side effect).
+    """
     try:
         return asyncio.run(coro_factory())
-    except RuntimeError:
+    except RuntimeError as e:
+        if "running event loop" not in str(e).lower() and "cannot be called from a running" not in str(e).lower():
+            raise
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             return pool.submit(asyncio.run, coro_factory()).result(timeout=timeout)
+
+
+def _standalone_bot(token):
+    """Build a Telegram Bot honoring the configured proxy, mirroring
+    tools.send_message_tool._send_telegram so standalone recreate works in
+    proxy-required regions (without a proxy the create would fail and every fire
+    would fall back to the group root)."""
+    from telegram import Bot
+    try:
+        from gateway.platforms.base import resolve_proxy_url
+        proxy = resolve_proxy_url("TELEGRAM_PROXY", target_hosts=["api.telegram.org"])
+    except Exception:
+        proxy = None
+    if proxy:
+        try:
+            from telegram.request import HTTPXRequest
+            return Bot(token=token, request=HTTPXRequest(proxy=proxy),
+                       get_updates_request=HTTPXRequest(proxy=proxy))
+        except Exception:
+            pass
+    return Bot(token=token)
 
 
 def recreate_topic(
@@ -263,8 +293,7 @@ def recreate_topic(
 
 
 async def _standalone_create(token, chat_id, name, icon_color, icon_emoji_id) -> Optional[int]:
-    from telegram import Bot
-    bot = Bot(token=token)
+    bot = _standalone_bot(token)
     kwargs: Dict[str, Any] = {"chat_id": int(chat_id), "name": str(name).strip()[:128]}
     if icon_color is not None:
         kwargs["icon_color"] = int(icon_color)
@@ -338,6 +367,33 @@ def _rewrite_deliver(job: dict, chat_id: str, old_tid: str, new_tid) -> Tuple[st
     return ",".join(new_parts), origin
 
 
+def _job_targets_thread(job: dict, chat_id: str, old_tid: str) -> bool:
+    """True if ANY of the job's delivery targets resolves to (chat_id, old_tid).
+
+    Unlike _resolved_target (first telegram part only), this scans EVERY comma
+    part plus the origin re-inherit, so a co-located job whose dead thread is its
+    SECOND target is still matched and repointed. _rewrite_deliver then rewrites
+    only the matching part(s).
+    """
+    chat_id = str(chat_id)
+    old_tid = str(old_tid)
+    deliver = str(job.get("deliver") or "")
+    origin = job.get("origin")
+    if not isinstance(origin, dict):
+        origin = {}
+    ochat = origin.get("chat_id")
+    otid = origin.get("thread_id")
+    for part in [p.strip() for p in deliver.split(",") if p.strip()]:
+        bits = part.split(":")
+        if len(bits) == 3 and bits[0] == "telegram":
+            if str(bits[1] or ochat) == chat_id and str(bits[2]) == old_tid:
+                return True
+        elif part in ("origin", origin.get("platform")):
+            if ochat is not None and otid is not None and str(ochat) == chat_id and str(otid) == old_tid:
+                return True
+    return False
+
+
 def repoint_colocated_jobs(chat_id: str, old_tid: str, new_tid: int, meta: Dict[str, Any]) -> List[str]:
     """Repoint every enabled job targeting (chat_id, old_tid) to new_tid and copy
     the topic metadata onto them so they can self-heal independently next time.
@@ -356,8 +412,9 @@ def repoint_colocated_jobs(chat_id: str, old_tid: str, new_tid: int, meta: Dict[
     for job in load_jobs():
         if not job.get("enabled", True):
             continue
-        c, t = _resolved_target(job)
-        if c is None or t is None or str(c) != chat_id or str(t) != old_tid:
+        # Scan ALL targets (not just the first) so a dead thread in a non-first
+        # multi-target slot is still repointed.
+        if not _job_targets_thread(job, chat_id, old_tid):
             continue
         new_deliver, new_origin = _rewrite_deliver(job, chat_id, old_tid, new_tid)
         updates: Dict[str, Any] = {"deliver": new_deliver, TELEGRAM_TOPIC_FIELD: topic_block}
@@ -372,6 +429,44 @@ def repoint_colocated_jobs(chat_id: str, old_tid: str, new_tid: int, meta: Dict[
 
 
 # --- orchestrator -------------------------------------------------------------
+
+# Per-(chat, old_thread) locks serialize heal attempts ACROSS the parallel cron
+# pool (threads in one process — see cron/scheduler._parallel_pool). Without this,
+# two co-located jobs (e.g. a monitor + its watchdog on one topic) firing in the
+# same tick both recreate the topic -> duplicate orphan topics + split delivery.
+_heal_locks: Dict[Tuple[str, str], threading.Lock] = {}
+_heal_locks_guard = threading.Lock()
+
+
+def _heal_lock(chat_id: str, old_thread_id: str) -> threading.Lock:
+    key = (str(chat_id), str(old_thread_id))
+    with _heal_locks_guard:
+        lock = _heal_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _heal_locks[key] = lock
+        return lock
+
+
+def _live_thread_for_job(job_id, chat_id: str) -> Optional[str]:
+    """Re-read the job's CURRENTLY persisted Telegram thread for chat_id from disk.
+
+    Used inside the heal lock to detect that a co-located sibling already healed
+    this topic (the job's deliver was repointed off the dead thread), so we return
+    that fresh thread instead of recreating a duplicate.
+    """
+    try:
+        from cron.jobs import load_jobs
+        for j in load_jobs():
+            if j.get("id") != job_id:
+                continue
+            c, t = _resolved_target(j)
+            if c is not None and str(c) == str(chat_id):
+                return str(t) if t is not None else None
+    except Exception:
+        return None
+    return None
+
 
 def heal_dead_thread(
     job: dict,
@@ -388,6 +483,11 @@ def heal_dead_thread(
     the caller then keeps the legacy group-root fallback so an alert is not lost.
     On a seed-write failure the just-created topic is rolled back (deleted) and
     None is returned, so we never deliver into an unseeded (context-blind) topic.
+
+    Concurrency-safe: serialized per (chat, old_thread). Inside the lock it
+    re-reads the job's live persisted thread; if a co-located sibling already
+    recreated the topic this tick, it returns that fresh thread WITHOUT creating
+    a duplicate.
     """
     meta = topic_metadata_for_job(job)
     if not meta:
@@ -397,28 +497,45 @@ def heal_dead_thread(
         )
         return None
 
-    new_tid = recreate_topic(chat_id, meta, adapter=adapter, loop=loop, token=token)
-    if not new_tid:
-        return None
+    with _heal_lock(chat_id, old_thread_id):
+        # Another co-located job may have already healed this topic while we
+        # waited on the lock. If THIS job's persisted thread moved off the dead
+        # one, reuse it instead of recreating a duplicate.
+        live = _live_thread_for_job(job.get("id"), chat_id)
+        if live and str(live) != str(old_thread_id):
+            try:
+                logger.info(
+                    "topic_heal: job '%s' dead thread %s already healed -> %s (sibling); reusing",
+                    job.get("id"), old_thread_id, live,
+                )
+                return int(live)
+            except (TypeError, ValueError):
+                return None
 
-    # Seed BEFORE repoint so the sidecar exists the instant the topic is live.
-    if not write_topic_seed(new_tid, meta["seed"]):
-        # Roll back the just-created (unseeded) topic; do not deliver context-blind.
-        _rollback_topic(chat_id, new_tid, adapter=adapter, loop=loop, token=token)
+        new_tid = recreate_topic(chat_id, meta, adapter=adapter, loop=loop, token=token)
+        if not new_tid:
+            return None
+
+        # Seed BEFORE repoint so the sidecar exists the instant the topic is live.
+        if not write_topic_seed(new_tid, meta["seed"]):
+            # Roll back the just-created (unseeded) topic; do not deliver context-blind.
+            _rollback_topic(chat_id, new_tid, adapter=adapter, loop=loop, token=token)
+            logger.warning(
+                "topic_heal: seed write failed for new thread %s; rolled back, no repoint", new_tid,
+            )
+            return None
+
+        repointed = repoint_colocated_jobs(chat_id, old_thread_id, new_tid, meta)
         logger.warning(
-            "topic_heal: seed write failed for new thread %s; rolled back, no repoint", new_tid,
+            "topic_heal: recreated topic '%s' (dead %s -> %s); repointed %s",
+            meta["name"], old_thread_id, new_tid, ", ".join(repointed) or "(none)",
         )
-        return None
-
-    repointed = repoint_colocated_jobs(chat_id, old_thread_id, new_tid, meta)
-    logger.warning(
-        "topic_heal: recreated topic '%s' (dead %s -> %s); repointed %s",
-        meta["name"], old_thread_id, new_tid, ", ".join(repointed) or "(none)",
-    )
-    return int(new_tid)
+        return int(new_tid)
 
 
 def _rollback_topic(chat_id, thread_id, *, adapter=None, loop=None, token=None) -> None:
+    """Best-effort delete of a just-created topic (seed-write failed). Live adapter
+    first, else a standalone Bot call."""
     if (
         adapter is not None and loop is not None
         and getattr(loop, "is_running", lambda: False)()
@@ -431,8 +548,7 @@ def _rollback_topic(chat_id, thread_id, *, adapter=None, loop=None, token=None) 
             logger.debug("topic_heal: live rollback delete failed for %s:%s", chat_id, thread_id, exc_info=True)
     if token:
         async def _del():
-            from telegram import Bot
-            await Bot(token=token).delete_forum_topic(chat_id=int(chat_id), message_thread_id=int(thread_id))
+            await _standalone_bot(token).delete_forum_topic(chat_id=int(chat_id), message_thread_id=int(thread_id))
         try:
             _run_standalone(_del)
         except Exception:

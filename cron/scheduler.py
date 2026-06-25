@@ -788,6 +788,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         topic_meta = None
         if is_telegram_forum_topic_target(platform_name, chat_id, thread_id):
             topic_meta = topic_metadata_for_job(job)
+        # Guard: a given target heals at most once per delivery (prevents a live
+        # heal+resend that then fails from re-entering the standalone heal path).
+        healed_this_target = False
 
         # Diagnostic: log thread_id for topic-aware delivery debugging
         origin = _resolve_origin(job) or {}
@@ -891,6 +894,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                         "Job '%s': self-healed dead topic %s -> %s and re-delivered",
                                         job["id"], old_thread, new_tid,
                                     )
+                                # Point any subsequent MEDIA send at the NEW topic
+                                # (without the no-fallback flag — media has no
+                                # recreate path, so let it fall back to root if the
+                                # fresh thread somehow fails rather than be lost).
+                                send_metadata = {"thread_id": thread_id}
                             else:
                                 # Could not recreate (no metadata / API fail).
                                 # Preserve the legacy fallback so the alert is not
@@ -914,6 +922,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 )
                                 logger.warning("Job '%s': %s", job["id"], msg)
                                 delivery_errors.append(msg)
+                                # Drop the no-fallback flag for the MEDIA send so a
+                                # dead-thread media send falls back to root instead
+                                # of being dropped (heal already failed).
+                                if send_metadata:
+                                    send_metadata.pop(NO_THREAD_FALLBACK_METADATA, None)
+                            # A heal attempt fired for this target; do not let a
+                            # later standalone fallback re-heal the same target.
+                            healed_this_target = True
 
                         if send_result is None or not getattr(send_result, "success", True):
                             err = getattr(send_result, "error", "unknown") if send_result else "no response from adapter"
@@ -966,11 +982,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 )
 
         if not delivered:
+            # If the live path already attempted a heal for this target, do not
+            # let the standalone fallback recreate the topic a second time.
+            standalone_can_heal = bool(topic_meta) and not healed_this_target
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
             coro = _send_to_platform(
                 platform, pconfig, chat_id, cleaned_delivery_content,
                 thread_id=thread_id, media_files=media_files,
-                allow_thread_fallback=not bool(topic_meta),
+                allow_thread_fallback=not standalone_can_heal,
             )
             try:
                 result = asyncio.run(coro)
@@ -984,7 +1003,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     future = pool.submit(asyncio.run, _send_to_platform(
                         platform, pconfig, chat_id, cleaned_delivery_content,
                         thread_id=thread_id, media_files=media_files,
-                        allow_thread_fallback=not bool(topic_meta),
+                        allow_thread_fallback=not standalone_can_heal,
                     ))
                     result = future.result(timeout=30)
             except Exception as e:
@@ -997,7 +1016,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             # Cron topic self-heal (standalone): a deleted forum topic is reported
             # (thread_not_found) when topic_meta is present. Recreate + repoint +
             # re-send to the fresh thread before treating it as an error.
-            if topic_meta and thread_id and thread_not_found_in_result(result):
+            if standalone_can_heal and thread_id and thread_not_found_in_result(result):
                 old_thread = requested_thread_from_result(result, thread_id)
                 new_tid = heal_dead_thread(
                     job, chat_id, str(old_thread),

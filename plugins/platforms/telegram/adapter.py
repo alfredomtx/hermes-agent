@@ -1807,6 +1807,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 name=topic_name,
                 icon_color=icon_color,
             )
+        if thread_id:
+            logger.info(
+                "[%s] Created forum topic '%s' in chat %s -> thread_id=%s (self-heal)",
+                self.name, topic_name, chat_id_arg, thread_id,
+            )
         return str(thread_id) if thread_id else None
 
     async def delete_forum_topic(self, chat_id: str, thread_id: str) -> bool:
