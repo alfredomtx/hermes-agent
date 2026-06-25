@@ -45,8 +45,8 @@ def test_async_rows_use_record_status_for_live_done_counts():
     text = format_subagent_roster(rows)
 
     assert "🤖 Subagents — 1 running, 1 done" in text
-    assert "✓ sleep 6 · 0:06" in text
-    assert "▶ sleep 10 · 0:08" in text
+    assert "✓ `sleep 6` · 6s" in text
+    assert "▶ `sleep 10` · 8s" in text
 
 
 def test_async_terminal_row_keeps_final_tool_count():
@@ -78,8 +78,8 @@ def test_async_terminal_row_keeps_final_tool_count():
     assert rows[0]["tools"] == 56
     assert rows[1]["tools"] == 23  # falls back to api_calls
     text = format_subagent_roster(rows, collapsed=True)
-    assert "✓ review · 15:49 · 56 tools" in text
-    assert "✓ audit · 4:47 · 23 tools" in text
+    assert "✓ `review` · 15m 49s · 56 tools" in text
+    assert "✓ `audit` · 4m 47s · 23 tools" in text
 
 
 def test_async_final_rows_fallback_to_results_when_children_missing():
@@ -97,9 +97,9 @@ def test_async_final_rows_fallback_to_results_when_children_missing():
 
     # Collapsed render now keeps the per-child breakdown under a summary header.
     lines = text.split("\n")
-    assert lines[0] == "⚠️ 2 subagents · 1 ✓ · 1 ✗ · 0:10"
-    assert lines[1] == "✓ sleep 6 · 0:06"
-    assert lines[2] == "✗ sleep 10 · 0:10"
+    assert lines[0] == "⚠️ 2 subagents · 1 ✓ · 1 ✗ · 10s"
+    assert lines[1] == "✓ `sleep 6` · 6s"
+    assert lines[2] == "✗ `sleep 10` · 10s"
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +224,7 @@ async def test_watcher_roster_seeds_edits_and_collapses(monkeypatch):
     assert len(adapter.sent) == 1
     assert adapter.edits
     assert "1 running, 1 done" in adapter.edits[-1]["content"]
-    assert "✓ sleep 6 · 0:06" in adapter.edits[-1]["content"]
+    assert "✓ `sleep 6` · 6s" in adapter.edits[-1]["content"]
 
     final_evt = _record(status="completed")
     final_evt["children"][0]["status"] = "completed"
@@ -234,7 +234,7 @@ async def test_watcher_roster_seeds_edits_and_collapses(monkeypatch):
 
     await runner._finalize_async_delegation_roster(final_evt, [])
 
-    assert "✅ 2 subagents · 2 ✓ · 0:10" in adapter.edits[-1]["content"]
+    assert "✅ 2 subagents · 2 ✓ · 10s" in adapter.edits[-1]["content"]
     assert "deleg_bg" not in runner._async_subagent_roster_bubbles
 
 

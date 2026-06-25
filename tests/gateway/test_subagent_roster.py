@@ -64,6 +64,44 @@ class TestDurationFormat:
         assert format_duration(None) == "0:00"
 
 
+# ── roster-only human elapsed formatter (3m 9s, not 3:09) ───────────────────
+class TestFormatElapsed:
+    def test_shapes(self):
+        from gateway.subagent_roster import format_elapsed
+
+        assert format_elapsed(0) == "0s"
+        assert format_elapsed(9) == "9s"
+        assert format_elapsed(45) == "45s"
+        assert format_elapsed(60) == "1m"          # trailing 0s dropped
+        assert format_elapsed(83) == "1m 23s"
+        assert format_elapsed(189) == "3m 9s"       # the 3:09 -> 3m 9s case
+        assert format_elapsed(3600) == "1h 0m"
+        assert format_elapsed(3665) == "1h 1m 5s"
+        assert format_elapsed(3720) == "1h 2m"      # trailing 0s dropped
+
+    def test_clamps_negative_and_bad(self):
+        from gateway.subagent_roster import format_elapsed
+
+        assert format_elapsed(-5) == "0s"
+        assert format_elapsed(None) == "0s"
+
+
+# ── label is rendered as an inline code span (backticks) ────────────────────
+class TestRosterLabelBackticks:
+    def test_running_row_label_in_backticks(self):
+        from gateway.subagent_roster import format_subagent_roster
+
+        rows = [{"glyph": "▶", "label": "verify php", "elapsed": 5.0, "running": True, "tools": 0}]
+        text = format_subagent_roster(rows)
+        assert "▶ `verify php` · 5s" in text
+
+    def test_backticks_in_goal_are_stripped(self):
+        # A goal containing backticks must not break the inline code span.
+        from gateway.subagent_roster import roster_label
+
+        assert roster_label("run `pytest` now") == "run pytest now"
+
+
 # ── pure roster state: fold ─────────────────────────────────────────────────
 class TestFoldSubagentRoster:
     def _state(self):
@@ -195,10 +233,10 @@ class TestFormatSubagentRoster:
         text = format_subagent_roster(rows)
         lines = text.split("\n")
         assert lines[0] == "🤖 Subagents — 2 running, 1 done, 1 failed"
-        assert lines[1] == "▶ verify php · 1:23 · 8 tools"
-        assert lines[2] == "▶ verify fe · 1:20"
-        assert lines[3] == "✓ run tests · 0:45"
-        assert lines[4] == "✗ check types · 0:30"
+        assert lines[1] == "▶ `verify php` · 1m 23s · 8 tools"
+        assert lines[2] == "▶ `verify fe` · 1m 20s"
+        assert lines[3] == "✓ `run tests` · 45s"
+        assert lines[4] == "✗ `check types` · 30s"
 
     def test_terminal_rows_keep_tool_count(self):
         # Tool count must persist on a DONE row, not vanish when running flips
@@ -212,9 +250,9 @@ class TestFormatSubagentRoster:
         ]
         text = format_subagent_roster(rows)
         lines = text.split("\n")
-        assert lines[1] == "✓ review · 15:49 · 56 tools"
-        assert lines[2] == "✗ audit · 0:30 · 1 tool"  # singular
-        assert lines[3] == "✓ noop · 0:05"  # 0 tools -> omit suffix
+        assert lines[1] == "✓ `review` · 15m 49s · 56 tools"
+        assert lines[2] == "✗ `audit` · 30s · 1 tool"  # singular
+        assert lines[3] == "✓ `noop` · 5s"  # 0 tools -> omit suffix
 
     def test_collapsed_keeps_breakdown_with_summary_header(self):
         # On finish the roster keeps the per-child breakdown (each marked with
@@ -230,10 +268,10 @@ class TestFormatSubagentRoster:
         out = format_subagent_roster(rows, collapsed=True)
         lines = out.split("\n")
         # A failure is present -> ⚠️ leads (a green check there would lie).
-        assert lines[0] == "⚠️ 3 subagents · 2 ✓ · 1 ✗ · 2:14"
-        assert lines[1] == "✓ a · 0:45"
-        assert lines[2] == "✓ b · 1:00"
-        assert lines[3] == "✗ c · 2:14"
+        assert lines[0] == "⚠️ 3 subagents · 2 ✓ · 1 ✗ · 2m 14s"
+        assert lines[1] == "✓ `a` · 45s"
+        assert lines[2] == "✓ `b` · 1m"
+        assert lines[3] == "✗ `c` · 2m 14s"
 
     def test_collapsed_all_success_leads_with_green_check(self):
         # Clear "all done" indicator: when every child finished successfully the
@@ -246,14 +284,14 @@ class TestFormatSubagentRoster:
         ]
         out = format_subagent_roster(rows, collapsed=True)
         lines = out.split("\n")
-        assert lines[0] == "✅ 2 subagents · 2 ✓ · 1:00"
+        assert lines[0] == "✅ 2 subagents · 2 ✓ · 1m"
 
     def test_collapsed_single_success_leads_with_green_check(self):
         from gateway.subagent_roster import format_subagent_roster
 
         rows = [{"glyph": "✓", "label": "a", "elapsed": 5.0, "running": False, "tools": 0}]
         out = format_subagent_roster(rows, collapsed=True)
-        assert out.split("\n")[0] == "✅ 1 subagent · 1 ✓ · 0:05"
+        assert out.split("\n")[0] == "✅ 1 subagent · 1 ✓ · 5s"
 
     def test_collapsed_with_running_row_keeps_robot(self):
         # Defensive: if a running row somehow reaches the collapsed render, do
@@ -284,8 +322,8 @@ class TestFormatSubagentRoster:
         ]
         out = format_subagent_roster(rows, collapsed=True)
         lines = out.split("\n")
-        assert lines[1] == "✓ a · 0:45 · 9 tools"
-        assert lines[2] == "✗ b · 1:00"
+        assert lines[1] == "✓ `a` · 45s · 9 tools"
+        assert lines[2] == "✗ `b` · 1m"
 
     def test_collapsed_renders_model_and_reasoning(self):
         from gateway.subagent_roster import format_subagent_roster
@@ -299,7 +337,7 @@ class TestFormatSubagentRoster:
             },
         ]
         out = format_subagent_roster(rows, collapsed=True)
-        assert "✓ review · opus-4-8 high · 5:22" in out
+        assert "✓ `review` · opus-4-8 high · 5m 22s" in out
 
     def test_row_cap_overflow(self):
         from gateway.subagent_roster import format_subagent_roster
