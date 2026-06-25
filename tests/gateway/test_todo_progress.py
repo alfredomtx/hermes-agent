@@ -140,3 +140,54 @@ def test_base_adapter_uses_todo_progress_renderer():
     assert lines[0].startswith("📋 Plan (4 tasks)")
     assert "planning 4 task(s)" not in lines[0]
     assert "Inspect gateway progress rendering" in lines[0]
+
+
+# ── header whole-plan wall-clock (DECISION B) ───────────────────────────────
+def test_header_wall_clock_appears_with_start_end_stamps():
+    # When items carry raw started_at/ended_at stamps (the result payload), the
+    # header gets a "· <wall>" suffix = earliest start -> latest end.
+    result = {
+        "todos": [
+            {"id": "a", "content": "first", "status": "completed",
+             "started_at": 1000.0, "ended_at": 1030.0, "elapsed_seconds": 30.0},
+            {"id": "b", "content": "second", "status": "completed",
+             "started_at": 1020.0, "ended_at": 1090.0, "elapsed_seconds": 70.0},
+        ]
+    }
+    card = format_todo_progress({"merge": False}, result=result)
+    assert card is not None
+    # wall-clock = 1090 - 1000 = 90s = "1m 30s"
+    assert card.startswith("📋 Plan (2 tasks) · 1m 30s")
+
+
+def test_header_wall_clock_absent_without_stamps():
+    # Existing fixtures (and the model's start args) carry elapsed_seconds but
+    # NO started_at/ended_at -> no suffix -> back-compat assertions stay valid.
+    result = {
+        "todos": [
+            {"id": "a", "content": "x", "status": "completed", "elapsed_seconds": 30.0},
+        ]
+    }
+    card = format_todo_progress({"merge": False}, result=result)
+    assert card is not None
+    assert card.startswith("📋 Plan (1 task)")
+    assert " · " not in card.splitlines()[0]
+
+
+def test_header_wall_clock_uses_now_for_in_progress():
+    # An in_progress item (started_at, no ended_at) counts up to now.
+    import gateway.todo_progress as tp
+    items = [
+        {"id": "a", "content": "running", "status": "in_progress",
+         "started_at": 1000.0, "elapsed_seconds": 45.0},
+    ]
+    # _plan_wall_clock_seconds imports time lazily; pass now explicitly.
+    wall = tp._plan_wall_clock_seconds(items, now=1045.0)
+    assert wall == 45.0
+
+
+def test_header_wall_clock_none_when_no_started_at():
+    import gateway.todo_progress as tp
+    items = [{"id": "a", "content": "x", "status": "pending", "elapsed_seconds": None}]
+    assert tp._plan_wall_clock_seconds(items, now=1045.0) is None
+

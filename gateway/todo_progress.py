@@ -71,6 +71,57 @@ def _coerce_todo_items(payload: Any) -> Optional[list]:
     return None
 
 
+def extract_todo_items(payload: Any) -> Optional[list]:
+    """Public alias for the tool-result item coercion (JSON string or dict).
+
+    Shared by the renderer and the persistent-card finished-check so both read
+    the todo list the same way.
+    """
+    return _coerce_todo_items(payload)
+
+
+def _plan_wall_clock_seconds(items: Any, *, now: Optional[float] = None) -> Optional[float]:
+    """Whole-plan wall-clock span: earliest start to latest end (or now).
+
+    Returns the real elapsed time across the plan, NOT the sum of per-item
+    spans (which double-counts parallel/overlapping work). Reads the raw
+    ``started_at`` / ``ended_at`` epoch stamps the todo result payload carries
+    (tools/todo_tool.py read_with_timing). An item that is in_progress has a
+    ``started_at`` but no ``ended_at`` -> counted up to ``now``. An item that
+    never started has no ``started_at`` -> excluded from the earliest-start.
+    Returns None when no item carries a ``started_at`` (e.g. the model's start
+    args, which have no stamps) so the caller appends no header suffix.
+    """
+    if not isinstance(items, list):
+        return None
+    if now is None:
+        import time as _time
+
+        now = _time.time()
+
+    starts: list = []
+    ends: list = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        started = item.get("started_at")
+        if not isinstance(started, (int, float)) or isinstance(started, bool):
+            continue
+        starts.append(float(started))
+        ended = item.get("ended_at")
+        if isinstance(ended, (int, float)) and not isinstance(ended, bool):
+            ends.append(float(ended))
+        else:
+            # Still running: count its span up to now.
+            ends.append(float(now))
+
+    # Empty-sequence guard BEFORE min()/max() (no started_at anywhere).
+    if not starts:
+        return None
+    span = max(ends) - min(starts)
+    return span if span >= 0 else 0.0
+
+
 def format_todo_progress(
     args: Optional[dict],
     *,
@@ -114,7 +165,15 @@ def format_todo_progress(
     title = "📋 Plan update" if merge else "📋 Plan"
     count = len(todos)
     noun = "task" if count == 1 else "tasks"
-    lines = [f"{title} ({count} {noun})"]
+    # Whole-plan wall-clock (DECISION B): earliest start -> latest end/now.
+    # Only renders when the items carry started_at/ended_at stamps (the result
+    # payload), so the model's start args (no stamps) and existing test
+    # fixtures (elapsed_seconds only) produce no suffix -> back-compat safe.
+    wall = _format_elapsed(_plan_wall_clock_seconds(todos))
+    header = f"{title} ({count} {noun})"
+    if wall:
+        header = f"{header} · {wall}"
+    lines = [header]
 
     if not todos:
         lines.append("No tasks")
