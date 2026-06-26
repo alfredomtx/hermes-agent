@@ -63,24 +63,14 @@ def resolve_roster_interval(user_config: Any, platform_key: str) -> float:
 def is_flood_error(result: Any) -> bool:
     """True if a failed adapter send/edit result is flood-control / rate-limit.
 
-    A flood/rate rejection means the platform DEFINITIVELY did not deliver the
-    message, so re-seeding a bubble after one cannot create a duplicate — unlike
-    an ambiguous failure (network drop after the bytes left, an unknown error),
-    which MIGHT have landed and must NOT be retried blindly. This predicate is
-    the dividing line the roster seed path uses to decide retry-vs-latch.
-
-    Mirrors the proven todo-card predicate (gateway/todo_card.py): the Telegram
-    adapter returns ``retryable=True`` for short floods (<=5s) and
-    ``error="flood_control:{wait}"`` for long floods (>5s, ``retryable=False``),
-    so the ``"flood"`` substring is load-bearing. ``"retry after"`` / ``"rate"``
-    cover the send-path / other-adapter phrasings (gateway/stream_consumer.py).
+    Thin re-export of the canonical predicate (gateway.flood_detect) so the
+    roster seed path and the stream consumer share ONE token set. A flood/rate
+    reject is known-not-delivered, so re-seeding after one cannot duplicate;
+    an ambiguous failure must latch instead. Kept here as a name the roster
+    seed paths already import (gateway/run.py).
     """
-    if result is None:
-        return False
-    if getattr(result, "retryable", False):
-        return True
-    err = (getattr(result, "error", "") or "").lower()
-    return "flood" in err or "retry after" in err or "rate" in err
+    from gateway.flood_detect import is_flood_error as _is_flood_error
+    return _is_flood_error(result)
 
 
 _LABEL_CAP = 80
