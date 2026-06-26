@@ -5,6 +5,7 @@ from agent.usage_pricing import (
     estimate_usage_cost,
     get_pricing_entry,
     normalize_usage,
+    resolve_billing_route,
 )
 
 
@@ -279,16 +280,13 @@ def test_bedrock_claude_rows_all_carry_cache_pricing():
 
 
 def test_bedrock_cross_region_profile_prefix_resolves_to_pricing():
-    """Cross-region inference profiles (us./global./eu. prefixes) must resolve
-    to the same pricing entry as the bare foundation-model id.  Without prefix
-    normalization, ``us.anthropic.claude-*`` sessions price as unknown.
-    """
+    """Cross-region inference profiles must resolve to the bare model pricing entry."""
     bedrock_url = "https://bedrock-runtime.us-east-1.amazonaws.com"
     bare = get_pricing_entry(
         "anthropic.claude-sonnet-4-5", provider="bedrock", base_url=bedrock_url
     )
     assert bare is not None
-    for prefix in ("us.", "global.", "eu."):
+    for prefix in ("us.", "global.", "eu.", "ap.", "jp."):
         scoped = get_pricing_entry(
             f"{prefix}anthropic.claude-sonnet-4-5",
             provider="bedrock",
@@ -322,3 +320,81 @@ def test_bedrock_claude_cached_session_estimates_cost_not_unknown():
     )
     assert result.status == "estimated"
     assert result.amount_usd is not None
+
+
+def test_bedrock_claude_opus_48_prices_via_region_prefix_strip():
+    """A Bedrock cross-Region inference id must price after the prefix is stripped."""
+    usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=200_000)
+    for model in (
+        "us.anthropic.claude-opus-4-8",
+        "eu.anthropic.claude-opus-4-8",
+        "apac.anthropic.claude-opus-4-8",
+        "global.anthropic.claude-opus-4-8",
+        "anthropic.claude-opus-4-8",  # bare id (no prefix) also resolves
+    ):
+        result = estimate_usage_cost(model, usage, provider="bedrock")
+        assert result.status == "estimated", model
+        # 1M input × $5/M + 200K output × $25/M = $5.00 + $5.00 = $10.00
+        assert float(result.amount_usd) == 10.0, model
+
+
+def test_bedrock_claude_opus_48_includes_cache_rates_no_double_count():
+    """Cache tokens price at the cache rate only."""
+    usage = CanonicalUsage(
+        input_tokens=100_000,
+        output_tokens=20_000,
+        cache_read_tokens=500_000,
+        cache_write_tokens=40_000,
+    )
+    result = estimate_usage_cost(
+        "us.anthropic.claude-opus-4-8", usage, provider="bedrock"
+    )
+    # input 100K×$5 + output 20K×$25 + cacheR 500K×$0.50 + cacheW 40K×$6.25
+    # = 0.50 + 0.50 + 0.25 + 0.25 = $1.50
+    assert result.status == "estimated"
+    assert float(result.amount_usd) == 1.50
+
+
+def test_bedrock_route_clears_base_url_to_avoid_network(monkeypatch):
+    """The Bedrock route must use the pure official-docs dict lookup."""
+    def _boom(*args, **kwargs):
+        raise AssertionError("endpoint metadata fetch must not be called")
+
+    monkeypatch.setattr("agent.usage_pricing.fetch_endpoint_model_metadata", _boom)
+    route = resolve_billing_route(
+        "us.anthropic.claude-opus-4-8",
+        provider="bedrock",
+        base_url="https://bedrock-runtime.ca-central-1.amazonaws.com",
+    )
+    assert route.base_url == ""
+    assert route.billing_mode == "official_docs_snapshot"
+    entry = get_pricing_entry(
+        "us.anthropic.claude-opus-4-8",
+        provider="bedrock",
+        base_url="https://bedrock-runtime.ca-central-1.amazonaws.com",
+    )
+    assert entry is not None
+    assert float(entry.input_cost_per_million) == 5.0
+
+
+def test_bedrock_base_url_host_detection_without_explicit_provider():
+    """A caller that passes the bedrock-runtime base_url but no provider name
+    must still route to bedrock (host match)."""
+    route = resolve_billing_route(
+        "us.anthropic.claude-opus-4-8",
+        provider=None,
+        base_url="https://bedrock-runtime.us-east-1.amazonaws.com",
+    )
+    assert route.provider == "bedrock"
+    assert route.model == "anthropic.claude-opus-4-8"
+
+
+def test_bedrock_unknown_model_stays_unknown():
+    """A Bedrock id with no exact pricing entry must fail safe to unknown."""
+    result = estimate_usage_cost(
+        "us.meta.llama4-maverick",
+        CanonicalUsage(input_tokens=1000, output_tokens=500),
+        provider="bedrock",
+    )
+    assert result.status == "unknown"
+    assert result.amount_usd is None
