@@ -97,7 +97,8 @@ def test_async_final_rows_fallback_to_results_when_children_missing():
 
     # Collapsed render now keeps the per-child breakdown under a summary header.
     lines = text.split("\n")
-    assert lines[0] == "⚠️ 2 subagents · 1 ✓ · 1 ✗ · 10s"
+    # Header elapsed is the SUM of all children (6+10=16s), not max.
+    assert lines[0] == "⚠️ 2 subagents · 1 ✓ · 1 ✗ · 16s"
     assert lines[1] == "✓ `sleep 6` · 6s"
     assert lines[2] == "✗ `sleep 10` · 10s"
 
@@ -234,7 +235,8 @@ async def test_watcher_roster_seeds_edits_and_collapses(monkeypatch):
 
     await runner._finalize_async_delegation_roster(final_evt, [])
 
-    assert "✅ 2 subagents · 2 ✓ · 10s" in adapter.edits[-1]["content"]
+    # Header elapsed is the SUM of all children (6+10=16s), not max.
+    assert "✅ 2 subagents · 2 ✓ · 16s" in adapter.edits[-1]["content"]
     assert "deleg_bg" not in runner._async_subagent_roster_bubbles
 
 
