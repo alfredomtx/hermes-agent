@@ -84,7 +84,11 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
 
     def test_profile_examples_do_not_advertise_generic_reviewer_lane(self):
-        from tools.delegate_tool import _build_dynamic_schema_overrides
+        from tools.delegate_tool import (
+            _build_dynamic_schema_overrides,
+            _dual_review_lane_phrase,
+            _get_dual_reviewer_profiles,
+        )
 
         overrides = _build_dynamic_schema_overrides()
         props = overrides["parameters"]["properties"]
@@ -97,13 +101,90 @@ class TestDelegateRequirements(unittest.TestCase):
             ]
         )
 
+        # Invariant: the schema text describes the LIVE dual-review roster, not a
+        # frozen 2-lane snapshot. Derive the expectation from config so adding a
+        # 3rd lane (delegation.dual_review_profiles) keeps the text honest.
+        lanes = _get_dual_reviewer_profiles()
+        _, count_word = _dual_review_lane_phrase()
+        # Independent check: the spelled-out count must correspond to the real
+        # lane count — NOT just to whatever the phrase helper returned (otherwise
+        # a _COUNT_WORDS mapping bug like 3 -> "two" would pass unnoticed).
+        from tools.delegate_tool import _COUNT_WORDS
+
+        self.assertEqual(count_word, _COUNT_WORDS.get(len(lanes), str(len(lanes))))
         self.assertIn("dual-review", text)
-        self.assertIn("counts as two", text)
-        self.assertIn("reviewer-codex", text)
-        self.assertIn("reviewer-opus", text)
+        self.assertIn(f"counts as {count_word}", text)
+        for lane in lanes:
+            self.assertIn(lane, text)
         self.assertNotIn("reviewer-codex + reviewer-opus tasks", text)
         self.assertNotIn("reviewer for high-reasoning review", text)
         self.assertNotIn("explorer, reviewer, coder", text)
+
+    def test_dual_review_roster_is_config_driven(self):
+        """A configured N-lane roster expands a dual-review task into N children,
+        every configured lane is rejected on direct dispatch under
+        require_dual_review, and the schema count word tracks the lane count.
+        Exercises the REAL resolver/expander against an explicit cfg (not the
+        live config) so the behavior is pinned regardless of machine config.
+        """
+        from unittest.mock import patch as mock_patch
+        from tools.delegate_tool import (
+            _COUNT_WORDS,
+            _dual_review_lane_phrase,
+            _expand_dual_review_task_items,
+            _get_dual_reviewer_profiles,
+            _is_single_reviewer_profile,
+            DUAL_REVIEWER_PROFILES,
+        )
+
+        three = {
+            "dual_review_profiles": ["reviewer-codex", "reviewer-opus", "reviewer-codex55-medium"],
+            "profiles": {
+                "reviewer-codex": {"provider": "openai-codex"},
+                "reviewer-opus": {"provider": "bedrock"},
+                "reviewer-codex55-medium": {"provider": "openai-codex"},
+            },
+        }
+        with mock_patch("tools.delegate_tool._load_config", return_value=three):
+            lanes = _get_dual_reviewer_profiles()
+            self.assertEqual(
+                lanes,
+                ("reviewer-codex", "reviewer-opus", "reviewer-codex55-medium"),
+            )
+            # Expander fans one dual-review task into exactly len(lanes) children.
+            items = _expand_dual_review_task_items(
+                [{"profile": "dual-review", "goal": "review the plan"}], None
+            )
+            self.assertEqual([it["task"]["profile"] for it in items], list(lanes))
+            self.assertTrue(all(it["from_dual_review"] for it in items))
+            # Every configured lane is a single-reviewer profile (rejected direct).
+            for lane in lanes:
+                self.assertTrue(_is_single_reviewer_profile(lane))
+            # Schema count word tracks the live lane count.
+            _, count_word = _dual_review_lane_phrase()
+            self.assertEqual(count_word, _COUNT_WORDS[len(lanes)])
+
+        # Safety: a typo'd lane (well-formed string, not in profiles) is SKIPPED;
+        # if that drops the roster below two usable lanes we fall back to the
+        # default pair — never hard-fail, never shrink to one lane.
+        typo_cfg = {
+            "dual_review_profiles": ["reviewer-codex", "reviewer-typo"],
+            "profiles": {
+                "reviewer-codex": {"provider": "openai-codex"},
+                "reviewer-opus": {"provider": "bedrock"},
+            },
+        }
+        with mock_patch("tools.delegate_tool._load_config", return_value=typo_cfg):
+            self.assertEqual(_get_dual_reviewer_profiles(), DUAL_REVIEWER_PROFILES)
+
+        # Fail-open: unreadable profiles map -> existence check skipped, the
+        # well-formed names are trusted (string-ness only).
+        no_profiles = {
+            "dual_review_profiles": ["lane-a", "lane-b"],
+            "profiles": None,
+        }
+        with mock_patch("tools.delegate_tool._load_config", return_value=no_profiles):
+            self.assertEqual(_get_dual_reviewer_profiles(), ("lane-a", "lane-b"))
 
     def test_schema_description_advertises_runtime_limits(self):
         """The model must see the user's actual concurrency / spawn-depth caps,

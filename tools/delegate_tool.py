@@ -28,7 +28,7 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
 )
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from toolsets import TOOLSETS
 
@@ -670,8 +670,67 @@ def _normalize_profile_name(profile: Optional[str]) -> Optional[str]:
 
 
 DUAL_REVIEW_PROFILE = "dual-review"
+# Default reviewer lanes the 'dual-review' pseudo-profile fans out to. This is
+# the fallback roster; the live roster is config-driven via
+# delegation.dual_review_profiles (see _get_dual_reviewer_profiles) so the lane
+# set can be tuned WITHOUT a code edit + reinstall — e.g. adding a third
+# reviewer model. The tuple here remains the stable default and the symbol
+# tests import.
 DUAL_REVIEWER_PROFILES = ("reviewer-codex", "reviewer-opus")
-_SINGLE_REVIEWER_PROFILES = frozenset(DUAL_REVIEWER_PROFILES)
+
+
+def _get_dual_reviewer_profiles(cfg: Optional[dict] = None) -> Tuple[str, ...]:
+    """Resolve the live dual-review lane roster.
+
+    Reads ``delegation.dual_review_profiles`` (a list of profile names) and
+    falls back to the hardcoded ``DUAL_REVIEWER_PROFILES`` pair whenever the
+    configured roster cannot yield at least two usable lanes. "Usable" means a
+    non-empty string that names a profile actually defined under
+    ``delegation.profiles`` — an unknown/typo'd name (e.g. ``reviewer-codx``) is
+    SKIPPED, not trusted, because routing a dual-review to a nonexistent profile
+    would hard-fail every dual-review at dispatch. Names are de-duplicated
+    preserving order. Net guarantee: a roster typo can never silently shrink
+    coverage to one lane and can never break dual-review outright — the worst
+    case is a clean fall back to the default pair. The known-profile check is
+    skipped (validate string-ness only) when the profiles map is unreadable, so
+    a transient config-load problem can't strand reviews on the default.
+    """
+    if cfg is None:
+        cfg = _load_config()
+    cfg = cfg or {}
+    raw = cfg.get("dual_review_profiles")
+    if not isinstance(raw, (list, tuple)) or not raw:
+        return DUAL_REVIEWER_PROFILES
+
+    profiles_map = cfg.get("profiles")
+    # Only enforce existence when we can actually read the profile map; if it's
+    # missing/malformed, fail open (string-ness only) so a transient load issue
+    # can't strand every review on the default pair.
+    known: Optional[set] = (
+        set(profiles_map.keys()) if isinstance(profiles_map, dict) else None
+    )
+
+    seen: set = set()
+    out: List[str] = []
+    for item in raw:
+        name = _normalize_profile_name(item if isinstance(item, str) else None)
+        if not name:
+            continue
+        if known is not None and name not in known:
+            # Unknown/typo'd lane: skip it rather than route a dual-review to a
+            # profile that doesn't exist (which would hard-fail at dispatch).
+            logger.warning(
+                "delegation.dual_review_profiles names unknown profile %r; "
+                "skipping it (not in delegation.profiles).",
+                name,
+            )
+            continue
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+    if len(out) < 2:
+        return DUAL_REVIEWER_PROFILES
+    return tuple(out)
 
 
 def _is_dual_review_profile(profile: Optional[str]) -> bool:
@@ -680,7 +739,9 @@ def _is_dual_review_profile(profile: Optional[str]) -> bool:
 
 def _is_single_reviewer_profile(profile: Optional[str]) -> bool:
     profile_name = _normalize_profile_name(profile)
-    return bool(profile_name and profile_name in _SINGLE_REVIEWER_PROFILES)
+    if not profile_name:
+        return False
+    return profile_name in frozenset(_get_dual_reviewer_profiles())
 
 
 def _requires_dual_review(cfg: Optional[dict]) -> bool:
@@ -691,10 +752,11 @@ def _requires_dual_review(cfg: Optional[dict]) -> bool:
 def _task_with_dual_review_lane_context(task: Dict[str, Any], reviewer_profile: str) -> Dict[str, Any]:
     """Clone a dual-review task and tell the child which reviewer lane it is.
 
-    Dual review expands one model-visible task into Codex + Opus children.  The
-    task text is otherwise identical, so artifact-writing workflows need a
-    grounded way for each child to select its own output path instead of racing
-    on a shared file.  This marker is also useful for normal review summaries.
+    Dual review expands one model-visible task into one child per configured
+    reviewer lane.  The task text is otherwise identical, so artifact-writing
+    workflows need a grounded way for each child to select its own output path
+    instead of racing on a shared file.  This marker is also useful for normal
+    review summaries.
     """
     cloned = dict(task)
     cloned["profile"] = reviewer_profile
@@ -721,9 +783,11 @@ def _expand_dual_review_task_items(task_list: List[Dict[str, Any]], top_profile:
     The expansion returns metadata beside each task instead of trusting hidden
     task fields from the model.  This lets require_dual_review reject direct
     single-reviewer profiles while still allowing the tool's own expansion to
-    route through reviewer-codex and reviewer-opus.
+    route through the configured dual-review lane roster
+    (delegation.dual_review_profiles; defaults to reviewer-codex + reviewer-opus).
     """
     expanded: List[Dict[str, Any]] = []
+    dual_reviewer_profiles = _get_dual_reviewer_profiles()
     for source_index, task in enumerate(task_list):
         if not isinstance(task, dict):
             expanded.append(
@@ -738,7 +802,7 @@ def _expand_dual_review_task_items(task_list: List[Dict[str, Any]], top_profile:
 
         task_profile = _normalize_profile_name(task.get("profile") or top_profile)
         if _is_dual_review_profile(task_profile):
-            for reviewer_profile in DUAL_REVIEWER_PROFILES:
+            for reviewer_profile in dual_reviewer_profiles:
                 cloned = _task_with_dual_review_lane_context(task, reviewer_profile)
                 expanded.append(
                     {
@@ -761,10 +825,12 @@ def _expand_dual_review_task_items(task_list: List[Dict[str, Any]], top_profile:
 
 
 def _single_reviewer_profile_error(profile_name: str) -> str:
+    lanes = _get_dual_reviewer_profiles()
+    lane_list = ", ".join(lanes)
     return (
         f"Direct reviewer profile '{profile_name}' is disabled because "
         "delegation.require_dual_review=true. Use profile='dual-review' so "
-        "reviewer-codex and reviewer-opus both run, then aggregate their "
+        f"all reviewer lanes ({lane_list}) run, then aggregate their "
         "findings in the parent agent."
     )
 
@@ -3839,6 +3905,26 @@ def _load_config() -> dict:
 # ---------------------------------------------------------------------------
 
 
+_COUNT_WORDS = {2: "two", 3: "three", 4: "four", 5: "five", 6: "six"}
+
+
+def _dual_review_lane_phrase() -> tuple:
+    """(expansion_clause, count_word) describing the live dual-review roster.
+
+    Keeps the model-facing schema text accurate when the lane roster is tuned
+    via delegation.dual_review_profiles, so the concurrency math the model does
+    ("counts as N child tasks") matches reality.
+    """
+    try:
+        lanes = _get_dual_reviewer_profiles()
+    except Exception:
+        lanes = DUAL_REVIEWER_PROFILES
+    n = len(lanes)
+    count_word = _COUNT_WORDS.get(n, str(n))
+    joined = ", ".join(lanes[:-1]) + f" + {lanes[-1]}" if n > 1 else lanes[0]
+    return joined, count_word
+
+
 def _build_top_level_description() -> str:
     """Compose the delegate_task tool description with current runtime limits.
 
@@ -3860,6 +3946,8 @@ def _build_top_level_description() -> str:
         orchestrator_on = _get_orchestrator_enabled()
     except Exception:
         orchestrator_on = True
+
+    _dr_lanes, _dr_count = _dual_review_lane_phrase()
 
     if max_depth >= 2 and orchestrator_on:
         nesting_clause = (
@@ -3917,8 +4005,8 @@ def _build_top_level_description() -> str:
         "- Use the 'profile' parameter when delegation.profiles defines a better lane "
         "for the task class (e.g. file-explorer for repo/file discovery, "
         "jira-auditor for Jira/ticket scope checks, or dual-review for any "
-        "review work). dual-review expands to reviewer-codex + "
-        "reviewer-opus internally so both models run and counts as two child "
+        f"review work). dual-review expands to {_dr_lanes} "
+        f"internally so all run and counts as {_dr_count} child "
         "tasks for max_concurrent_children. Per-task profile beats "
         "the top-level profile.\n"
         "- Subagents have NO memory of your conversation. Pass all relevant "
@@ -3955,13 +4043,27 @@ def _build_tasks_param_description() -> str:
         max_children = _get_max_concurrent_children()
     except Exception:
         max_children = _DEFAULT_MAX_CONCURRENT_CHILDREN
+    _dr_lanes, _dr_count = _dual_review_lane_phrase()
     return (
         f"Batch mode: tasks to run in parallel (up to {max_children} for this "
         f"user, set via delegation.max_concurrent_children). Each gets "
         "its own subagent with isolated context and terminal session. "
-        "The reserved profile='dual-review' expands to two child tasks and "
-        "counts as two against this limit. "
+        f"The reserved profile='dual-review' expands to {_dr_count} child tasks and "
+        f"counts as {_dr_count} against this limit. "
         "When provided, top-level goal/context/toolsets are ignored."
+    )
+
+
+def _build_profile_param_description() -> str:
+    """Compose the 'profile' parameter description with the live dual-review roster."""
+    _dr_lanes, _dr_count = _dual_review_lane_phrase()
+    return (
+        "Optional delegation profile from config.yaml delegation.profiles. "
+        "Use profiles to route task classes to the right model/reasoning/tool policy "
+        "(e.g. file-explorer for file/repo discovery; jira-auditor for Jira/ticket scope checks; "
+        f"dual-review for enforced {_dr_lanes} review; "
+        f"dual-review counts as {_dr_count} child tasks). "
+        "Per-task profile overrides this top-level value."
     )
 
 
@@ -4043,6 +4145,8 @@ def _build_dynamic_schema_overrides() -> dict:
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
     overrides_params["properties"]["role"]["description"] = _build_role_param_description()
 
+    overrides_params["properties"]["profile"]["description"] = _build_profile_param_description()
+
     # Prune ACP overrides from the schema when no known ACP CLI is on PATH.
     # The runtime guard in _build_child_agent remains as defense-in-depth for
     # internal callers / tests / future code paths that skip the schema layer.
@@ -4060,6 +4164,7 @@ def _build_dynamic_schema_overrides() -> dict:
                 }
             tasks_schema["items"] = items
             overrides_params["properties"]["tasks"] = tasks_schema
+
 
     return {
         "description": _build_top_level_description(),
