@@ -369,7 +369,11 @@ def format_subagent_roster(rows: List[Dict[str, Any]], *, collapsed: bool = Fals
         # terminal glyph) instead of collapsing to a bare one-liner — the user
         # wants to see WHICH children did what, not just a count. The summary
         # line becomes a header above the rows.
-        span = max((r["elapsed"] for r in rows), default=0.0)
+        # Header elapsed is the SUM of every child's elapsed (combined
+        # agent-time), NOT max(): children run in parallel so max would just
+        # echo the slowest child and looks like a missing total. Alfredo wants
+        # the aggregate across both subagents.
+        total = sum((r["elapsed"] for r in rows), 0.0)
         # Clear "finished" indicator on the header, replacing the 🤖 robot:
         #   ✅  every child finished and NONE failed/timed-out/interrupted
         #   ⚠️  finished but at least one child failed (a green check would lie)
@@ -387,7 +391,7 @@ def format_subagent_roster(rows: List[Dict[str, Any]], *, collapsed: bool = Fals
             head_parts.append(f"{len(done)} ✓")
         if failed_total:
             head_parts.append(f"{len(failed_total)} ✗")
-        head_parts.append(format_elapsed(span))
+        head_parts.append(format_elapsed(total))
         head = " · ".join(head_parts)
 
         lines = [head]
@@ -413,6 +417,11 @@ def format_subagent_roster(rows: List[Dict[str, Any]], *, collapsed: bool = Fals
         head += f", {len(done)} done"
     if failed_total:
         head += f", {len(failed_total)} failed"
+    # Live elapsed TOTAL across all rows (combined agent-time), so the header
+    # carries a ticking aggregate while children run instead of no time at all.
+    live_total = sum((r["elapsed"] for r in rows), 0.0)
+    if live_total > 0:
+        head += f" · {format_elapsed(live_total)}"
 
     lines = [head]
     shown = rows[:_MAX_ROWS]

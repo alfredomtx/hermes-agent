@@ -232,7 +232,8 @@ class TestFormatSubagentRoster:
         ]
         text = format_subagent_roster(rows)
         lines = text.split("\n")
-        assert lines[0] == "🤖 Subagents — 2 running, 1 done, 1 failed"
+        # Live header carries the SUM of all rows' elapsed (83+80+45+30=238s).
+        assert lines[0] == "🤖 Subagents — 2 running, 1 done, 1 failed · 3m 58s"
         assert lines[1] == "▶ `verify php` · 1m 23s · 8 tools"
         assert lines[2] == "▶ `verify fe` · 1m 20s"
         assert lines[3] == "✓ `run tests` · 45s"
@@ -268,7 +269,8 @@ class TestFormatSubagentRoster:
         out = format_subagent_roster(rows, collapsed=True)
         lines = out.split("\n")
         # A failure is present -> ⚠️ leads (a green check there would lie).
-        assert lines[0] == "⚠️ 3 subagents · 2 ✓ · 1 ✗ · 2m 14s"
+        # Header elapsed is the SUM of all children (45+60+134=239s), not max.
+        assert lines[0] == "⚠️ 3 subagents · 2 ✓ · 1 ✗ · 3m 59s"
         assert lines[1] == "✓ `a` · 45s"
         assert lines[2] == "✓ `b` · 1m"
         assert lines[3] == "✗ `c` · 2m 14s"
@@ -284,7 +286,8 @@ class TestFormatSubagentRoster:
         ]
         out = format_subagent_roster(rows, collapsed=True)
         lines = out.split("\n")
-        assert lines[0] == "✅ 2 subagents · 2 ✓ · 1m"
+        # Header elapsed is the SUM of all children (45+60=105s), not max.
+        assert lines[0] == "✅ 2 subagents · 2 ✓ · 1m 45s"
 
     def test_collapsed_single_success_leads_with_green_check(self):
         from gateway.subagent_roster import format_subagent_roster
