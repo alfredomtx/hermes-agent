@@ -612,7 +612,7 @@ def resolve_billing_route(
         return BillingRoute(provider="openrouter", model=model, base_url=base_url or "", billing_mode="official_models_api")
     if provider_name == "nous" or base_url_host_matches(base_url or "", "inference-api.nousresearch.com"):
         return BillingRoute(provider="nous", model=model, base_url=base_url or _NOUS_DEFAULT_BASE_URL, billing_mode="official_models_api")
-    if provider_name == "bedrock" or "bedrock" in base:
+    if provider_name == "bedrock" or base_url_host_matches(base_url or "", "amazonaws.com"):
         # AWS Bedrock resells third-party models (Anthropic Claude, Amazon Nova)
         # at the provider's published per-token rates through AWS billing. The
         # model id carries a cross-Region inference-profile prefix

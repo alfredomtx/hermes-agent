@@ -335,3 +335,37 @@ def test_bedrock_unknown_model_stays_unknown():
     assert result.status == "unknown"
     assert result.amount_usd is None
 
+
+def test_bedrock_us_gov_prefix_strips_and_prices():
+    """The us-gov. region prefix must also normalize to the priced id."""
+    result = estimate_usage_cost(
+        "us-gov.anthropic.claude-opus-4-8",
+        CanonicalUsage(input_tokens=1_000_000, output_tokens=200_000),
+        provider="bedrock",
+    )
+    assert result.status == "estimated"
+    assert float(result.amount_usd) == 10.0
+
+
+def test_bedrock_host_detection_does_not_false_positive_on_substring():
+    """A non-AWS URL that merely CONTAINS 'bedrock' must NOT be routed to the
+    bedrock docs-snapshot pricing (the substring-match false-positive class)."""
+    route = resolve_billing_route(
+        "claude-opus-4-8",
+        provider=None,
+        base_url="https://my-bedrock-proxy.example.com/v1",
+    )
+    assert route.provider != "bedrock"
+
+
+def test_bedrock_branch_does_not_override_explicit_provider():
+    """An explicit non-bedrock provider must win even if its base_url contains
+    the substring 'bedrock' (the branch must key on host, not substring)."""
+    route = resolve_billing_route(
+        "claude-opus-4-8",
+        provider="anthropic",
+        base_url="https://anthropic-via-bedrock-proxy.example.com/v1",
+    )
+    assert route.provider == "anthropic"
+    assert route.billing_mode == "official_docs_snapshot"
+
