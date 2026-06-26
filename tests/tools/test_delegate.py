@@ -3230,6 +3230,38 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
         self.assertIn("depth 1", prompt)
         self.assertIn("max_spawn_depth=2", prompt)
 
+    # ── Verify-status provenance contract (unwatched-surface tagging) ────
+
+    def test_leaf_prompt_carries_verify_status_contract(self):
+        """Every child summary is an unwatched surface (consumed by the parent
+        with no human watching), so the child is instructed to tag external-state
+        claims with verify-status. This must reach leaf children, the common case."""
+        prompt = _build_child_system_prompt(
+            "Fix tests", role="leaf",
+            max_spawn_depth=2, child_depth=1,
+        )
+        # The contract is keyed off the two-state field + the never-fake rule.
+        self.assertIn("[verified:", prompt)
+        self.assertIn("[unverified]", prompt)
+        self.assertIn("external-state claim", prompt)
+
+    def test_orchestrator_prompt_carries_verify_status_contract(self):
+        """The contract lives in the SHARED summary block, so orchestrator
+        children get it too."""
+        prompt = _build_child_system_prompt(
+            "Survey approaches", role="orchestrator",
+            max_spawn_depth=2, child_depth=1,
+        )
+        self.assertIn("[verified:", prompt)
+        self.assertIn("[unverified]", prompt)
+
+    def test_verify_status_contract_present_for_goal_only_child(self):
+        """No role / no context still gets the contract — it is unconditional
+        in the shared block, not gated on role or context."""
+        prompt = _build_child_system_prompt("Do something")
+        self.assertIn("[verified:", prompt)
+        self.assertIn("[unverified]", prompt)
+
     def test_orchestrator_prompt_at_depth_floor_says_children_are_leaves(self):
         """With max_spawn_depth=2 and child_depth=1, the orchestrator's
         own children would be at depth 2 (the floor) → must be leaves."""
