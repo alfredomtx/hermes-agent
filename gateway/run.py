@@ -15410,7 +15410,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if getattr(result, "success", False) and getattr(result, "message_id", None):
                 bubble["message_id"] = str(result.message_id)
             else:
-                bubble["seed_failed"] = True
+                # A flood/rate reject means the seed DEFINITIVELY did not land,
+                # so re-seeding next tick cannot duplicate — do NOT latch; just
+                # stamp the throttle clock so retries pace at the roster interval
+                # instead of hammering every idle tick. Only an AMBIGUOUS failure
+                # (might have delivered) latches seed_failed to avoid dup spam.
+                from gateway.subagent_roster import is_flood_error
+                if not is_flood_error(result):
+                    bubble["seed_failed"] = True
+                bubble["last_edit_ts"] = now
                 return
         else:
             kwargs: Dict[str, Any] = {
@@ -17925,7 +17933,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if _cleanup_progress:
                             _cleanup_msg_ids.append(str(roster_msg_id))
                     else:
-                        roster_seed_failed = True
+                        # A flood/rate reject DEFINITIVELY did not deliver, so a
+                        # re-seed next tick cannot duplicate — do NOT latch; stamp
+                        # the throttle clock so retries pace at the roster interval
+                        # rather than hammering every 0.3s idle tick. Only an
+                        # AMBIGUOUS failure (might have landed) latches to avoid
+                        # duplicate bubbles. Mirrors the watcher seed path.
+                        from gateway.subagent_roster import is_flood_error
+                        if not is_flood_error(result):
+                            roster_seed_failed = True
+                        _last_roster_edit_ts = now
                         return
                 else:
                     kwargs: Dict[str, Any] = {
