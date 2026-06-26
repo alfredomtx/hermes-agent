@@ -445,6 +445,45 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
     # Bedrock charges the same per-token rates as the model provider but
     # through AWS billing.  These are the on-demand prices (no commitment).
     # Source: https://aws.amazon.com/bedrock/pricing/
+    # Opus 4.5/4.7/4.8 dropped to $5/$25 (1/3 of the 4.6 price); 4.6 stays
+    # $15/$75. Cache rates follow Anthropic's 0.1x read / 1.25x write multipliers.
+    # Source: https://aws.amazon.com/blogs/machine-learning/claude-opus-4-5-now-in-amazon-bedrock
+    (
+        "bedrock",
+        "anthropic.claude-opus-4-8",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("5.00"),
+        output_cost_per_million=Decimal("25.00"),
+        cache_read_cost_per_million=Decimal("0.50"),
+        cache_write_cost_per_million=Decimal("6.25"),
+        source="official_docs_snapshot",
+        source_url="https://aws.amazon.com/blogs/machine-learning/claude-opus-4-5-now-in-amazon-bedrock",
+        pricing_version="bedrock-pricing-2026-04",
+    ),
+    (
+        "bedrock",
+        "anthropic.claude-opus-4-7",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("5.00"),
+        output_cost_per_million=Decimal("25.00"),
+        cache_read_cost_per_million=Decimal("0.50"),
+        cache_write_cost_per_million=Decimal("6.25"),
+        source="official_docs_snapshot",
+        source_url="https://aws.amazon.com/bedrock/pricing/",
+        pricing_version="bedrock-pricing-2026-04",
+    ),
+    (
+        "bedrock",
+        "anthropic.claude-opus-4-5",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("5.00"),
+        output_cost_per_million=Decimal("25.00"),
+        cache_read_cost_per_million=Decimal("0.50"),
+        cache_write_cost_per_million=Decimal("6.25"),
+        source="official_docs_snapshot",
+        source_url="https://aws.amazon.com/blogs/machine-learning/claude-opus-4-5-now-in-amazon-bedrock",
+        pricing_version="bedrock-pricing-2026-04",
+    ),
     (
         "bedrock",
         "anthropic.claude-opus-4-6",
@@ -573,6 +612,19 @@ def resolve_billing_route(
         return BillingRoute(provider="openrouter", model=model, base_url=base_url or "", billing_mode="official_models_api")
     if provider_name == "nous" or base_url_host_matches(base_url or "", "inference-api.nousresearch.com"):
         return BillingRoute(provider="nous", model=model, base_url=base_url or _NOUS_DEFAULT_BASE_URL, billing_mode="official_models_api")
+    if provider_name == "bedrock" or "bedrock" in base:
+        # AWS Bedrock resells third-party models (Anthropic Claude, Amazon Nova)
+        # at the provider's published per-token rates through AWS billing. The
+        # model id carries a cross-Region inference-profile prefix
+        # (us./eu./apac./global./us-gov.) that is NOT part of the pricing key —
+        # strip it and look up the exact (bedrock, <model>) official-docs entry.
+        # base_url is deliberately cleared so get_pricing_entry does the pure
+        # dict lookup and never attempts an endpoint /models metadata fetch
+        # (this route is hit on every throttled cost render; no network).
+        # NOTE: geographic profiles (us./eu./apac.) cost ~10% more than the
+        # global profile; we estimate at the published base rate and the cost
+        # label is "~$" (estimate), so a geo run reads ~10% low by design.
+        return BillingRoute(provider="bedrock", model=_normalize_bedrock_model_name(model), base_url="", billing_mode="official_docs_snapshot")
     if provider_name == "anthropic":
         return BillingRoute(provider="anthropic", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
     if provider_name == "openai":
@@ -582,6 +634,28 @@ def resolve_billing_route(
     if provider_name in {"custom", "local"} or (base and "localhost" in base):
         return BillingRoute(provider=provider_name or "custom", model=model, base_url=base_url or "", billing_mode="unknown")
     return BillingRoute(provider=provider_name or "unknown", model=model.split("/")[-1] if model else "", base_url=base_url or "", billing_mode="unknown")
+
+
+def _normalize_bedrock_model_name(model: str) -> str:
+    """Strip the Bedrock cross-Region inference-profile prefix from a model id.
+
+    Bedrock model ids used for inference carry a regional routing prefix that is
+    NOT part of the pricing key, e.g.:
+      us.anthropic.claude-opus-4-8     -> anthropic.claude-opus-4-8
+      eu.anthropic.claude-sonnet-4-6   -> anthropic.claude-sonnet-4-6
+      global.anthropic.claude-opus-4-8 -> anthropic.claude-opus-4-8
+      apac.amazon.nova-pro             -> amazon.nova-pro
+    The canonical key keeps the vendor segment (anthropic./amazon.) because the
+    pricing table is keyed by it. Only the known geo/global prefixes are
+    stripped; anything else is returned unchanged so an unknown id fails safe to
+    an unknown route (cost omitted) rather than mis-pricing.
+    """
+    name = (model or "").strip()
+    prefixes = ("us-gov.", "us.", "eu.", "apac.", "global.")
+    for prefix in prefixes:
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
 
 
 def _normalize_anthropic_model_name(model: str) -> str:
