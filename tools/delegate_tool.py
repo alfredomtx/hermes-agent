@@ -1023,6 +1023,13 @@ def _build_child_system_prompt(
         "- Any issues encountered\n\n"
         "Important workspace rule: Never assume a repository lives at /workspace/... or any other container-style path unless the task/context explicitly gives that path. "
         "If no exact local path is provided, discover it first before issuing git/workdir-specific commands.\n\n"
+        "Provenance: your summary is consumed by the parent agent with no human watching, so tag every "
+        "external-state claim (a checkable fact about the world: a file's contents, a line number, whether "
+        "something exists/is installed, a command's exit code, an HTTP status, a test result) with its "
+        "verify-status: '[verified: <how>]' when you actually checked it (e.g. read file, ran test, grep, "
+        "curl 200) or '[unverified]' when you are inferring or did not check. Do NOT tag reasoning, "
+        "recommendations, or opinions -- only checkable facts. A summary with no external-state claims needs "
+        "no tags. Never fake a '[verified: ...]' for a fact you did not actually check.\n\n"
         "Be thorough but concise -- your response is returned to the "
         "parent agent as a summary."
     )
