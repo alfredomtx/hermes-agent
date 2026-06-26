@@ -59,6 +59,30 @@ def resolve_roster_interval(user_config: Any, platform_key: str) -> float:
     except Exception:
         return ROSTER_EDIT_INTERVAL
 
+
+def is_flood_error(result: Any) -> bool:
+    """True if a failed adapter send/edit result is flood-control / rate-limit.
+
+    A flood/rate rejection means the platform DEFINITIVELY did not deliver the
+    message, so re-seeding a bubble after one cannot create a duplicate — unlike
+    an ambiguous failure (network drop after the bytes left, an unknown error),
+    which MIGHT have landed and must NOT be retried blindly. This predicate is
+    the dividing line the roster seed path uses to decide retry-vs-latch.
+
+    Mirrors the proven todo-card predicate (gateway/todo_card.py): the Telegram
+    adapter returns ``retryable=True`` for short floods (<=5s) and
+    ``error="flood_control:{wait}"`` for long floods (>5s, ``retryable=False``),
+    so the ``"flood"`` substring is load-bearing. ``"retry after"`` / ``"rate"``
+    cover the send-path / other-adapter phrasings (gateway/stream_consumer.py).
+    """
+    if result is None:
+        return False
+    if getattr(result, "retryable", False):
+        return True
+    err = (getattr(result, "error", "") or "").lower()
+    return "flood" in err or "retry after" in err or "rate" in err
+
+
 _LABEL_CAP = 80
 _MAX_ROWS = 10
 

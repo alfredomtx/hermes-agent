@@ -389,3 +389,126 @@ async def test_watcher_roster_collapses_interrupted_batch_with_failed_counts(mon
     assert "1 ✓" in last
     assert "1 ✗" in last
     assert "deleg_bg" not in runner._async_subagent_roster_bubbles
+
+
+# ── Reseed-on-flood: a flood-rejected seed must NOT latch (keep trying) ──────
+class FloodSeedAdapter(AsyncRosterAdapter):
+    """Rejects the first N seed sends with a flood-control result, then succeeds.
+
+    Models Telegram flood control on createMessage: the send DEFINITIVELY did
+    not deliver (success=False), so the roster must re-seed on the next tick
+    rather than latching seed_failed and never showing the bubble.
+    """
+
+    def __init__(self, fail_sends=1, error="flood_control:18", retryable=False):
+        super().__init__()
+        self._fail_sends = fail_sends
+        self._flood_error = error
+        self._flood_retryable = retryable
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None, buttons=None):
+        if self._fail_sends > 0:
+            self._fail_sends -= 1
+            self.sent.append({"chat_id": chat_id, "content": content, "metadata": metadata,
+                              "failed": True})
+            return SendResult(
+                success=False, error=self._flood_error, retryable=self._flood_retryable
+            )
+        return await super().send(chat_id, content, reply_to=reply_to, metadata=metadata)
+
+
+class AmbiguousSeedAdapter(AsyncRosterAdapter):
+    """Rejects the seed with a non-flood (ambiguous) failure that MIGHT have
+    landed — the roster must latch and NOT re-seed (avoid duplicate bubbles)."""
+
+    def __init__(self, error="Bad Gateway"):
+        super().__init__()
+        self._err = error
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None, buttons=None):
+        self.sent.append({"chat_id": chat_id, "content": content, "metadata": metadata,
+                          "failed": True})
+        return SendResult(success=False, error=self._err)
+
+
+@pytest.mark.asyncio
+async def test_watcher_roster_reseeds_after_flood_reject(monkeypatch):
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"display": {"platforms": {"telegram": {"subagent_roster": "on"}}}},
+    )
+    # Drive a controllable clock so the second tick is past the (>=1s floor)
+    # roster interval; the reseed is deliberately PACED, not hammered.
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(gateway_run.time, "monotonic", lambda: clock["t"])
+
+    adapter = FloodSeedAdapter(fail_sends=1)  # first seed floods, second lands
+    runner = _runner(adapter)
+    active = [{"subagent_id": "sa-0", "started_at": 101.0, "tool_count": 0}]
+
+    # Tick 1: seed is flood-rejected → bubble exists in state but unseeded, NOT latched.
+    await runner._tick_async_delegation_rosters([_record()], active)
+    bubble = runner._async_subagent_roster_bubbles["deleg_bg"]
+    assert bubble["message_id"] is None
+    assert bubble["seed_failed"] is False, "flood reject must NOT latch seed_failed"
+    assert len(adapter.sent) == 1  # one (failed) seed attempt so far
+
+    # Advance past the interval; tick 2 re-seeds and now succeeds.
+    clock["t"] += 30.0
+    await runner._tick_async_delegation_rosters([_record()], active)
+    assert len(adapter.sent) == 2, "must retry the seed after a flood reject"
+    assert bubble["message_id"] is not None, "second seed should land the bubble"
+
+
+@pytest.mark.asyncio
+async def test_watcher_roster_retryable_flood_reseeds(monkeypatch):
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"display": {"platforms": {"telegram": {"subagent_roster": "on"}}}},
+    )
+    clock = {"t": 2000.0}
+    monkeypatch.setattr(gateway_run.time, "monotonic", lambda: clock["t"])
+
+    # retryable=True with no error string = Telegram short (<=5s) flood.
+    adapter = FloodSeedAdapter(fail_sends=1, error=None, retryable=True)
+    runner = _runner(adapter)
+    active = [{"subagent_id": "sa-0", "started_at": 101.0, "tool_count": 0}]
+
+    await runner._tick_async_delegation_rosters([_record()], active)
+    assert runner._async_subagent_roster_bubbles["deleg_bg"]["seed_failed"] is False
+    clock["t"] += 30.0
+    await runner._tick_async_delegation_rosters([_record()], active)
+    assert len(adapter.sent) == 2
+    assert runner._async_subagent_roster_bubbles["deleg_bg"]["message_id"] is not None
+
+
+@pytest.mark.asyncio
+async def test_watcher_roster_latches_on_ambiguous_failure(monkeypatch):
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"display": {"platforms": {"telegram": {"subagent_roster": "on"}}}},
+    )
+    clock = {"t": 3000.0}
+    monkeypatch.setattr(gateway_run.time, "monotonic", lambda: clock["t"])
+
+    adapter = AmbiguousSeedAdapter()  # always fails with a non-flood error
+    runner = _runner(adapter)
+    active = [{"subagent_id": "sa-0", "started_at": 101.0, "tool_count": 0}]
+
+    await runner._tick_async_delegation_rosters([_record()], active)
+    bubble = runner._async_subagent_roster_bubbles["deleg_bg"]
+    assert bubble["seed_failed"] is True, "ambiguous failure must latch (may have delivered)"
+
+    # Even past the interval, a latched seed must not re-attempt (avoid dup bubbles).
+    clock["t"] += 30.0
+    await runner._tick_async_delegation_rosters([_record()], active)
+    assert len(adapter.sent) == 1, "latched seed must not re-attempt on an ambiguous failure"

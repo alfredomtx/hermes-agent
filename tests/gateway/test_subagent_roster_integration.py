@@ -22,12 +22,17 @@ from gateway.session import SessionSource
 
 
 class ProgressCaptureAdapter(BasePlatformAdapter):
-    def __init__(self, platform=Platform.TELEGRAM, seed_fails=False):
+    def __init__(self, platform=Platform.TELEGRAM, seed_fails=False, flood_seed_fails=0):
         super().__init__(PlatformConfig(enabled=True, token="***"), platform)
         self.sent = []
         self.edits = []
         self.typing = []
         self._seed_fails = seed_fails
+        # When > 0, the first N seed sends are rejected with a FLOOD result
+        # (known-not-delivered) and then sends succeed — models Telegram flood
+        # control clearing. Distinct from seed_fails, which is an AMBIGUOUS
+        # failure (might have delivered → must latch, never retry).
+        self._flood_seed_fails = flood_seed_fails
         self._send_seq = 0
 
     async def connect(self) -> bool:
@@ -39,6 +44,10 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
     async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
         self._send_seq += 1
         self.sent.append({"chat_id": chat_id, "content": content})
+        if self._flood_seed_fails > 0:
+            self._flood_seed_fails -= 1
+            # Telegram long flood: success=False, error="flood_control:{wait}".
+            return SendResult(success=False, message_id=None, error="flood_control:18")
         if self._seed_fails:
             return SendResult(success=False, message_id=None)
         return SendResult(success=True, message_id=f"roster-{self._send_seq}")
@@ -168,6 +177,31 @@ class NoRosterEmittingToolAgent:
         return {"final_response": "done", "messages": [], "api_calls": 1}
 
 
+class SlowRosterAgent:
+    """Like RosterAgent but runs long enough (~2.5s) that, with the roster
+    interval at its 1.0s floor, a flood-rejected seed has time to RE-SEED on a
+    later idle tick. Used by the sync-path flood-reseed test."""
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+        self._interrupt_requested = False
+
+    @property
+    def is_interrupted(self) -> bool:
+        return self._interrupt_requested
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        _emit_start(cb, "sa-0", "verify php", 0)
+        _emit_start(cb, "sa-1", "verify fe", 1)
+        time.sleep(2.5)  # > 1.0s floor: a flooded seed gets a paced re-seed
+        _emit_complete(cb, "sa-0", "completed", 1.2)
+        _emit_complete(cb, "sa-1", "completed", 2.4)
+        time.sleep(0.3)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
 def _make_runner(adapter):
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
@@ -192,7 +226,7 @@ def _make_runner(adapter):
 
 
 async def _run(monkeypatch, tmp_path, agent_cls, session_id, *,
-               adapter=None, roster="on", tool_progress="off"):
+               adapter=None, roster="on", tool_progress="off", roster_interval=None):
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *a, **k: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
@@ -220,6 +254,8 @@ async def _run(monkeypatch, tmp_path, agent_cls, session_id, *,
             }
         }
     }
+    if roster_interval is not None:
+        cfg["display"]["platforms"]["telegram"]["subagent_roster_interval"] = roster_interval
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: cfg)
     monkeypatch.delenv("HERMES_TOOL_PROGRESS_MODE", raising=False)
 
@@ -313,3 +349,43 @@ async def test_no_edit_adapter_noops(monkeypatch, tmp_path):
     _, result = await _run(monkeypatch, tmp_path, RosterAgent, "sess-noedit", adapter=adapter)
     assert result["final_response"] == "done"
     assert len(adapter.sent) == 0 and len(adapter.edits) == 0
+
+
+@pytest.mark.asyncio
+async def test_sync_roster_reseeds_after_flood(monkeypatch, tmp_path):
+    # The sync (in-turn) _publish_roster path: a flood-rejected seed must NOT
+    # latch — a later paced idle tick re-seeds, so the bubble still appears once
+    # flood clears. roster_interval=1.0 (floor) + a ~2.5s agent gives the
+    # re-seed window. The first send floods; the re-seed lands the bubble.
+    adapter = ProgressCaptureAdapter(flood_seed_fails=1)
+    _, result = await _run(
+        monkeypatch, tmp_path, SlowRosterAgent, "sess-sync-flood",
+        adapter=adapter, roster_interval=1.0,
+    )
+    assert result["final_response"] == "done"
+    # At least two sends: the flooded seed + a successful re-seed. (No latch.)
+    assert len(adapter.sent) >= 2, (
+        f"flood seed must re-seed on the sync path, got {len(adapter.sent)} sends"
+    )
+    # The bubble actually landed: a roster lead marker is present in some frame.
+    blob = "\n".join(_all_text(adapter))
+    assert any(m in blob for m in ("🤖", "✅", "⚠️")), "re-seeded roster never rendered"
+
+
+@pytest.mark.asyncio
+async def test_sync_roster_latches_on_ambiguous_seed_failure(monkeypatch, tmp_path):
+    # Mirror guard: an AMBIGUOUS (non-flood) seed failure on the sync path must
+    # STILL latch — never re-seed — even with a long agent + 1.0s interval that
+    # would otherwise allow a retry. This locks the nonlocal/latch contract that
+    # py_compile cannot catch (an accidental local would re-seed and spam).
+    adapter = ProgressCaptureAdapter(seed_fails=True)
+    _, result = await _run(
+        monkeypatch, tmp_path, SlowRosterAgent, "sess-sync-ambig",
+        adapter=adapter, roster_interval=1.0,
+    )
+    assert result["final_response"] == "done"
+    # Latched after the first failure: at most one seed attempt despite a ~2.5s
+    # run with sub-second idle ticks (a broken latch would send many).
+    assert len(adapter.sent) <= 1, (
+        f"ambiguous seed failure must latch, got {len(adapter.sent)} sends (spam)"
+    )

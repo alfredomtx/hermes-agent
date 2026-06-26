@@ -474,3 +474,57 @@ class TestRosterPipelineGate:
 
 from gateway.subagent_roster import _LABEL_CAP
 
+
+# ── is_flood_error: the retry-vs-latch dividing line for seed failures ──────
+class TestIsFloodError:
+    """A flood/rate reject is known-not-delivered (safe to re-seed); an
+    ambiguous failure might have landed (must latch). is_flood_error draws
+    that line so the roster seed path retries floods but not ambiguous fails.
+    """
+
+    class _R:
+        def __init__(self, success=False, error=None, message_id=None, retryable=False):
+            self.success = success
+            self.error = error
+            self.message_id = message_id
+            self.retryable = retryable
+
+    def test_none_is_not_flood(self):
+        from gateway.subagent_roster import is_flood_error
+        assert is_flood_error(None) is False
+
+    def test_retryable_flag_is_flood(self):
+        # Telegram short floods (<=5s) come back retryable=True with no error str.
+        from gateway.subagent_roster import is_flood_error
+        assert is_flood_error(self._R(retryable=True)) is True
+
+    def test_flood_control_error_string(self):
+        # Long floods (>5s) return error="flood_control:{wait}", retryable=False.
+        from gateway.subagent_roster import is_flood_error
+        assert is_flood_error(self._R(error="flood_control:18")) is True
+
+    def test_retry_after_phrasing(self):
+        from gateway.subagent_roster import is_flood_error
+        assert is_flood_error(self._R(error="Too Many Requests: retry after 12")) is True
+
+    def test_rate_limit_phrasing(self):
+        from gateway.subagent_roster import is_flood_error
+        assert is_flood_error(self._R(error="rate limit exceeded")) is True
+
+    def test_case_insensitive(self):
+        from gateway.subagent_roster import is_flood_error
+        assert is_flood_error(self._R(error="FLOOD CONTROL EXCEEDED")) is True
+
+    def test_ambiguous_failure_is_not_flood(self):
+        # A network drop / unknown error MIGHT have delivered → not flood → latch.
+        from gateway.subagent_roster import is_flood_error
+        assert is_flood_error(self._R(error="Bad Gateway")) is False
+        assert is_flood_error(self._R(error="connection reset")) is False
+        assert is_flood_error(self._R(error=None)) is False
+
+    def test_success_result_with_no_error(self):
+        # Defensive: a success result is never treated as a flood.
+        from gateway.subagent_roster import is_flood_error
+        assert is_flood_error(self._R(success=True, message_id="42")) is False
+
+
