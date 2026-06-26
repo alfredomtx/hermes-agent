@@ -1096,6 +1096,13 @@ def _build_child_system_prompt(
         "curl 200) or '[unverified]' when you are inferring or did not check. Do NOT tag reasoning, "
         "recommendations, or opinions -- only checkable facts. A summary with no external-state claims needs "
         "no tags. Never fake a '[verified: ...]' for a fact you did not actually check.\n\n"
+        "Receipt: if you run commands, write or patch files, or are an orchestrator, your work "
+        "is a reusable handoff — END your summary with ONE fenced ```receipt block (pure JSON) "
+        "per the agent-receipt schema: {claim_id, producer (your profile/lane, NOT the model id), "
+        "task, stop_reason (completed|blocked|partial|timeout|aborted), sources [{ref,status}], "
+        "touched [files/urls], commands [{cmd,result,status} -- TESTS you ran, not the tool trace], "
+        "blockers [], next_owner}. A pure read-only lookup that changed nothing does not need one. "
+        "Do NOT restate the model or tool trace the harness already captures.\n\n"
         "Be thorough but concise -- your response is returned to the "
         "parent agent as a summary."
     )
@@ -2491,6 +2498,29 @@ def _run_single_child_attempt(
         }
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
+
+        # Agent-receipt stamp (agent_receipt schema guard). Reusable delegated work owes a
+        # structured receipt. Derive receipt_owed from data the harness already has — the
+        # child's own tool_trace (did it write files / run commands?) plus its role
+        # (orchestrators always owe) — NOT a manual opt-in flag (which a careless caller
+        # never sets). ALWAYS stamp receipt_owed; only when owed do we validate the child's
+        # summary and add receipt_valid/receipt_errors. A pure read-only lookup owes nothing
+        # and gets no false-negative stamp. The validator fails open on its own faults.
+        try:
+            from tools import agent_receipt as _ar
+            _owed = _ar.owes_receipt(
+                surface="delegate",
+                role=entry.get("_child_role"),
+                tool_trace=tool_trace,
+            )
+            entry["receipt_owed"] = bool(_owed)
+            if _owed:
+                _ok_r, _errs_r = _ar.validate_text(summary or "")
+                entry["receipt_valid"] = bool(_ok_r)
+                if not _ok_r:
+                    entry["receipt_errors"] = _errs_r[:5]
+        except Exception:
+            logger.debug("agent_receipt stamp failed (non-fatal)", exc_info=True)
 
         # Cross-agent file-state reminder.  If this subagent wrote any
         # files the parent had already read, surface it so the parent

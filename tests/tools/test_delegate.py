@@ -247,6 +247,16 @@ class TestChildSystemPrompt(unittest.TestCase):
         prompt = _build_child_system_prompt("Do something", "  ")
         self.assertNotIn("CONTEXT", prompt)
 
+    def test_receipt_instruction_present(self):
+        """Reusable-work children are told to end with a receipt block (agent_receipt guard)."""
+        prompt = _build_child_system_prompt("Refactor the module")
+        self.assertIn("```receipt", prompt)
+        self.assertIn("agent-receipt schema", prompt)
+        # honest scope: conditional on running commands / writing files / orchestrator
+        self.assertIn("if you run commands", prompt.lower())
+        # must NOT ask the child to restate harness-captured facts
+        self.assertIn("not the tool trace", prompt.lower())
+
 
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):
