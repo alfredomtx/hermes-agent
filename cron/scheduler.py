@@ -2205,7 +2205,13 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         "SILENT: If there is genuinely nothing new to report, respond "
         "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
         "Never combine [SILENT] with content — either report your "
-        "findings normally, or say [SILENT] and nothing more.]\n\n"
+        "findings normally, or say [SILENT] and nothing more. "
+        "RECEIPT: if your report makes reusable claims another agent or "
+        "human will act on (not a [SILENT]/status-only ping), END it with "
+        "ONE fenced ```receipt block (pure JSON) per the agent-receipt "
+        "schema: {claim_id, producer, task, stop_reason, sources, touched, "
+        "commands, blockers, next_owner}. See the agent-receipt-schema "
+        "skill for field meanings.]\n\n"
     )
     prompt = cron_hint + prompt
     if skills is None:
