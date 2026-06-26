@@ -9,10 +9,15 @@ retried blindly. That known-not-delivered vs maybe-delivered split is the
 dividing line the roster seed path and the stream consumer both rely on.
 
 Extracted (mirrors the gateway.duration_format extraction) so the token set is
-authoritative in ONE place instead of duplicated across subagent_roster.py,
-stream_consumer.py, and the inline checks — and so tightening it (e.g. dropping
-the old bare ``"rate"`` substring that false-matched accurate/moderate/separate)
-happens once.
+authoritative in ONE place for the two SHARED predicates that classify a
+``SendResult`` failure — ``subagent_roster.is_flood_error`` and
+``GatewayStreamConsumer._is_flood_error`` — instead of each carrying its own
+substring list, and so tightening it (e.g. dropping the old bare ``"rate"``
+substring that false-matched accurate/moderate/separate) happens once. NOTE:
+two intentionally-narrow inline ``"flood"``-only backoff checks are NOT routed
+through here — ``gateway/run.py`` progress-edit backoff and
+``gateway/todo_card.py`` (its own comment pins it to the ``"flood"`` subset);
+both are non-seed, non-dup-sensitive paths that never used the bare ``"rate"``.
 """
 
 from __future__ import annotations
