@@ -4493,11 +4493,35 @@ class AIAgent:
         # api_mode-flip race (the Anthropic SDK raises a non-retryable
         # TypeError on them). See #31673.
         from agent.anthropic_adapter import create_anthropic_message
+
+        # Reset the per-request event timestamp before the call so a stale
+        # marker from a previous (potentially zombie) worker on this agent
+        # can't satisfy this call's TTFB check (B-race). The poll loop reads
+        # this attribute under the same generation id it stamps below.
+        _gen_id = object()
+        self._anthropic_stream_generation = _gen_id
+        self._anthropic_stream_last_event_ts = None
+        self._anthropic_stream_fallback_to_create = False
+
+        def _on_event(_event):
+            # Late-event race (B-race): a daemon worker that outlived its
+            # turn must not refresh the LIVE request's timestamp. We accept
+            # the event only if the agent's generation id still matches the
+            # one we stamped when this call started.
+            if self._anthropic_stream_generation is _gen_id:
+                self._anthropic_stream_last_event_ts = time.time()
+
+        def _on_fallback():
+            if self._anthropic_stream_generation is _gen_id:
+                self._anthropic_stream_fallback_to_create = True
+
         return create_anthropic_message(
             self._anthropic_client,
             api_kwargs,
             log_prefix=getattr(self, "log_prefix", ""),
             prefer_stream=not bool(getattr(self, "_disable_streaming", False)),
+            on_event=_on_event,
+            on_fallback_to_create=_on_fallback,
         )
 
     def _rebuild_anthropic_client(self) -> None:
