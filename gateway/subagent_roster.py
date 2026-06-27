@@ -19,6 +19,7 @@ Design contract (see plan ~/.hermes/plans/subagent-roster-bubble.md):
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -392,10 +393,38 @@ def _bucket_of(row: Dict[str, Any]) -> str:
     return "errored"
 
 
-def format_subagent_roster(rows: List[Dict[str, Any]], *, collapsed: bool = False) -> Optional[str]:
-    """Render roster rows into a bubble string. None when there are no rows."""
+def format_subagent_roster(
+    rows: List[Dict[str, Any]],
+    *,
+    collapsed: bool = False,
+    wall_clock: Optional[float] = None,
+) -> Optional[str]:
+    """Render roster rows into a bubble string. None when there are no rows.
+
+    ``wall_clock`` is the real elapsed time of the delegate_task call (the time
+    the user actually waited). When given and usable it is the header total;
+    otherwise the header falls back to the SLOWEST child's elapsed (parallel-
+    safe). We NEVER sum child elapsed: children run concurrently, so a sum
+    overcounts (3 parallel 3s children finish in ~3s wall-clock, not 9s).
+    """
     if not rows:
         return None
+
+    # Header time = authoritative wall-clock when usable, else the SLOWEST
+    # child (parallel-safe). NEVER sum. Reject non-finite/overflow: format_elapsed
+    # only catches TypeError/ValueError, so an int(round(inf)) -> OverflowError
+    # would crash the render and skip the max fallback.
+    def _usable(w: Any) -> Optional[float]:
+        try:
+            w = float(w)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return w if (math.isfinite(w) and w >= 0) else None
+
+    _wc = _usable(wall_clock)
+    header_elapsed = (
+        _wc if _wc is not None else max((r["elapsed"] for r in rows), default=0.0)
+    )
 
     buckets: Dict[str, List[Dict[str, Any]]] = {}
     for row in rows:
@@ -414,11 +443,11 @@ def format_subagent_roster(rows: List[Dict[str, Any]], *, collapsed: bool = Fals
         # terminal glyph) instead of collapsing to a bare one-liner — the user
         # wants to see WHICH children did what, not just a count. The summary
         # line becomes a header above the rows.
-        # Header elapsed is the SUM of every child's elapsed (combined
-        # agent-time), NOT max(): children run in parallel so max would just
-        # echo the slowest child and looks like a missing total. Alfredo wants
-        # the aggregate across both subagents.
-        total = sum((r["elapsed"] for r in rows), 0.0)
+        # Header elapsed is the WALL-CLOCK of the delegate_task call when known
+        # (computed once above as header_elapsed), else the slowest child. NOT
+        # the sum: children run in parallel, so summing overcounts the time the
+        # user actually waited.
+        total = header_elapsed
         # Clear "finished" indicator on the header, replacing the 🤖 robot:
         #   ✅  every child finished and NONE failed/timed-out/interrupted
         #   ⚠️  finished but at least one child failed (a green check would lie)
@@ -472,9 +501,10 @@ def format_subagent_roster(rows: List[Dict[str, Any]], *, collapsed: bool = Fals
         head += f", {len(done)} done"
     if failed_total:
         head += f", {len(failed_total)} failed"
-    # Live elapsed TOTAL across all rows (combined agent-time), so the header
-    # carries a ticking aggregate while children run instead of no time at all.
-    live_total = sum((r["elapsed"] for r in rows), 0.0)
+    # Live header elapsed is the WALL-CLOCK since dispatch when known (computed
+    # once above as header_elapsed), else the slowest running child. NOT the
+    # sum: children run in parallel, so a ticking sum overcounts wall-clock.
+    live_total = header_elapsed
     if live_total > 0:
         head += f" · {format_elapsed(live_total)}"
 
