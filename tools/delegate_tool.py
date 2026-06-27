@@ -2588,6 +2588,18 @@ def _run_single_child_attempt(
             # dropped on completion, so the roster needs this on the record to
             # keep showing the count on the finished row.
             "tool_count": len(tool_trace),
+            # PUBLIC per-child cost for the watcher roster's finished row + header
+            # total. Mirrors the private _child_cost_usd (which is underscore-
+            # stripped before the async result); this public key survives into the
+            # async child record. Display-only; the private key drives the parent
+            # session rollup.
+            "cost_usd": (
+                float(getattr(child, "session_estimated_cost_usd", 0.0) or 0.0)
+                if isinstance(
+                    getattr(child, "session_estimated_cost_usd", 0.0), (int, float)
+                )
+                else 0.0
+            ),
             "duration_seconds": duration,
             "model": _model if isinstance(_model, str) else None,
             "exit_reason": exit_reason,
@@ -3421,11 +3433,15 @@ def delegate_task(
         for _i, _t, _c, _, _ in children:
             _model = getattr(_c, "model", None)
             _reasoning = getattr(_c, "reasoning_config", None)
+            _spec = task_specs[_i] if _i < len(task_specs) else {}
             _child_records.append(
                 {
                     "task_index": _i,
                     "subagent_id": getattr(_c, "_subagent_id", "") or "",
                     "goal": _t["goal"],
+                    "profile": _spec.get("profile") or "",
+                    "role": _spec.get("role") or "",
+                    "toolsets": _spec.get("toolsets"),
                     "model": _model if isinstance(_model, str) else creds["model"],
                     "reasoning": _reasoning,
                     "status": "pending",

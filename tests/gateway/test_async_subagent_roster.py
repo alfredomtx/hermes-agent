@@ -514,3 +514,158 @@ async def test_watcher_roster_latches_on_ambiguous_failure(monkeypatch):
     clock["t"] += 30.0
     await runner._tick_async_delegation_rosters([_record()], active)
     assert len(adapter.sent) == 1, "latched seed must not re-attempt on an ambiguous failure"
+
+
+# ── MERGE: dispatched card seed rows + cost (delegate-card-into-roster) ──
+
+from gateway.async_subagent_roster import build_async_dispatched_seed_rows
+
+
+def test_dispatched_seed_rows_use_per_child_profile():
+    record = {
+        "goals": ["Review auth refactor", "Audit the migration"],
+        "children": [
+            {"task_index": 0, "goal": "Review auth refactor", "profile": "reviewer-codex"},
+            {"task_index": 1, "goal": "Audit the migration", "profile": "reviewer-opus"},
+        ],
+    }
+    assert build_async_dispatched_seed_rows(record) == [
+        "reviewer-codex · `Review auth refactor`",
+        "reviewer-opus · `Audit the migration`",
+    ]
+
+
+def test_dispatched_seed_rows_fallback_to_record_role_toolsets_when_no_profile():
+    record = {
+        "goals": ["do a thing"],
+        "role": "reviewer",
+        "toolsets": ["terminal", "file"],
+        "children": [{"task_index": 0, "goal": "do a thing"}],
+    }
+    assert build_async_dispatched_seed_rows(record) == [
+        "role=reviewer · toolsets=terminal,file · `do a thing`",
+    ]
+
+
+def test_dispatched_seed_rows_empty_record_is_empty():
+    assert build_async_dispatched_seed_rows({}) == []
+
+
+def test_async_terminal_rows_carry_cost_usd():
+    record = {
+        "delegation_id": "deleg_1",
+        "children": [
+            {
+                "task_index": 0,
+                "subagent_id": "sa-0",
+                "goal": "g0",
+                "status": "completed",
+                "duration_seconds": 5.0,
+                "cost_usd": 0.0231,
+            },
+            {
+                "task_index": 1,
+                "subagent_id": "sa-1",
+                "goal": "g1",
+                "status": "completed",
+                "duration_seconds": 6.0,
+                # no cost_usd -> no cost cell, not counted in total
+            },
+        ],
+    }
+    rows = build_async_subagent_roster_rows(record, [], now=200.0)
+    assert rows[0]["cost_usd"] == 0.0231
+    assert rows[1]["cost_usd"] is None
+
+    text = format_subagent_roster(rows, collapsed=True)
+    assert "· $0.0231" in text          # per-row cost (adaptive 4dp <$1)
+    assert "· $0.0231" in text.split("\n")[0] or "$0.0231" in text  # header total sums known only
+    # header total == only the known cost
+    assert "$0.0231" in text.split("\n")[0]
+
+
+def test_cost_format_adaptive_and_header_total():
+    from gateway.subagent_roster import _format_cost, _cost_suffix
+
+    assert _format_cost(0.0123) == "$0.0123"
+    assert _format_cost(1.0) == "$1.00"
+    assert _format_cost(1.2345) == "$1.23"
+    assert _format_cost(0.999) == "$0.9990"
+    assert _cost_suffix({"cost_usd": 0.0123}) == " · $0.0123"
+    assert _cost_suffix({"cost_usd": 2.5}) == " · $2.50"
+    assert _cost_suffix({"cost_usd": None}) == ""
+    assert _cost_suffix({"cost_usd": 0}) == ""
+    assert _cost_suffix({"cost_usd": "x"}) == ""
+    assert _cost_suffix({}) == ""
+
+    # Header sums known costs and uses adaptive format (0.6 + 0.6 = 1.20 -> 2dp).
+    rows = [
+        {"glyph": "✓", "label": "a", "elapsed": 1.0, "running": False, "tools": 0,
+         "bucket": "done", "model": "", "cost_usd": 0.6},
+        {"glyph": "✓", "label": "b", "elapsed": 1.0, "running": False, "tools": 0,
+         "bucket": "done", "model": "", "cost_usd": 0.6},
+    ]
+    head = format_subagent_roster(rows, collapsed=True).split("\n")[0]
+    assert "$1.20" in head
+
+
+def _config_args_and_roster_on():
+    return {"display": {"platforms": {"telegram": {
+        "subagent_roster": "on", "delegate_task_args": "on"}}}}
+
+
+@pytest.mark.asyncio
+async def test_watcher_seed_frame_shows_dispatched_card_then_edits_to_rows(monkeypatch):
+    """args:on + roster:on -> first watcher send is the dispatched card (profile
+    · goal), then it EDITS the same message to live roster rows."""
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", _config_args_and_roster_on)
+
+    adapter = AsyncRosterAdapter()
+    runner = _runner(adapter)
+    record = _record()
+    record["children"][0]["profile"] = "reviewer-codex"
+    record["children"][1]["profile"] = "reviewer-opus"
+
+    # First tick: not-yet-seeded -> dispatched card frame.
+    await runner._tick_async_delegation_rosters([record], [])
+    assert len(adapter.sent) == 1
+    seed = adapter.sent[0]["content"]
+    assert seed.startswith("🔀 Delegate task — 2 tasks")
+    assert "reviewer-codex · `sleep 6`" in seed
+    assert "reviewer-opus · `sleep 10`" in seed
+
+    # Second publish (a child now running): edits the SAME message to roster rows.
+    await runner._publish_async_delegation_roster(
+        record,
+        [{"subagent_id": "sa-0", "started_at": 101.0, "tool_count": 1}],
+        force=True,
+        collapsed=False,
+    )
+    assert len(adapter.sent) == 1  # no second send
+    assert adapter.edits
+    assert adapter.edits[-1]["content"].startswith("🤖 Subagents")
+    assert "🔀 Delegate task" not in adapter.edits[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_watcher_no_seed_frame_when_args_off(monkeypatch):
+    """roster:on + args:OFF -> NO dispatched-card seed frame (toggle independence)."""
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"display": {"platforms": {"telegram": {"subagent_roster": "on"}}}},
+    )
+
+    adapter = AsyncRosterAdapter()
+    runner = _runner(adapter)
+    record = _record()
+    record["children"][0]["profile"] = "reviewer-codex"
+
+    await runner._tick_async_delegation_rosters([record], [])
+    assert len(adapter.sent) == 1
+    assert "🔀 Delegate task" not in adapter.sent[0]["content"]
+    assert adapter.sent[0]["content"].startswith("🤖 Subagents")

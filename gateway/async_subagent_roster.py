@@ -139,6 +139,10 @@ def build_async_subagent_roster_rows(
         except (TypeError, ValueError):
             tools = 0
 
+        # Final cost: threaded as a PUBLIC cost_usd onto the child record (see
+        # delegate_tool._run_single_child + async_delegation._update_child_result_locked).
+        # Completion-only; missing/non-numeric -> None so the row shows no cost cell.
+        _row_cost = child.get("cost_usd")
         rows.append(
             {
                 "glyph": glyph,
@@ -149,7 +153,45 @@ def build_async_subagent_roster_rows(
                 "bucket": bucket,
                 "model": model,
                 "reasoning": reasoning,
+                "cost_usd": float(_row_cost) if isinstance(_row_cost, (int, float)) else None,
             }
         )
 
+    return rows
+
+
+def build_async_dispatched_seed_rows(record: Dict[str, Any]) -> List[str]:
+    """Card-style 'here is what I dispatched' rows for a BACKGROUND record.
+
+    One row per child in the same shape as the foreground delegate_task params
+    card (``[profile] · [role=… · toolsets=…] · `goal```). Per-child ``profile``
+    is used when the child record carries it (threaded in by delegate_tool); it
+    falls back to record-level ``role``/``toolsets`` when a child has none.
+    Returns [] when the record has no children/goals.
+    """
+    # Lazy import: gateway.run owns the canonical cell renderers; a module-load
+    # import would create a run.py <-> async_subagent_roster cycle.
+    from gateway.run import _delegate_goal_cell, _delegate_param_cells
+
+    children = _children_from_record(record)
+    if not children:
+        return []
+
+    record_spec = {
+        k: record.get(k)
+        for k in ("role", "toolsets")
+        if record.get(k) not in (None, "", [], {})
+    }
+    record_cells = _delegate_param_cells(record_spec)
+
+    rows: List[str] = []
+    for child in children:
+        cells: List[str] = []
+        profile = child.get("profile")
+        if profile not in (None, "", [], {}):
+            cells.append(" ".join(str(profile).replace("`", "").split()))
+        else:
+            cells.extend(record_cells)
+        cells.append(_delegate_goal_cell(child.get("goal")))
+        rows.append(" · ".join(cells))
     return rows

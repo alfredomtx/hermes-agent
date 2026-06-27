@@ -13556,14 +13556,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
         source, adapter, metadata = target
 
-        from gateway.async_subagent_roster import build_async_subagent_roster_rows
+        from gateway.async_subagent_roster import (
+            build_async_subagent_roster_rows,
+            build_async_dispatched_seed_rows,
+        )
         from gateway.subagent_roster import (
             format_subagent_roster,
             resolve_roster_interval,
         )
 
         rows = build_async_subagent_roster_rows(record, active_subagents)
-        text = format_subagent_roster(rows, collapsed=collapsed)
+        # MERGE: gate the dispatched-card seed frame on delegate_task_args too
+        # (toggle independence). The watcher is a global loop that otherwise only
+        # honors subagent_roster; without this, args:off + roster:on would still
+        # render the dispatched card frame. Resolve it with the same shape
+        # _async_roster_target uses for subagent_roster.
+        try:
+            from gateway.display_config import resolve_display_setting
+
+            _args_enabled = is_truthy_value(
+                resolve_display_setting(
+                    _load_gateway_config(),
+                    _platform_config_key(source.platform),
+                    "delegate_task_args",
+                    False,
+                ),
+                default=False,
+            )
+        except Exception:
+            _args_enabled = False
+        # Show the card-style "here is what I dispatched" frame as the FIRST render
+        # of this delegation's bubble (message_id is None == not yet seeded),
+        # regardless of whether a child already flipped to running by the first
+        # ~3s watcher tick. Preserves the suppressed foreground card's audit info
+        # (incl. per-child profile). Every subsequent edit uses the normal roster
+        # rows. collapsed (final) always uses the roster shape.
+        _existing_bubble = self._async_roster_bubbles().get(delegation_id) or {}
+        _not_yet_seeded = (
+            _existing_bubble.get("message_id") is None
+            and not _existing_bubble.get("seed_failed")
+        )
+        if _args_enabled and not collapsed and _not_yet_seeded:
+            seed_rows = build_async_dispatched_seed_rows(record)
+            if seed_rows:
+                shown = seed_rows[:10]
+                header = (
+                    "🔀 Delegate task"
+                    if len(seed_rows) == 1
+                    else f"🔀 Delegate task — {len(seed_rows)} tasks"
+                )
+                lines = [header, *shown]
+                extra = len(seed_rows) - len(shown)
+                if extra > 0:
+                    lines.append(f"… +{extra} more")
+                text = "\n".join(lines)
+            else:
+                text = format_subagent_roster(rows, collapsed=collapsed)
+        else:
+            text = format_subagent_roster(rows, collapsed=collapsed)
         if not text:
             return
 
@@ -13678,6 +13728,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not did:
             return
         try:
+            # Fast-completion: if the bubble was never seeded (the delegation
+            # finished before the first ~3s watcher tick) AND delegate_task_args
+            # is on, show the dispatched card frame once, then collapse-edit the
+            # SAME message. Without this the card-first view would be skipped (the
+            # seed branch in _publish is `not collapsed`). Gated on args so a
+            # roster-only (args:off) run still does a single collapsed send.
+            if self._async_roster_bubbles().get(did, {}).get("message_id") is None:
+                _args_on = False
+                try:
+                    from gateway.display_config import resolve_display_setting
+
+                    _tgt = self._async_roster_target(evt)
+                    if _tgt is not None:
+                        _src, _, _ = _tgt
+                        _args_on = is_truthy_value(
+                            resolve_display_setting(
+                                _load_gateway_config(),
+                                _platform_config_key(_src.platform),
+                                "delegate_task_args",
+                                False,
+                            ),
+                            default=False,
+                        )
+                except Exception:
+                    _args_on = False
+                if _args_on:
+                    try:
+                        await self._publish_async_delegation_roster(
+                            evt,
+                            active_subagents,
+                            force=True,
+                            collapsed=False,
+                            allow_seed=True,
+                        )
+                    except Exception:
+                        pass
             await self._publish_async_delegation_roster(
                 evt,
                 active_subagents,
@@ -15587,6 +15673,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if tool_name == "delegate_task" and delegate_task_args_enabled:
                 last_tool[0] = tool_name
                 last_was_terminal_block[0] = False
+                # MERGE: when the live roster is ALSO on, a top-level (background)
+                # delegate_task is rendered as ONE bubble by the WATCHER
+                # (_publish_async_delegation_roster) — dispatched card -> live rows
+                # -> collapse, with per-child profile + cost. So SUPPRESS the
+                # foreground standalone card here to avoid a second bubble.
+                # Background is FORCED by depth (the schema `background` param is
+                # ignored): a top-level delegate_task (_delegate_depth==0) is ALWAYS
+                # background (run_agent._dispatch_delegate_task). agent_holder[0] is
+                # the live top-level agent (depth 0), so this suppresses for every
+                # top-level dispatch (the only kind that reaches this tool.started
+                # site — nested children relay as subagent.tool). When the roster
+                # is OFF, the standalone card emits exactly as today.
+                _disp_agent = agent_holder[0] if agent_holder else None
+                _is_background = getattr(_disp_agent, "_delegate_depth", 0) == 0
+                if subagent_roster_enabled and _is_background:
+                    return  # watcher owns the merged bubble; no foreground card
                 for _card in _format_delegate_task_args_progress(args):
                     progress_queue.put(("__tool_start__", tool_name, _card))
                 return
