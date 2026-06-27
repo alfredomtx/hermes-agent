@@ -153,6 +153,24 @@ def _model_suffix(row: Dict[str, Any]) -> str:
     return f" · {model} {tag}".rstrip() if tag else f" · {model}"
 
 
+def _profile_suffix(row: Dict[str, Any]) -> str:
+    """`· <profile>` suffix for a row, or '' when no profile is known.
+
+    The profile (delegation lane, e.g. ``reviewer-codex``) is the audit cell
+    Alfredo wants kept VISIBLE after the dispatched-card seed frame morphs into
+    the live roster: the model id alone (``gpt-5.5``) does not say WHICH lane
+    ran. Shown on running, pending, AND finished rows so it never vanishes.
+    Backticks/whitespace are normalised like the card cell. Missing/empty -> ''.
+    """
+    raw = row.get("profile")
+    if not raw:
+        return ""
+    profile = " ".join(str(raw).replace("`", "").split())
+    if not profile:
+        return ""
+    return f" · {profile}"
+
+
 def _tools_suffix(row: Dict[str, Any]) -> str:
     """`· N tool(s)` suffix for a row, or '' when the count is 0/missing.
 
@@ -438,7 +456,7 @@ def format_subagent_roster(rows: List[Dict[str, Any]], *, collapsed: bool = Fals
             # shown with its live glyph; terminal rows keep ✓/✗/⏱/⏹. Tool count
             # is kept on done rows too, not dropped when running flips to False.
             line = (
-                f"{r['glyph']} `{r['label']}`{_model_suffix(r)}"
+                f"{r['glyph']} `{r['label']}`{_profile_suffix(r)}{_model_suffix(r)}"
                 f" · {format_elapsed(r['elapsed'])}{_tools_suffix(r)}{_cost_suffix(r)}"
             )
             lines.append(line)
@@ -464,7 +482,7 @@ def format_subagent_roster(rows: List[Dict[str, Any]], *, collapsed: bool = Fals
     shown = rows[:_MAX_ROWS]
     for r in shown:
         line = (
-            f"{r['glyph']} `{r['label']}`{_model_suffix(r)}"
+            f"{r['glyph']} `{r['label']}`{_profile_suffix(r)}{_model_suffix(r)}"
             f" · {format_elapsed(r['elapsed'])}{_tools_suffix(r)}{_cost_suffix(r)}"
         )
         lines.append(line)
