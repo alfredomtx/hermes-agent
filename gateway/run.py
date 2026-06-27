@@ -143,102 +143,126 @@ _GATEWAY_RATE_LIMIT_RE = re.compile(
     re.IGNORECASE,
 )
 
-_DELEGATE_TASK_ARGS_PROGRESS_CHARS = 3000
-_DELEGATE_TASK_ARGS_TEXT_PREVIEW_CHARS = 160
+_DELEGATE_TASK_GOAL_PREVIEW_CHARS = 120
+# Max delegate_task rows rendered on one card (batch tasks beyond this collapse
+# into a "… +N more" line). Mirrors gateway.subagent_roster._MAX_ROWS.
+_DELEGATE_TASK_MAX_ROWS = 10
+# Non-goal/context params surfaced (in this order) to the LEFT of the goal on a
+# roster row, after the profile. Curated so the row stays scannable instead of
+# dumping every arg (e.g. background=False). Keys absent from a call are skipped.
+_DELEGATE_TASK_ROW_PARAM_ORDER = ("role", "toolsets", "agentType", "acp_command")
 
 
-def _split_progress_payload(text: str, *, chunk_size: int = _DELEGATE_TASK_ARGS_PROGRESS_CHARS) -> List[str]:
-    """Split a large human-readable progress payload into message-sized chunks.
-
-    Gateway progress overflow normally splits between progress *items*, not
-    inside one large item. ``delegate_task`` arguments can contain large
-    ``context`` strings, so pre-chunk the payload before putting it on the
-    progress queue. Keep chunks line-oriented for readable Markdown fences and
-    hard-split very long lines so one JSON string cannot exceed Telegram's
-    message limit by itself.
-    """
-    chunk_size = max(100, int(chunk_size or _DELEGATE_TASK_ARGS_PROGRESS_CHARS))
-    chunks: List[str] = []
-    current: List[str] = []
-    current_len = 0
-
-    for raw_line in (text.splitlines() or [""]):
-        line_parts = [raw_line[i : i + chunk_size] for i in range(0, len(raw_line), chunk_size)] or [""]
-        for part in line_parts:
-            part_len = len(part) + 1
-            if current and current_len + part_len > chunk_size:
-                chunks.append("\n".join(current))
-                current = [part]
-                current_len = part_len
-            else:
-                current.append(part)
-                current_len += part_len
-
-    if current:
-        chunks.append("\n".join(current))
-    return chunks or [""]
-
-
-def _truncate_delegate_task_progress_fields(
-    value: Any,
-    *,
-    limit: int = _DELEGATE_TASK_ARGS_TEXT_PREVIEW_CHARS,
-) -> Any:
-    """Return a presentation-only copy with long delegate goal/context trimmed."""
-    try:
-        limit = max(1, int(limit))
-    except (TypeError, ValueError):
-        limit = _DELEGATE_TASK_ARGS_TEXT_PREVIEW_CHARS
-
-    if isinstance(value, dict):
-        truncated: dict[Any, Any] = {}
-        for key, item in value.items():
-            if key in {"goal", "context"} and isinstance(item, str) and len(item) > limit:
-                truncated[key] = item[:limit] + "..."
-            else:
-                truncated[key] = _truncate_delegate_task_progress_fields(item, limit=limit)
-        return truncated
-    if isinstance(value, list):
-        return [_truncate_delegate_task_progress_fields(item, limit=limit) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_truncate_delegate_task_progress_fields(item, limit=limit) for item in value)
-    return value
-
-
-def _format_delegate_task_args_progress(
-    args: Optional[dict], *, chunk_size: int = _DELEGATE_TASK_ARGS_PROGRESS_CHARS
-) -> List[str]:
-    """Render ``delegate_task`` call arguments as Telegram progress cards.
-
-    This is intentionally only the tool *input* payload, not subagent output.
-    It lets Telegram users audit exactly what context/instructions were handed
-    to child agents without switching all tool progress into noisy verbose mode.
-    """
-    display_args = _truncate_delegate_task_progress_fields(args or {})
-    try:
-        body = json.dumps(
-            display_args,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            default=str,
-        )
-    except Exception:
-        body = str(display_args)
-
+def _redact_delegate_text(text: str) -> str:
+    """Best-effort secret redaction for one rendered roster cell."""
     try:
         from agent.redact import redact_sensitive_text
 
-        body = redact_sensitive_text(body)
+        return redact_sensitive_text(text)
     except Exception:
-        pass
+        return text
 
-    chunks = _split_progress_payload(body, chunk_size=chunk_size)
-    total = len(chunks)
-    cards: List[str] = []
-    for index, chunk in enumerate(chunks, 1):
-        suffix = f" ({index}/{total})" if total > 1 else ""
-        cards.append(f"🔀 delegate_task parameters{suffix}\n```\n{chunk}\n```")
-    return cards
+
+def _delegate_goal_cell(goal: Any, *, limit: int = _DELEGATE_TASK_GOAL_PREVIEW_CHARS) -> str:
+    """Render the goal as an inline-code cell, whitespace-collapsed + capped.
+
+    Backticks are stripped (the cell renders inside a `` `...` `` span, so a
+    stray backtick would break it on Telegram), matching ``roster_label`` in
+    ``gateway.subagent_roster``. Empty/missing goal -> ``goal`` placeholder.
+    """
+    try:
+        cap = max(1, int(limit))
+    except (TypeError, ValueError):
+        cap = _DELEGATE_TASK_GOAL_PREVIEW_CHARS
+    text = " ".join(_redact_delegate_text(str(goal or "")).replace("`", "").split())
+    if not text:
+        text = "goal"
+    if len(text) > cap:
+        text = text[: cap - 1] + "…"
+    return f"`{text}`"
+
+
+def _delegate_param_cells(spec: dict) -> List[str]:
+    """Plain-text ``key=value`` cells for curated non-goal/context params.
+
+    Order is fixed by ``_DELEGATE_TASK_ROW_PARAM_ORDER`` so rows are stable.
+    Lists render compactly (``toolsets=terminal,file``); everything is
+    whitespace-collapsed, redacted, and kept short. Profile is handled
+    separately (it leads the row) so it is excluded here.
+    """
+    cells: List[str] = []
+    for key in _DELEGATE_TASK_ROW_PARAM_ORDER:
+        if key not in spec:
+            continue
+        value = spec.get(key)
+        if value is None or value == "" or value == [] or value == {}:
+            continue
+        if isinstance(value, (list, tuple)):
+            rendered = ",".join(str(v) for v in value)
+        else:
+            rendered = str(value)
+        # Strip backticks: plain cells must not introduce an inline-code
+        # delimiter that pairs with the goal cell's backticks on Telegram.
+        rendered = " ".join(_redact_delegate_text(rendered).replace("`", "").split())
+        if len(rendered) > 60:
+            rendered = rendered[:59] + "…"
+        cells.append(f"{key}={rendered}")
+    return cells
+
+
+def _delegate_task_row(spec: dict, *, default_profile: Optional[str]) -> str:
+    """One roster row: ``profile · key=val · `goal` `` (profile NOT backticked).
+
+    Per-task ``profile`` overrides the call-level ``default_profile``. The goal
+    is the only inline-code cell; profile and extra params are plain text, all
+    joined by `` · `` — mirroring the subagent roster's row shape.
+    """
+    profile = spec.get("profile") or default_profile
+    left: List[str] = []
+    if profile:
+        # Strip backticks for the same reason as param/goal cells: the profile
+        # is plain text and a stray backtick would break the goal code span.
+        left.append(" ".join(_redact_delegate_text(str(profile)).replace("`", "").split()))
+    left.extend(_delegate_param_cells(spec))
+    left.append(_delegate_goal_cell(spec.get("goal")))
+    return " · ".join(left)
+
+
+def _format_delegate_task_args_progress(args: Optional[dict]) -> List[str]:
+    """Render ``delegate_task`` call args as a compact Telegram roster card.
+
+    Mirrors the live subagent roster style (``gateway.subagent_roster``):
+    a ``🔀 Delegate task`` header, then one row per dispatched task with the
+    profile (plus any curated extra param) on the left and the goal as an
+    inline-code cell capped at ``_DELEGATE_TASK_GOAL_PREVIEW_CHARS`` on the
+    right. This is intentionally only the tool *input* payload, never subagent
+    output, so Telegram users can audit what was handed to child agents without
+    switching all tool progress into noisy verbose mode.
+
+    Batch mode: when ``args['tasks']`` is a non-empty list, each entry is its
+    own row (per-task ``profile`` overrides the call-level one). Otherwise the
+    single top-level ``goal`` is one row.
+    """
+    args = args or {}
+    default_profile = args.get("profile")
+
+    tasks = args.get("tasks")
+    specs: List[dict]
+    if isinstance(tasks, list) and tasks:
+        specs = [t if isinstance(t, dict) else {"goal": t} for t in tasks]
+        header = f"🔀 Delegate task — {len(specs)} tasks"
+    else:
+        specs = [args]
+        header = "🔀 Delegate task"
+
+    lines = [header]
+    shown = specs[:_DELEGATE_TASK_MAX_ROWS]
+    for spec in shown:
+        lines.append(_delegate_task_row(spec, default_profile=default_profile))
+    extra = len(specs) - len(shown)
+    if extra > 0:
+        lines.append(f"… +{extra} more")
+    return ["\n".join(lines)]
 
 
 def _tool_progress_pipeline_enabled(

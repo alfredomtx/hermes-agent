@@ -251,7 +251,10 @@ async def test_duration_suffix_survives_reset_from_interim_content(monkeypatch):
 
     assert result["final_response"] == "done"
     # The tool whose completion straddled the interim __reset__ keeps its suffix.
-    assert "🔀 delegate_task parameters · 2m 05s" in rendered
+    # NOTE: the delegate_task card now renders as the roster-style header
+    # ("🔀 Delegate task — N tasks") instead of the old "delegate_task
+    # parameters" JSON card; the duration suffix still attaches to that line.
+    assert "🔀 Delegate task — 1 tasks · 2m 05s" in rendered
     # The last tools before the reply keep their suffixes too.
     assert 'write_file: "/tmp/x.out" · 0.5s' in rendered
 
