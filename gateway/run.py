@@ -29,6 +29,7 @@ import dataclasses
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -13566,6 +13567,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
         rows = build_async_subagent_roster_rows(record, active_subagents)
+
+        # Header wall-clock for this delegation (the real time waited), threaded
+        # into format_subagent_roster so the header is NOT a sum of parallel
+        # child durations. _coerce returns finite-or-None so a malformed/non-
+        # finite timestamp can never produce a bogus 0.0 or a non-finite value
+        # (the formatter's _usable is a second finite-guard, defense in depth).
+        def _coerce(v: Any) -> Optional[float]:
+            try:
+                v = float(v)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return v if math.isfinite(v) else None
+
+        if collapsed:
+            # Authoritative batch wall-clock; fall back to completed-dispatched.
+            _wall = _coerce(record.get("total_duration_seconds"))
+            if _wall is None:
+                _d = _coerce(record.get("dispatched_at"))
+                _c = _coerce(record.get("completed_at"))
+                _wall = max(0.0, _c - _d) if (_d is not None and _c is not None) else None
+        else:
+            # Live: real elapsed since dispatch.
+            _d = _coerce(record.get("dispatched_at"))
+            _wall = max(0.0, time.time() - _d) if _d is not None else None
+
         # MERGE: gate the dispatched-card seed frame on delegate_task_args too
         # (toggle independence). The watcher is a global loop that otherwise only
         # honors subagent_roster; without this, args:off + roster:on would still
@@ -13611,9 +13637,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     lines.append(f"… +{extra} more")
                 text = "\n".join(lines)
             else:
-                text = format_subagent_roster(rows, collapsed=collapsed)
+                text = format_subagent_roster(rows, collapsed=collapsed, wall_clock=_wall)
         else:
-            text = format_subagent_roster(rows, collapsed=collapsed)
+            text = format_subagent_roster(rows, collapsed=collapsed, wall_clock=_wall)
         if not text:
             return
 

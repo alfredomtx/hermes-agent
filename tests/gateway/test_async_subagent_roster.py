@@ -97,8 +97,9 @@ def test_async_final_rows_fallback_to_results_when_children_missing():
 
     # Collapsed render now keeps the per-child breakdown under a summary header.
     lines = text.split("\n")
-    # Header elapsed is the SUM of all children (6+10=16s), not max.
-    assert lines[0] == "⚠️ 2 subagents · 1 ✓ · 1 ✗ · 16s"
+    # Header elapsed is the WALL-CLOCK fallback = slowest child (max(6,10)=10),
+    # NOT the sum (16): this direct call passes no wall_clock.
+    assert lines[0] == "⚠️ 2 subagents · 1 ✓ · 1 ✗ · 10s"
     assert lines[1] == "✓ `sleep 6` · 6s"
     assert lines[2] == "✗ `sleep 10` · 10s"
 
@@ -228,6 +229,7 @@ async def test_watcher_roster_seeds_edits_and_collapses(monkeypatch):
     assert "✓ `sleep 6` · 6s" in adapter.edits[-1]["content"]
 
     final_evt = _record(status="completed")
+    final_evt["total_duration_seconds"] = 4.0  # authoritative batch wall-clock
     final_evt["children"][0]["status"] = "completed"
     final_evt["children"][0]["duration_seconds"] = 6.0
     final_evt["children"][1]["status"] = "completed"
@@ -235,9 +237,39 @@ async def test_watcher_roster_seeds_edits_and_collapses(monkeypatch):
 
     await runner._finalize_async_delegation_roster(final_evt, [])
 
-    # Header elapsed is the SUM of all children (6+10=16s), not max.
-    assert "✅ 2 subagents · 2 ✓ · 16s" in adapter.edits[-1]["content"]
+    # Header elapsed is the batch WALL-CLOCK (total_duration_seconds=4.0),
+    # threaded end-to-end, NOT the sum of children (6+10=16s).
+    assert "✅ 2 subagents · 2 ✓ · 4s" in adapter.edits[-1]["content"]
     assert "deleg_bg" not in runner._async_subagent_roster_bubbles
+
+
+@pytest.mark.asyncio
+async def test_watcher_live_header_uses_wall_clock(monkeypatch):
+    # AC2: the LIVE (running) header shows real elapsed since dispatch
+    # (now - dispatched_at), NOT a sum of child elapsed. Clock is FROZEN so the
+    # whole-second rounding can't flake across the 96.5s boundary.
+    import time as _time
+    import gateway.run as gateway_run
+
+    FIXED = 1_000_000.0
+    monkeypatch.setattr(_time, "time", lambda: FIXED)
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"display": {"platforms": {"telegram": {"subagent_roster": "on"}}}},
+    )
+
+    adapter = AsyncRosterAdapter()
+    runner = _runner(adapter)
+    record = _record()  # status running, is_batch True
+    record["dispatched_at"] = FIXED - 96.0  # dispatched 1m 36s ago
+
+    await runner._tick_async_delegation_rosters([record], [])
+
+    assert adapter.sent
+    # Live header carries wall-clock since dispatch (96s -> "1m 36s"), never a
+    # sum of the two child elapsed.
+    assert "· 1m 36s" in adapter.sent[0]["content"]
 
 
 @pytest.mark.asyncio

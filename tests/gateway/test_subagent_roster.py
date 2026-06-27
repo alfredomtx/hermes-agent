@@ -232,8 +232,9 @@ class TestFormatSubagentRoster:
         ]
         text = format_subagent_roster(rows)
         lines = text.split("\n")
-        # Live header carries the SUM of all rows' elapsed (83+80+45+30=238s).
-        assert lines[0] == "🤖 Subagents — 2 running, 1 done, 1 failed · 3m 58s"
+        # Live header carries the WALL-CLOCK fallback = slowest row's elapsed
+        # (max(83,80,45,30)=83), NOT the sum: children run in parallel.
+        assert lines[0] == "🤖 Subagents — 2 running, 1 done, 1 failed · 1m 23s"
         assert lines[1] == "▶ `verify php` · 1m 23s · 8 tools"
         assert lines[2] == "▶ `verify fe` · 1m 20s"
         assert lines[3] == "✓ `run tests` · 45s"
@@ -269,8 +270,9 @@ class TestFormatSubagentRoster:
         out = format_subagent_roster(rows, collapsed=True)
         lines = out.split("\n")
         # A failure is present -> ⚠️ leads (a green check there would lie).
-        # Header elapsed is the SUM of all children (45+60+134=239s), not max.
-        assert lines[0] == "⚠️ 3 subagents · 2 ✓ · 1 ✗ · 3m 59s"
+        # Header elapsed is the WALL-CLOCK fallback = slowest child
+        # (max(45,60,134)=134), NOT the sum: children run in parallel.
+        assert lines[0] == "⚠️ 3 subagents · 2 ✓ · 1 ✗ · 2m 14s"
         assert lines[1] == "✓ `a` · 45s"
         assert lines[2] == "✓ `b` · 1m"
         assert lines[3] == "✗ `c` · 2m 14s"
@@ -286,8 +288,9 @@ class TestFormatSubagentRoster:
         ]
         out = format_subagent_roster(rows, collapsed=True)
         lines = out.split("\n")
-        # Header elapsed is the SUM of all children (45+60=105s), not max.
-        assert lines[0] == "✅ 2 subagents · 2 ✓ · 1m 45s"
+        # Header elapsed is the WALL-CLOCK fallback = slowest child
+        # (max(45,60)=60), NOT the sum: children run in parallel.
+        assert lines[0] == "✅ 2 subagents · 2 ✓ · 1m"
 
     def test_collapsed_single_success_leads_with_green_check(self):
         from gateway.subagent_roster import format_subagent_roster
@@ -351,6 +354,44 @@ class TestFormatSubagentRoster:
         ]
         text = format_subagent_roster(rows)
         assert text.split("\n")[-1] == "… +3 more"  # 13 rows, cap 10
+
+    def test_header_wall_clock_overrides_sum(self):
+        # The header total is the delegate_task WALL-CLOCK when provided, NOT a
+        # sum of child elapsed. Two children [6,10] but wall_clock=4.0 -> "4s".
+        from gateway.subagent_roster import format_subagent_roster
+
+        rows = [
+            {"glyph": "✓", "label": "a", "elapsed": 6.0, "running": False, "tools": 0},
+            {"glyph": "✓", "label": "b", "elapsed": 10.0, "running": False, "tools": 0},
+        ]
+        out = format_subagent_roster(rows, collapsed=True, wall_clock=4.0)
+        assert out.split("\n")[0] == "✅ 2 subagents · 2 ✓ · 4s"
+
+    def test_header_fallback_is_max_not_sum(self):
+        # With no wall_clock, the header falls back to the SLOWEST child
+        # (max(6,10)=10 -> "10s"), never the sum (16 -> "16s").
+        from gateway.subagent_roster import format_subagent_roster
+
+        rows = [
+            {"glyph": "✓", "label": "a", "elapsed": 6.0, "running": False, "tools": 0},
+            {"glyph": "✓", "label": "b", "elapsed": 10.0, "running": False, "tools": 0},
+        ]
+        out = format_subagent_roster(rows, collapsed=True)
+        assert out.split("\n")[0] == "✅ 2 subagents · 2 ✓ · 10s"
+
+    def test_header_ignores_bad_wall_clock(self):
+        # A malformed/non-finite wall_clock must NOT crash the render and must
+        # route to the max(child) fallback. inf in particular must not reach
+        # format_elapsed's int(round(inf)) (OverflowError). All -> "10s".
+        from gateway.subagent_roster import format_subagent_roster
+
+        rows = [
+            {"glyph": "✓", "label": "a", "elapsed": 6.0, "running": False, "tools": 0},
+            {"glyph": "✓", "label": "b", "elapsed": 10.0, "running": False, "tools": 0},
+        ]
+        for bad in ("x", -5, float("inf"), float("-inf"), float("nan"), None, 10**400):
+            out = format_subagent_roster(rows, collapsed=True, wall_clock=bad)
+            assert out.split("\n")[0] == "✅ 2 subagents · 2 ✓ · 10s", bad
 
 
 class TestShortenModel:
