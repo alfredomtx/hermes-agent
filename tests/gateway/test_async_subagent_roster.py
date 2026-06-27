@@ -668,4 +668,89 @@ async def test_watcher_no_seed_frame_when_args_off(monkeypatch):
     await runner._tick_async_delegation_rosters([record], [])
     assert len(adapter.sent) == 1
     assert "🔀 Delegate task" not in adapter.sent[0]["content"]
-    assert adapter.sent[0]["content"].startswith("🤖 Subagents")
+
+
+# ── Fix A: profile must PERSIST in roster rows after the seed card morphs ──
+# Regression for "I don't see the profile anymore, only the Subagents part":
+# the dispatched-card seed frame shows profile for one interval then EDITS into
+# the live roster, which previously rendered only model (gpt-5.5 / opus-4-8),
+# dropping the lane (reviewer-codex / reviewer-opus). The profile is now a row
+# cell so it survives the morph in running, partial-done, AND collapsed states.
+
+def test_roster_rows_carry_profile_in_all_states():
+    """build_async_subagent_roster_rows threads child profile onto every row
+    bucket (running / pending / terminal) so the renderer can keep it visible."""
+    record = {
+        "delegation_id": "deleg_p",
+        "dispatched_at": 100.0,
+        "children": [
+            {"task_index": 0, "subagent_id": "sa-0", "goal": "g0",
+             "profile": "reviewer-codex", "status": "completed", "duration_seconds": 5.0},
+            {"task_index": 1, "subagent_id": "sa-1", "goal": "g1",
+             "profile": "reviewer-opus", "status": "pending"},
+        ],
+    }
+    active = [{"subagent_id": "sa-1", "started_at": 100.0, "tool_count": 0}]
+    rows = build_async_subagent_roster_rows(record, active, now=110.0)
+    by_label = {r["label"]: r for r in rows}
+    assert by_label["g0"]["profile"] == "reviewer-codex"   # terminal row
+    assert by_label["g1"]["profile"] == "reviewer-opus"    # running row
+
+
+def test_profile_suffix_renders_and_survives_morph():
+    """_profile_suffix renders the lane, and a full roster line keeps it in both
+    the live and collapsed render — the exact cell that used to vanish."""
+    from gateway.subagent_roster import _profile_suffix
+
+    assert _profile_suffix({"profile": "reviewer-codex"}) == " · reviewer-codex"
+    assert _profile_suffix({"profile": "  reviewer`-`opus "}) == " · reviewer-opus"
+    assert _profile_suffix({"profile": ""}) == ""
+    assert _profile_suffix({}) == ""
+
+    rows = [
+        {"glyph": "✓", "label": "g0", "elapsed": 5.0, "running": False, "tools": 70,
+         "bucket": "done", "model": "gpt-5.5", "profile": "reviewer-codex"},
+        {"glyph": "✓", "label": "g1", "elapsed": 6.0, "running": False, "tools": 42,
+         "bucket": "done", "model": "us.anthropic.claude-opus-4-8", "profile": "reviewer-opus"},
+    ]
+    live = format_subagent_roster(rows, collapsed=False)
+    collapsed = format_subagent_roster(rows, collapsed=True)
+    assert live is not None and collapsed is not None
+    for text in (live, collapsed):
+        assert "reviewer-codex" in text
+        assert "reviewer-opus" in text
+        # profile sits before the model cell: `g0` · reviewer-codex · gpt-5.5
+        assert "`g0` · reviewer-codex · gpt-5.5" in text
+
+
+@pytest.mark.asyncio
+async def test_watcher_profile_persists_through_card_to_roster_edit(monkeypatch):
+    """End-to-end watcher proof: the seed card shows profile, and after it EDITS
+    into the live roster the SAME profile is still present in the row (the bug)."""
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", _config_args_and_roster_on)
+
+    adapter = AsyncRosterAdapter()
+    runner = _runner(adapter)
+    record = _record()
+    record["children"][0]["profile"] = "reviewer-codex"
+    record["children"][1]["profile"] = "reviewer-opus"
+
+    # Seed card frame.
+    await runner._tick_async_delegation_rosters([record], [])
+    assert "reviewer-codex" in adapter.sent[0]["content"]
+
+    # Morph to the live roster — profile must NOT vanish.
+    await runner._publish_async_delegation_roster(
+        record,
+        [{"subagent_id": "sa-0", "started_at": 101.0, "tool_count": 1},
+         {"subagent_id": "sa-1", "started_at": 102.0, "tool_count": 0}],
+        force=True,
+        collapsed=False,
+    )
+    edited = adapter.edits[-1]["content"]
+    assert edited.startswith("🤖 Subagents")
+    assert "🔀 Delegate task" not in edited
+    assert "reviewer-codex" in edited   # ← the regression: lane survives the morph
+    assert "reviewer-opus" in edited
