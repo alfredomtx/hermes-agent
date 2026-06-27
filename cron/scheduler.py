@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -2421,6 +2422,73 @@ def _guard_job_credential_exfil(job: dict) -> None:
         raise RuntimeError(f"Cron job '{job_id}' blocked for safety: {err}")
 
 
+def _parse_wallclock_timeout(raw):
+    """Per-job wall-clock cap parser. None/""/0/negative/invalid → None (unlimited).
+    Extracted as a module-level helper so the real parsing logic is unit-testable
+    (not re-implemented in tests)."""
+    if raw in (None, "", 0, "0"):
+        return None
+    try:
+        v = float(raw)
+    except (ValueError, TypeError):
+        return None
+    return v if v > 0 else None
+
+
+def _poll_cron_future(cron_future, agent, *, inactivity_limit, wallclock_limit,
+                      poll_interval, run_start):
+    """Block until the cron future completes OR a timeout cap is crossed.
+
+    Returns (result, timeout_cause, elapsed). timeout_cause is None | "inactivity"
+    | "wallclock". When a cap fires, result is None (the worker is still running).
+
+    Entry contract: the caller enters the poll loop when EITHER cap is set; if both
+    are None it should just await the future directly. Wall-clock is checked FIRST
+    (precedence) because an active-every-poll runaway never crosses the inactivity
+    threshold, so only wall-clock can catch it. This is the REAL logic exercised by
+    run_job — tests drive THIS function, not a copy."""
+    while True:
+        done, _ = concurrent.futures.wait({cron_future}, timeout=poll_interval)
+        if done:
+            return cron_future.result(), None, time.monotonic() - run_start
+        elapsed = time.monotonic() - run_start
+        if wallclock_limit is not None and elapsed >= wallclock_limit:
+            return None, "wallclock", elapsed
+        _idle_secs = 0.0
+        if hasattr(agent, "get_activity_summary"):
+            try:
+                _act = agent.get_activity_summary()
+                _idle_secs = _act.get("seconds_since_activity", 0.0)
+            except Exception:
+                pass
+        if inactivity_limit is not None and _idle_secs >= inactivity_limit:
+            return None, "inactivity", elapsed
+
+
+def _write_cron_killed_sentinel(cron_session_id, job_id, *, cause, elapsed,
+                                wallclock_limit, interrupt_state):
+    """Write the GENERIC killed-sentinel (job-agnostic). pr-2c (or any job) reconciles
+    it into its own surface on the next tick. Best-effort; never raises."""
+    if not cron_session_id:
+        return None
+    try:
+        _killed_dir = Path(os.path.expanduser("~/.hermes/state/cron-killed"))
+        _killed_dir.mkdir(parents=True, exist_ok=True)
+        _path = _killed_dir / f"{cron_session_id}.json"
+        _path.write_text(json.dumps({
+            "cause": cause,
+            "elapsed_s": round(elapsed, 1),
+            "wallclock_limit_s": wallclock_limit,
+            "job_id": job_id,
+            "interrupt_state": interrupt_state,
+            "at": int(time.time()),
+        }) + "\n")
+        return str(_path)
+    except Exception:
+        return None
+
+
+
 def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -3022,6 +3090,14 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         else:
             _cron_timeout = 600.0
         _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
+
+        # Per-job WALL-CLOCK cap (total runtime), distinct from the inactivity cap above.
+        # default None = unlimited (behavior-preserving for every job without the field).
+        # Behavioral config lives in jobs.json (AGENTS.md: no new HERMES_* for non-secret).
+        _wallclock_limit = _parse_wallclock_timeout(job.get("wallclock_timeout"))
+        if job.get("wallclock_timeout") not in (None, "", 0, "0") and _wallclock_limit is None:
+            logger.warning("Job '%s': invalid wallclock_timeout=%r; treating as unlimited",
+                           job_name, job.get("wallclock_timeout"))
         _POLL_INTERVAL = 5.0
         _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         # Preserve scheduler-scoped ContextVar state (for example skill-declared
@@ -3029,37 +3105,68 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # thread used for inactivity timeout monitoring.
         _cron_context = contextvars.copy_context()
         _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
-        _inactivity_timeout = False
+        _timeout_cause = None  # None | "inactivity" | "wallclock"
+        _run_start = time.monotonic()
+        _elapsed = 0.0
         try:
-            if _cron_inactivity_limit is None:
-                # Unlimited — just wait for the result.
+            if _cron_inactivity_limit is None and _wallclock_limit is None:
+                # Unlimited — just wait for the result (byte-for-byte the old no-cap path).
                 result = _cron_future.result()
             else:
-                result = None
-                while True:
-                    done, _ = concurrent.futures.wait(
-                        {_cron_future}, timeout=_POLL_INTERVAL,
-                    )
-                    if done:
-                        result = _cron_future.result()
-                        break
-                    # Agent still running — check inactivity.
-                    _idle_secs = 0.0
-                    if hasattr(agent, "get_activity_summary"):
-                        try:
-                            _act = agent.get_activity_summary()
-                            _idle_secs = _act.get("seconds_since_activity", 0.0)
-                        except Exception:
-                            pass
-                    if _idle_secs >= _cron_inactivity_limit:
-                        _inactivity_timeout = True
-                        break
+                # Poll loop is entered when EITHER cap is set (so a wall-clock cap is honored
+                # even when inactivity is disabled, HERMES_CRON_TIMEOUT=0). Real logic lives
+                # in the module-level _poll_cron_future helper so tests exercise THIS code.
+                result, _timeout_cause, _elapsed = _poll_cron_future(
+                    _cron_future, agent,
+                    inactivity_limit=_cron_inactivity_limit,
+                    wallclock_limit=_wallclock_limit,
+                    poll_interval=_POLL_INTERVAL, run_start=_run_start,
+                )
         except Exception:
             _cron_pool.shutdown(wait=False, cancel_futures=True)
             raise
         finally:
             _cron_pool.shutdown(wait=False, cancel_futures=True)
 
+        if _timeout_cause == "wallclock":
+            # Total-runtime cap hit. agent.interrupt() is COOPERATIVE (sets a flag the
+            # agent loop honors at its next turn-top checkpoint + aborts in-flight
+            # tools/HTTP); it is NOT a hard thread kill. We request the interrupt, wait a
+            # bounded grace for the worker to actually unwind, log completed-vs-pending,
+            # write a GENERIC killed-sentinel (job-agnostic — pr-2c reconciles it into a
+            # Telegram REFUSE@runaway card on its next tick), then raise TimeoutError so
+            # the job is marked failed regardless of whether the thread has exited yet.
+            logger.error(
+                "Job '%s' exceeded wall-clock cap (%.0fs >= %.0fs) — requesting cooperative interrupt",
+                job_name, _elapsed, _wallclock_limit,
+            )
+            if hasattr(agent, "interrupt"):
+                try:
+                    agent.interrupt("Cron job timed out (wall-clock)")
+                except Exception:
+                    pass
+            _interrupt_state = "interrupt_pending"
+            try:
+                _cron_future.result(timeout=30)
+                _interrupt_state = "interrupt_completed"
+            except Exception:
+                _interrupt_state = "interrupt_pending"
+            logger.error("Job '%s' wall-clock interrupt: %s", job_name, _interrupt_state)
+            _sess = None
+            try:
+                _sess = _cron_session_id  # bound earlier in this function
+            except NameError:
+                _sess = None
+            _write_cron_killed_sentinel(
+                _sess, job_id, cause="wallclock", elapsed=_elapsed,
+                wallclock_limit=_wallclock_limit, interrupt_state=_interrupt_state,
+            )
+            raise TimeoutError(
+                f"Cron job '{job_name}' exceeded wall-clock cap "
+                f"({int(_elapsed)}s >= {int(_wallclock_limit)}s) — {_interrupt_state}"
+            )
+
+        _inactivity_timeout = (_timeout_cause == "inactivity")
         if _inactivity_timeout:
             # Build diagnostic summary from the agent's activity tracker.
             _activity = {}
