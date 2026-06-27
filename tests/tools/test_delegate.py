@@ -1004,6 +1004,160 @@ class TestDelegateTask(unittest.TestCase):
         parent.tool_progress_callback.assert_not_called()
 
 
+class TestDualPlanProfile(unittest.TestCase):
+    """The dual-plan pseudo-profile fans one task into both planner lanes,
+    mirroring dual-review. Pure ergonomics; the require_dual_review gate is
+    unaffected (planner profiles are not single-reviewer profiles)."""
+
+    def test_dual_plan_expands_to_two_planner_lanes_with_both_flags(self):
+        from unittest.mock import patch as mock_patch
+        from tools.delegate_tool import (
+            _expand_reserved_profile_task_items,
+            _get_dual_planner_profiles,
+        )
+
+        cfg = {
+            "dual_plan_profiles": ["planner-codex", "planner-opus"],
+            "profiles": {
+                "planner-codex": {"provider": "openai-codex"},
+                "planner-opus": {"provider": "bedrock"},
+            },
+        }
+        with mock_patch("tools.delegate_tool._load_config", return_value=cfg):
+            lanes = _get_dual_planner_profiles()
+            self.assertEqual(lanes, ("planner-codex", "planner-opus"))
+            items = _expand_reserved_profile_task_items(
+                [{"profile": "dual-plan", "goal": "plan the feature"}], None
+            )
+            # exactly 2 children, one per planner lane
+            self.assertEqual([it["task"]["profile"] for it in items], list(lanes))
+            # BOTH flags present on every item; dual-plan True, dual-review False
+            for it in items:
+                self.assertIn("from_dual_review", it)
+                self.assertIn("from_dual_plan", it)
+                self.assertFalse(it["from_dual_review"])
+                self.assertTrue(it["from_dual_plan"])
+                self.assertEqual(it["dual_plan_profile"], "dual-plan")
+                self.assertIsNone(it["dual_review_profile"])
+                # lane marker injected into the child context
+                self.assertIn("DUAL-PLAN LANE", it["task"]["context"])
+            # original source_index preserved
+            self.assertEqual([it["source_index"] for it in items], [0, 0])
+
+    def test_dual_plan_roster_config_driven_with_fallback(self):
+        from unittest.mock import patch as mock_patch
+        from tools.delegate_tool import (
+            _get_dual_planner_profiles,
+            DUAL_PLANNER_PROFILES,
+        )
+
+        # typo'd lane (well-formed, not in profiles) -> skipped -> <2 usable ->
+        # fall back to the default pair (never hard-fail, never shrink to one).
+        typo = {
+            "dual_plan_profiles": ["planner-codex", "planner-typo"],
+            "profiles": {
+                "planner-codex": {"provider": "openai-codex"},
+                "planner-opus": {"provider": "bedrock"},
+            },
+        }
+        with mock_patch("tools.delegate_tool._load_config", return_value=typo):
+            self.assertEqual(_get_dual_planner_profiles(), DUAL_PLANNER_PROFILES)
+
+        # absent key -> default pair
+        with mock_patch("tools.delegate_tool._load_config", return_value={}):
+            self.assertEqual(_get_dual_planner_profiles(), DUAL_PLANNER_PROFILES)
+
+        # unreadable profiles map -> existence check skipped, names trusted
+        no_profiles = {"dual_plan_profiles": ["lane-a", "lane-b"], "profiles": None}
+        with mock_patch("tools.delegate_tool._load_config", return_value=no_profiles):
+            self.assertEqual(_get_dual_planner_profiles(), ("lane-a", "lane-b"))
+
+    def test_non_reserved_task_passes_through_with_both_flags_false(self):
+        from tools.delegate_tool import _expand_reserved_profile_task_items
+
+        items = _expand_reserved_profile_task_items(
+            [{"profile": "coder", "goal": "do a thing"}], None
+        )
+        self.assertEqual(len(items), 1)
+        self.assertFalse(items[0]["from_dual_review"])
+        self.assertFalse(items[0]["from_dual_plan"])
+        self.assertEqual(items[0]["task"]["profile"], "coder")
+
+    def test_mixed_batch_dispatch_does_not_regress_dual_review_gate(self):
+        """The B1/B2 seam: a mixed batch [dual-review, dual-plan, coder] under
+        require_dual_review=true must (a) still expand dual-review with
+        from_dual_review=True and NOT block it, (b) expand dual-plan to 2 planner
+        lanes, (c) pass coder through. The expanded count (2+2+1=5) needs the cap
+        raised above the default 3, so set max_concurrent_children=5."""
+        parent = _make_mock_parent(depth=0)
+        cfg = {
+            "require_dual_review": True,
+            "max_concurrent_children": 5,
+            "dual_review_profiles": ["reviewer-codex", "reviewer-opus"],
+            "dual_plan_profiles": ["planner-codex", "planner-opus"],
+            "profiles": {
+                "reviewer-codex": {"provider": "openai-codex", "model": "gpt-5.5"},
+                "reviewer-opus": {"provider": "bedrock", "model": "us.anthropic.claude-opus-4-8"},
+                "planner-codex": {"provider": "openai-codex", "model": "gpt-5.5"},
+                "planner-opus": {"provider": "bedrock", "model": "us.anthropic.claude-opus-4-8"},
+                "coder": {"provider": "bedrock", "model": "us.anthropic.claude-opus-4-8"},
+            },
+        }
+
+        def fake_creds(profile_cfg, _parent):
+            return {
+                "model": profile_cfg.get("model"),
+                "provider": profile_cfg.get("provider"),
+                "base_url": None, "api_key": None, "api_mode": None,
+                "command": None, "args": [],
+            }
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value=cfg),
+            patch("tools.delegate_tool._resolve_delegation_credentials", side_effect=fake_creds),
+            patch("run_agent.AIAgent") as MockAgent,
+        ):
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "ok", "completed": True, "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(
+                    tasks=[
+                        {"profile": "dual-review", "goal": "review the diff"},
+                        {"profile": "dual-plan", "goal": "plan the feature"},
+                        {"profile": "coder", "goal": "tiny edit"},
+                    ],
+                    parent_agent=parent,
+                )
+            )
+
+        # NOT blocked by the single-reviewer gate (dual-review expansion is trusted,
+        # dual-plan/coder are not single-reviewer profiles).
+        self.assertNotIn("error", result)
+        # 5 children built: 2 reviewers + 2 planners + 1 coder.
+        self.assertEqual(MockAgent.call_count, 5)
+
+    def test_dual_plan_advertised_in_schema(self):
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        overrides = _build_dynamic_schema_overrides()
+        props = overrides["parameters"]["properties"]
+        text = "\n".join(
+            [
+                overrides["description"],
+                props["profile"]["description"],
+                props["tasks"]["description"],
+                props["tasks"]["items"]["properties"]["profile"]["description"],
+            ]
+        )
+        self.assertIn("dual-plan", text)
+        self.assertIn("planner-codex", text)
+        self.assertIn("planner-opus", text)
+
+
 class TestToolNamePreservation(unittest.TestCase):
     """Verify _last_resolved_tool_names is restored after subagent runs."""
 

@@ -678,6 +678,15 @@ DUAL_REVIEW_PROFILE = "dual-review"
 # tests import.
 DUAL_REVIEWER_PROFILES = ("reviewer-codex", "reviewer-opus")
 
+DUAL_PLAN_PROFILE = "dual-plan"
+# Default planner lanes the 'dual-plan' pseudo-profile fans out to. Mirror of
+# DUAL_REVIEWER_PROFILES: a stable fallback; the live roster is config-driven via
+# delegation.dual_plan_profiles (see _get_dual_planner_profiles) so the lane set
+# can be tuned WITHOUT a code edit + reinstall. dual-plan is the planning
+# analogue of dual-review — one model-visible task fans into one child per
+# planner lane so the two plans come from two DIFFERENT models.
+DUAL_PLANNER_PROFILES = ("planner-codex", "planner-opus")
+
 
 def _get_dual_reviewer_profiles(cfg: Optional[dict] = None) -> Tuple[str, ...]:
     """Resolve the live dual-review lane roster.
@@ -737,6 +746,59 @@ def _is_dual_review_profile(profile: Optional[str]) -> bool:
     return _normalize_profile_name(profile) == DUAL_REVIEW_PROFILE
 
 
+def _get_dual_planner_profiles(cfg: Optional[dict] = None) -> Tuple[str, ...]:
+    """Resolve the live dual-plan lane roster.
+
+    Mirror of ``_get_dual_reviewer_profiles`` for planners: reads
+    ``delegation.dual_plan_profiles`` (a list of profile names) and falls back to
+    the hardcoded ``DUAL_PLANNER_PROFILES`` pair whenever the configured roster
+    cannot yield at least two usable lanes. "Usable" means a non-empty string
+    naming a profile actually defined under ``delegation.profiles`` — an
+    unknown/typo'd name is SKIPPED so a dual-plan is never routed to a nonexistent
+    profile (which would hard-fail at dispatch). Names are de-duplicated
+    preserving order. Net guarantee: a roster typo can never silently shrink to
+    one lane and can never break dual-plan outright — worst case is a clean fall
+    back to the default pair. The known-profile check is skipped (string-ness
+    only) when the profiles map is unreadable, so a transient config-load problem
+    can't strand planning on the default.
+    """
+    if cfg is None:
+        cfg = _load_config()
+    cfg = cfg or {}
+    raw = cfg.get("dual_plan_profiles")
+    if not isinstance(raw, (list, tuple)) or not raw:
+        return DUAL_PLANNER_PROFILES
+
+    profiles_map = cfg.get("profiles")
+    known: Optional[set] = (
+        set(profiles_map.keys()) if isinstance(profiles_map, dict) else None
+    )
+
+    seen: set = set()
+    out: List[str] = []
+    for item in raw:
+        name = _normalize_profile_name(item if isinstance(item, str) else None)
+        if not name:
+            continue
+        if known is not None and name not in known:
+            logger.warning(
+                "delegation.dual_plan_profiles names unknown profile %r; "
+                "skipping it (not in delegation.profiles).",
+                name,
+            )
+            continue
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+    if len(out) < 2:
+        return DUAL_PLANNER_PROFILES
+    return tuple(out)
+
+
+def _is_dual_plan_profile(profile: Optional[str]) -> bool:
+    return _normalize_profile_name(profile) == DUAL_PLAN_PROFILE
+
+
 def _is_single_reviewer_profile(profile: Optional[str]) -> bool:
     profile_name = _normalize_profile_name(profile)
     if not profile_name:
@@ -777,25 +839,63 @@ def _task_with_dual_review_lane_context(task: Dict[str, Any], reviewer_profile: 
     return cloned
 
 
-def _expand_dual_review_task_items(task_list: List[Dict[str, Any]], top_profile: Optional[str]) -> List[Dict[str, Any]]:
-    """Expand the reserved dual-review pseudo-profile into both reviewer lanes.
+def _task_with_dual_plan_lane_context(task: Dict[str, Any], planner_profile: str) -> Dict[str, Any]:
+    """Clone a dual-plan task and tell the child which planner lane it is.
+
+    Planning analogue of ``_task_with_dual_review_lane_context``: dual-plan
+    expands one model-visible task into one child per configured planner lane so
+    the two plans come from two DIFFERENT models. The task text is otherwise
+    identical, so artifact-writing plans need a grounded way for each child to
+    pick its own output path instead of racing on a shared file.
+    """
+    cloned = dict(task)
+    cloned["profile"] = planner_profile
+    marker = (
+        "DUAL-PLAN LANE:\n"
+        "- This task was expanded from profile='dual-plan'.\n"
+        f"- Your assigned planner lane is `{planner_profile}`.\n"
+        "- If the task lists model-specific output paths, write only the path "
+        "for your assigned lane.\n"
+        "- Do not write a shared artifact path unless the task explicitly says "
+        "a shared write is safe."
+    )
+    context = cloned.get("context")
+    if isinstance(context, str) and context.strip():
+        cloned["context"] = f"{context.rstrip()}\n\n{marker}"
+    else:
+        cloned["context"] = marker
+    return cloned
+
+
+def _expand_reserved_profile_task_items(task_list: List[Dict[str, Any]], top_profile: Optional[str]) -> List[Dict[str, Any]]:
+    """Single-pass expander for the reserved fan-out pseudo-profiles.
+
+    Branches per source task into dual-review / dual-plan / passthrough and
+    ALWAYS emits BOTH ``from_dual_review`` and ``from_dual_plan`` (plus the
+    original ``source_index`` and the per-family profile marker) on EVERY item.
+    The both-flags-always invariant is load-bearing: the single-reviewer gate
+    hard-subscripts ``task_item["from_dual_review"]``, so a missing key would
+    KeyError. A task carries one profile string, so the review/plan branches are
+    mutually exclusive — never double-expanded.
 
     The expansion returns metadata beside each task instead of trusting hidden
-    task fields from the model.  This lets require_dual_review reject direct
-    single-reviewer profiles while still allowing the tool's own expansion to
-    route through the configured dual-review lane roster
-    (delegation.dual_review_profiles; defaults to reviewer-codex + reviewer-opus).
+    task fields from the model, so require_dual_review can reject direct
+    single-reviewer profiles while the tool's own expansion still routes through
+    the configured rosters (delegation.dual_review_profiles / dual_plan_profiles).
     """
     expanded: List[Dict[str, Any]] = []
     dual_reviewer_profiles = _get_dual_reviewer_profiles()
+    dual_planner_profiles = _get_dual_planner_profiles()
     for source_index, task in enumerate(task_list):
         if not isinstance(task, dict):
             expanded.append(
                 {
                     "task": task,
                     "from_dual_review": False,
+                    "from_dual_plan": False,
                     "source_index": source_index,
                     "dual_review_profile": None,
+                    "dual_plan_profile": None,
                 }
             )
             continue
@@ -808,8 +908,23 @@ def _expand_dual_review_task_items(task_list: List[Dict[str, Any]], top_profile:
                     {
                         "task": cloned,
                         "from_dual_review": True,
+                        "from_dual_plan": False,
                         "source_index": source_index,
                         "dual_review_profile": DUAL_REVIEW_PROFILE,
+                        "dual_plan_profile": None,
+                    }
+                )
+        elif _is_dual_plan_profile(task_profile):
+            for planner_profile in dual_planner_profiles:
+                cloned = _task_with_dual_plan_lane_context(task, planner_profile)
+                expanded.append(
+                    {
+                        "task": cloned,
+                        "from_dual_review": False,
+                        "from_dual_plan": True,
+                        "source_index": source_index,
+                        "dual_review_profile": None,
+                        "dual_plan_profile": DUAL_PLAN_PROFILE,
                     }
                 )
         else:
@@ -817,11 +932,20 @@ def _expand_dual_review_task_items(task_list: List[Dict[str, Any]], top_profile:
                 {
                     "task": task,
                     "from_dual_review": False,
+                    "from_dual_plan": False,
                     "source_index": source_index,
                     "dual_review_profile": None,
+                    "dual_plan_profile": None,
                 }
             )
     return expanded
+
+
+# Backward-compatible alias: existing callers/tests import this name. The unified
+# expander is a strict superset (dual-review behavior byte-identical, plus the
+# from_dual_plan / dual_plan_profile keys), so the alias keeps the dual-review
+# suite literally untouched.
+_expand_dual_review_task_items = _expand_reserved_profile_task_items
 
 
 def _single_reviewer_profile_error(profile_name: str) -> str:
@@ -3100,7 +3224,7 @@ def delegate_task(
     if not task_list:
         return tool_error("No tasks provided.")
 
-    expanded_task_items = _expand_dual_review_task_items(task_list, top_profile)
+    expanded_task_items = _expand_reserved_profile_task_items(task_list, top_profile)
     task_list = [item["task"] for item in expanded_task_items]
     if len(task_list) > max_children:
         return tool_error(
@@ -3955,6 +4079,23 @@ def _dual_review_lane_phrase() -> tuple:
     return joined, count_word
 
 
+def _dual_plan_lane_phrase() -> tuple:
+    """(expansion_clause, count_word) describing the live dual-plan roster.
+
+    Planning analogue of ``_dual_review_lane_phrase`` — keeps the model-facing
+    schema text accurate when the lane roster is tuned via
+    delegation.dual_plan_profiles.
+    """
+    try:
+        lanes = _get_dual_planner_profiles()
+    except Exception:
+        lanes = DUAL_PLANNER_PROFILES
+    n = len(lanes)
+    count_word = _COUNT_WORDS.get(n, str(n))
+    joined = ", ".join(lanes[:-1]) + f" + {lanes[-1]}" if n > 1 else lanes[0]
+    return joined, count_word
+
+
 def _build_top_level_description() -> str:
     """Compose the delegate_task tool description with current runtime limits.
 
@@ -3978,6 +4119,7 @@ def _build_top_level_description() -> str:
         orchestrator_on = True
 
     _dr_lanes, _dr_count = _dual_review_lane_phrase()
+    _dp_lanes, _dp_count = _dual_plan_lane_phrase()
 
     if max_depth >= 2 and orchestrator_on:
         nesting_clause = (
@@ -4039,6 +4181,11 @@ def _build_top_level_description() -> str:
         f"internally so all run and counts as {_dr_count} child "
         "tasks for max_concurrent_children. Per-task profile beats "
         "the top-level profile.\n"
+        "- For PLANNING work, profile='dual-plan' is the planning analogue of "
+        f"dual-review: it expands to {_dp_lanes} (two DIFFERENT planner models) "
+        f"and counts as {_dp_count} child tasks. Use it to get two independent "
+        "plans you reconcile, the same way dual-review gives two independent "
+        "reviews.\n"
         "- Subagents have NO memory of your conversation. Pass all relevant "
         "info (file paths, error messages, constraints) via the 'context' field.\n"
         "- If the user is writing in a non-English language, or asked for "
@@ -4074,12 +4221,15 @@ def _build_tasks_param_description() -> str:
     except Exception:
         max_children = _DEFAULT_MAX_CONCURRENT_CHILDREN
     _dr_lanes, _dr_count = _dual_review_lane_phrase()
+    _dp_lanes, _dp_count = _dual_plan_lane_phrase()
     return (
         f"Batch mode: tasks to run in parallel (up to {max_children} for this "
         f"user, set via delegation.max_concurrent_children). Each gets "
         "its own subagent with isolated context and terminal session. "
         f"The reserved profile='dual-review' expands to {_dr_count} child tasks and "
         f"counts as {_dr_count} against this limit. "
+        f"The reserved profile='dual-plan' likewise expands to {_dp_count} planner "
+        f"child tasks ({_dp_lanes}). "
         "When provided, top-level goal/context/toolsets are ignored."
     )
 
@@ -4087,12 +4237,14 @@ def _build_tasks_param_description() -> str:
 def _build_profile_param_description() -> str:
     """Compose the 'profile' parameter description with the live dual-review roster."""
     _dr_lanes, _dr_count = _dual_review_lane_phrase()
+    _dp_lanes, _dp_count = _dual_plan_lane_phrase()
     return (
         "Optional delegation profile from config.yaml delegation.profiles. "
         "Use profiles to route task classes to the right model/reasoning/tool policy "
         "(e.g. file-explorer for file/repo discovery; jira-auditor for Jira/ticket scope checks; "
         f"dual-review for enforced {_dr_lanes} review; "
-        f"dual-review counts as {_dr_count} child tasks). "
+        f"dual-review counts as {_dr_count} child tasks; "
+        f"dual-plan for two independent plans from {_dp_lanes}, counting as {_dp_count} child tasks). "
         "Per-task profile overrides this top-level value."
     )
 
@@ -4243,7 +4395,8 @@ DELEGATE_TASK_SCHEMA = {
                     "Use profiles to route task classes to the right model/reasoning/tool policy "
                     "(e.g. file-explorer for file/repo discovery; jira-auditor for Jira/ticket scope checks; "
                     "dual-review for enforced reviewer-codex + reviewer-opus review; "
-                    "dual-review counts as two child tasks). "
+                    "dual-review counts as two child tasks; "
+                    "dual-plan for two independent plans from planner-codex + planner-opus, counting as two child tasks). "
                     "Per-task profile overrides this top-level value."
                 ),
             },
@@ -4259,7 +4412,7 @@ DELEGATE_TASK_SCHEMA = {
                         },
                         "profile": {
                             "type": "string",
-                            "description": "Per-task delegation profile override (e.g. file-explorer, jira-auditor, dual-review, coder).",
+                            "description": "Per-task delegation profile override (e.g. file-explorer, jira-auditor, dual-review, dual-plan, coder).",
                         },
                         "acp_command": {
                             "type": "string",
