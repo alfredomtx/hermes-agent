@@ -167,6 +167,33 @@ def _tools_suffix(row: Dict[str, Any]) -> str:
         return ""
     return f" · {n} tool" + ("s" if n != 1 else "")
 
+
+def _format_cost(cost: float) -> str:
+    """Adaptive USD format: 2dp at/above $1 ($1.23), 4dp below ($0.0123).
+
+    Big multi-agent totals read clean; small per-subagent costs keep precision.
+    """
+    return f"${cost:.2f}" if cost >= 1 else f"${cost:.4f}"
+
+
+def _cost_suffix(row: Dict[str, Any]) -> str:
+    """`· $0.0123` / `· $1.23` suffix for a row, or '' when cost is unknown.
+
+    Cost is a COMPLETION-only number (the live registry has no running cost),
+    so this is only ever non-empty on a finished row. Missing/None/<=0 -> '' so
+    a provider with no pricing shows no cost cell instead of a misleading $0.00.
+    """
+    raw = row.get("cost_usd")
+    if raw is None:
+        return ""
+    try:
+        cost = float(raw)
+    except (TypeError, ValueError):
+        return ""
+    if cost <= 0:
+        return ""
+    return f" · {_format_cost(cost)}"
+
 # delegate_tool subagent.complete status string -> (glyph, display bucket).
 # Vocabulary verified in tools/delegate_tool.py: completed | failed |
 # interrupted | timeout | error. Unknown -> fail-CLOSED to errored (never render
@@ -392,6 +419,16 @@ def format_subagent_roster(rows: List[Dict[str, Any]], *, collapsed: bool = Fals
         if failed_total:
             head_parts.append(f"{len(failed_total)} ✗")
         head_parts.append(format_elapsed(total))
+        # Total cost across all children (adaptive format), when known. Sums only
+        # rows that carry a numeric cost_usd; absent costs contribute nothing.
+        total_cost = 0.0
+        for r in rows:
+            try:
+                total_cost += float(r.get("cost_usd") or 0.0)
+            except (TypeError, ValueError):
+                pass
+        if total_cost > 0:
+            head_parts.append(_format_cost(total_cost))
         head = " · ".join(head_parts)
 
         lines = [head]
@@ -402,7 +439,7 @@ def format_subagent_roster(rows: List[Dict[str, Any]], *, collapsed: bool = Fals
             # is kept on done rows too, not dropped when running flips to False.
             line = (
                 f"{r['glyph']} `{r['label']}`{_model_suffix(r)}"
-                f" · {format_elapsed(r['elapsed'])}{_tools_suffix(r)}"
+                f" · {format_elapsed(r['elapsed'])}{_tools_suffix(r)}{_cost_suffix(r)}"
             )
             lines.append(line)
         extra = len(rows) - len(shown)
@@ -428,7 +465,7 @@ def format_subagent_roster(rows: List[Dict[str, Any]], *, collapsed: bool = Fals
     for r in shown:
         line = (
             f"{r['glyph']} `{r['label']}`{_model_suffix(r)}"
-            f" · {format_elapsed(r['elapsed'])}{_tools_suffix(r)}"
+            f" · {format_elapsed(r['elapsed'])}{_tools_suffix(r)}{_cost_suffix(r)}"
         )
         lines.append(line)
     extra = len(rows) - len(shown)

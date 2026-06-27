@@ -152,6 +152,9 @@ def _normalise_children(
                 "task_index": task_index,
                 "subagent_id": str(child.get("subagent_id") or ""),
                 "goal": str(goal or ""),
+                "profile": str(child.get("profile") or ""),
+                "role": str(child.get("role") or ""),
+                "toolsets": child.get("toolsets"),
                 "model": child_model if isinstance(child_model, str) else model,
                 "reasoning": child.get("reasoning"),
                 "status": _normalise_child_status(child.get("status") or "pending"),
@@ -225,6 +228,13 @@ def _update_child_result_locked(
     if _tc is not None:
         try:
             target["tool_count"] = int(_tc or 0)
+        except (TypeError, ValueError):
+            pass
+    # Final per-child cost for the roster's finished row + header total. Public
+    # key threaded from _run_single_child's result entry (delegate_tool.py).
+    if result.get("cost_usd") is not None:
+        try:
+            target["cost_usd"] = float(result.get("cost_usd") or 0.0)
         except (TypeError, ValueError):
             pass
     if result.get("error"):
