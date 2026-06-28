@@ -3471,6 +3471,7 @@ def delegate_task(
             delegation_id=_delegation_id,
             children=_child_records,
             routing=_routing,
+            profile=top_profile,
         )
 
         if dispatch.get("status") == "dispatched":

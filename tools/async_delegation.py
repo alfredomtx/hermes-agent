@@ -524,6 +524,7 @@ def dispatch_async_delegation_batch(
     delegation_id: Optional[str] = None,
     children: Optional[List[Dict[str, Any]]] = None,
     routing: Optional[Dict[str, Any]] = None,
+    profile: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
 
@@ -559,6 +560,7 @@ def dispatch_async_delegation_batch(
         "context": context,
         "toolsets": list(toolsets) if toolsets else None,
         "role": role,
+        "profile": profile or "",
         "model": model,
         "session_key": session_key,
         "status": "running",

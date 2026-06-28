@@ -164,38 +164,39 @@ def build_async_subagent_roster_rows(
     return rows
 
 
-def build_async_dispatched_seed_rows(record: Dict[str, Any]) -> List[str]:
-    """Card-style 'here is what I dispatched' rows for a BACKGROUND record.
+def build_async_dispatched_header(record: Dict[str, Any]) -> str:
+    """Pinned 'what I dispatched' header line for a BACKGROUND delegation.
 
-    One row per child in the same shape as the foreground delegate_task params
-    card (``[profile] · [role=… · toolsets=…] · `goal```). Per-child ``profile``
-    is used when the child record carries it (threaded in by delegate_tool); it
-    falls back to record-level ``role``/``toolsets`` when a child has none.
-    Returns [] when the record has no children/goals.
+    Rendered as the FIRST line of the bubble and KEPT for the whole lifecycle
+    (it does NOT morph away into the roster the way the old seed-card frame did).
+    The live/collapsed roster rows are appended BELOW it.
+
+    Shape: ``🔀 Delegate task — N agents · <profile> · toolsets=a,b``
+      * ``N agents`` — the post-expansion child count (a ``dual-review`` fans
+        into one agent per lane, so this is the real number of agents running,
+        not the number of model-issued tasks). Singular ``— 1 agent``.
+      * ``<profile>`` — the top-level delegation profile when one was set
+        (``dual-review`` / ``coder`` / …); omitted for a plain delegate.
+      * ``toolsets=…`` — ONLY when toolsets were EXPLICITLY passed on the
+        dispatch (an audit signal for "did I under-provision a child"); hidden
+        when the children just inherited the parent toolset (the common case),
+        to avoid noise on every row.
+    Returns "" when the record has no children/goals.
     """
-    # Lazy import: gateway.run owns the canonical cell renderers; a module-load
-    # import would create a run.py <-> async_subagent_roster cycle.
-    from gateway.run import _delegate_goal_cell, _delegate_param_cells
-
     children = _children_from_record(record)
-    if not children:
-        return []
+    n = len(children)
+    if n <= 0:
+        return ""
 
-    record_spec = {
-        k: record.get(k)
-        for k in ("role", "toolsets")
-        if record.get(k) not in (None, "", [], {})
-    }
-    record_cells = _delegate_param_cells(record_spec)
+    head = f"🔀 Delegate task — {n} agent" + ("" if n == 1 else "s")
 
-    rows: List[str] = []
-    for child in children:
-        cells: List[str] = []
-        profile = child.get("profile")
-        if profile not in (None, "", [], {}):
-            cells.append(" ".join(str(profile).replace("`", "").split()))
-        else:
-            cells.extend(record_cells)
-        cells.append(_delegate_goal_cell(child.get("goal")))
-        rows.append(" · ".join(cells))
-    return rows
+    profile = record.get("profile")
+    if profile not in (None, "", [], {}):
+        head += " · " + " ".join(str(profile).replace("`", "").split())
+
+    toolsets = record.get("toolsets")
+    if isinstance(toolsets, (list, tuple)) and toolsets:
+        cleaned = [str(t).replace("`", "").strip() for t in toolsets if str(t).strip()]
+        if cleaned:
+            head += " · toolsets=" + ",".join(cleaned)
+    return head
