@@ -15390,7 +15390,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         from gateway.async_subagent_roster import (
             build_async_subagent_roster_rows,
-            build_async_dispatched_seed_rows,
+            build_async_dispatched_header,
         )
         from gateway.subagent_roster import (
             format_subagent_roster,
@@ -15423,11 +15423,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _d = _coerce(record.get("dispatched_at"))
             _wall = max(0.0, time.time() - _d) if _d is not None else None
 
-        # MERGE: gate the dispatched-card seed frame on delegate_task_args too
-        # (toggle independence). The watcher is a global loop that otherwise only
-        # honors subagent_roster; without this, args:off + roster:on would still
-        # render the dispatched card frame. Resolve it with the same shape
-        # _async_roster_target uses for subagent_roster.
+        # PINNED HEADER: a "what I dispatched" line that stays for the WHOLE
+        # lifecycle instead of morphing away. The roster rows are appended
+        # BELOW it and updated in place every tick (live → collapsed), so the
+        # profile/agent-count/toolsets audit info is ALWAYS visible, not just in
+        # the first ~10s frame. Gated on delegate_task_args (toggle independence:
+        # args:off + roster:on → roster only, no header). The watcher is a global
+        # loop that otherwise only honors subagent_roster, so resolve args here
+        # with the same shape _async_roster_target uses for subagent_roster.
         try:
             from gateway.display_config import resolve_display_setting
 
@@ -15442,35 +15445,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception:
             _args_enabled = False
-        # Show the card-style "here is what I dispatched" frame as the FIRST render
-        # of this delegation's bubble (message_id is None == not yet seeded),
-        # regardless of whether a child already flipped to running by the first
-        # ~3s watcher tick. Preserves the suppressed foreground card's audit info
-        # (incl. per-child profile). Every subsequent edit uses the normal roster
-        # rows. collapsed (final) always uses the roster shape.
-        _existing_bubble = self._async_roster_bubbles().get(delegation_id) or {}
-        _not_yet_seeded = (
-            _existing_bubble.get("message_id") is None
-            and not _existing_bubble.get("seed_failed")
-        )
-        if _args_enabled and not collapsed and _not_yet_seeded:
-            seed_rows = build_async_dispatched_seed_rows(record)
-            if seed_rows:
-                shown = seed_rows[:10]
-                header = (
-                    "🔀 Delegate task"
-                    if len(seed_rows) == 1
-                    else f"🔀 Delegate task — {len(seed_rows)} tasks"
-                )
-                lines = [header, *shown]
-                extra = len(seed_rows) - len(shown)
-                if extra > 0:
-                    lines.append(f"… +{extra} more")
-                text = "\n".join(lines)
+
+        roster_text = format_subagent_roster(rows, collapsed=collapsed, wall_clock=_wall)
+        if _args_enabled:
+            header = build_async_dispatched_header(record)
+            if header:
+                text = f"{header}\n{roster_text}" if roster_text else header
             else:
-                text = format_subagent_roster(rows, collapsed=collapsed, wall_clock=_wall)
+                text = roster_text
         else:
-            text = format_subagent_roster(rows, collapsed=collapsed, wall_clock=_wall)
+            text = roster_text
         if not text:
             return
 
@@ -15585,42 +15569,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not did:
             return
         try:
-            # Fast-completion: if the bubble was never seeded (the delegation
-            # finished before the first ~3s watcher tick) AND delegate_task_args
-            # is on, show the dispatched card frame once, then collapse-edit the
-            # SAME message. Without this the card-first view would be skipped (the
-            # seed branch in _publish is `not collapsed`). Gated on args so a
-            # roster-only (args:off) run still does a single collapsed send.
-            if self._async_roster_bubbles().get(did, {}).get("message_id") is None:
-                _args_on = False
-                try:
-                    from gateway.display_config import resolve_display_setting
-
-                    _tgt = self._async_roster_target(evt)
-                    if _tgt is not None:
-                        _src, _, _ = _tgt
-                        _args_on = is_truthy_value(
-                            resolve_display_setting(
-                                _load_gateway_config(),
-                                _platform_config_key(_src.platform),
-                                "delegate_task_args",
-                                False,
-                            ),
-                            default=False,
-                        )
-                except Exception:
-                    _args_on = False
-                if _args_on:
-                    try:
-                        await self._publish_async_delegation_roster(
-                            evt,
-                            active_subagents,
-                            force=True,
-                            collapsed=False,
-                            allow_seed=True,
-                        )
-                    except Exception:
-                        pass
+            # Single collapsed publish handles BOTH cases now that the header is
+            # pinned into every render (live AND collapsed): a never-seeded fast
+            # completion seeds the bubble directly with header + collapsed roster
+            # (allow_seed=True), and an already-seeded bubble edits in place. No
+            # pre-seed non-collapsed pass is needed — the old card-first dance
+            # existed only because the dispatched card used to be a separate
+            # first frame that the collapsed roster would otherwise skip.
             await self._publish_async_delegation_roster(
                 evt,
                 active_subagents,
