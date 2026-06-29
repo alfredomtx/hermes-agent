@@ -698,8 +698,10 @@ def test_dispatched_header_agent_count_and_profile():
     # toolsets shown ONLY when explicitly set.
     assert build_async_dispatched_header(rec("coder", ["terminal", "file"])) == \
         "🔀 Delegate task — 2 agents · coder · toolsets=terminal,file"
-    # no profile -> no profile cell.
-    assert build_async_dispatched_header(rec(None, None)) == "🔀 Delegate task — 2 agents"
+    # no profile -> EXPLICIT "profile: none" cell (not omitted), so a plain
+    # delegate is unambiguous.
+    assert build_async_dispatched_header(rec(None, None)) == \
+        "🔀 Delegate task — 2 agents · profile: none"
     # singular.
     assert build_async_dispatched_header(rec("explorer", None, n=1)) == \
         "🔀 Delegate task — 1 agent · explorer"
