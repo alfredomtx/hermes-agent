@@ -200,7 +200,9 @@ def build_async_dispatched_header(record: Dict[str, Any]) -> str:
         # unambiguous (not "did the profile cell go missing?").
         head += " · profile: none"
 
-    toolsets = record.get("toolsets")
+    toolsets = record.get("header_toolsets")
+    if toolsets in (None, "", [], {}):
+        toolsets = record.get("toolsets")
     if isinstance(toolsets, (list, tuple)) and toolsets:
         cleaned = [str(t).replace("`", "").strip() for t in toolsets if str(t).strip()]
         if cleaned:

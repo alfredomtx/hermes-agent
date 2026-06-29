@@ -709,6 +709,23 @@ def test_dispatched_header_agent_count_and_profile():
     assert build_async_dispatched_header({}) == ""
 
 
+def test_dispatched_header_prefers_header_toolsets_over_resolved():
+    """The header reads `header_toolsets` (the EXPLICIT set computed by the
+    caller) in preference to the resolved `toolsets` record field, so a per-task
+    uniform set surfaces and a profile-defaulted `toolsets` does not leak in."""
+    base = {"children": [{"task_index": 0, "subagent_id": "s0", "goal": "g0"},
+                         {"task_index": 1, "subagent_id": "s1", "goal": "g1"}]}
+    # header_toolsets present -> used.
+    assert build_async_dispatched_header({**base, "header_toolsets": ["terminal", "file"]}) == \
+        "🔀 Delegate task — 2 agents · profile: none · toolsets=terminal,file"
+    # header_toolsets absent -> falls back to top-level toolsets (back-compat).
+    assert build_async_dispatched_header({**base, "toolsets": ["web"]}) == \
+        "🔀 Delegate task — 2 agents · profile: none · toolsets=web"
+    # neither -> no toolsets cell.
+    assert build_async_dispatched_header(base) == \
+        "🔀 Delegate task — 2 agents · profile: none"
+
+
 # ── Fix A: profile must PERSIST in roster rows (now BELOW the pinned header) ──
 # Regression for "I don't see the profile anymore, only the Subagents part":
 # the profile is a per-row cell so it shows in running, partial-done, AND

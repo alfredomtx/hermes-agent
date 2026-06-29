@@ -491,6 +491,55 @@ def test_batch_completion_event_carries_profile():
     assert build_async_dispatched_header(evt) == "🔀 Delegate task — 2 agents · dual-review"
 
 
+def test_batch_completion_event_carries_header_toolsets():
+    """Regression: per-task (not top-level) toolsets must still surface on the
+    pinned header via `header_toolsets`.
+
+    The gap: the header only read the TOP-LEVEL `toolsets` arg, so a batch whose
+    toolsets were set PER-TASK (the common 'I gave every child terminal,file'
+    shape) showed NO toolsets cell even though the children were explicitly
+    provisioned. The caller now computes a uniform per-task set into
+    `header_toolsets`, which must ride the completion evt to the collapsed render.
+    """
+    did = ad.new_delegation_id()
+
+    def runner():
+        return {
+            "results": [
+                {"task_index": 0, "status": "completed", "summary": "a", "duration_seconds": 1.0},
+                {"task_index": 1, "status": "completed", "summary": "b", "duration_seconds": 1.0},
+            ],
+            "total_duration_seconds": 1.0,
+        }
+
+    res = ad.dispatch_async_delegation_batch(
+        delegation_id=did,
+        goals=["g0", "g1"],
+        context=None,
+        toolsets=None,  # NOT top-level — per-task instead
+        role="leaf",
+        model="m",
+        session_key="",
+        runner=runner,
+        profile=None,
+        header_toolsets=["terminal", "file"],  # uniform per-task set computed by caller
+        children=[
+            {"task_index": 0, "subagent_id": "s0", "goal": "g0", "profile": "file-explorer", "model": "m"},
+            {"task_index": 1, "subagent_id": "s1", "goal": "g1", "profile": "", "model": "m"},
+        ],
+        max_async_children=3,
+    )
+    assert res == {"status": "dispatched", "delegation_id": did}
+
+    evt = _drain_one()
+    assert evt is not None
+    assert evt.get("header_toolsets") == ["terminal", "file"]
+    from gateway.async_subagent_roster import build_async_dispatched_header
+    # No top-level profile -> profile: none; per-task uniform toolsets surface.
+    assert build_async_dispatched_header(evt) == \
+        "🔀 Delegate task — 2 agents · profile: none · toolsets=terminal,file"
+
+
 def test_model_dispatch_forces_background():
     """The MODEL-facing dispatch path forces background=True for any top-level
     delegation (single task OR batch), and keeps it off for an orchestrator
