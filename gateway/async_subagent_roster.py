@@ -176,7 +176,9 @@ def build_async_dispatched_header(record: Dict[str, Any]) -> str:
         into one agent per lane, so this is the real number of agents running,
         not the number of model-issued tasks). Singular ``— 1 agent``.
       * ``<profile>`` — the top-level delegation profile when one was set
-        (``dual-review`` / ``coder`` / …); omitted for a plain delegate.
+        (``dual-review`` / ``coder`` / …); rendered as ``profile: none`` when no
+        profile was passed, so a plain delegate is EXPLICITLY marked rather than
+        leaving the reader to wonder whether the cell is missing.
       * ``toolsets=…`` — ONLY when toolsets were EXPLICITLY passed on the
         dispatch (an audit signal for "did I under-provision a child"); hidden
         when the children just inherited the parent toolset (the common case),
@@ -193,6 +195,10 @@ def build_async_dispatched_header(record: Dict[str, Any]) -> str:
     profile = record.get("profile")
     if profile not in (None, "", [], {}):
         head += " · " + " ".join(str(profile).replace("`", "").split())
+    else:
+        # No delegation profile -> mark it explicitly so a plain delegate is
+        # unambiguous (not "did the profile cell go missing?").
+        head += " · profile: none"
 
     toolsets = record.get("toolsets")
     if isinstance(toolsets, (list, tuple)) and toolsets:
