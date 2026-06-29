@@ -500,6 +500,7 @@ def dispatch_async_delegation_batch(
     children: Optional[List[Dict[str, Any]]] = None,
     routing: Optional[Dict[str, Any]] = None,
     profile: Optional[str] = None,
+    header_toolsets: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
 
@@ -534,6 +535,7 @@ def dispatch_async_delegation_batch(
         "goals": list(goals),
         "context": context,
         "toolsets": list(toolsets) if toolsets else None,
+        "header_toolsets": list(header_toolsets) if header_toolsets else None,
         "role": role,
         "profile": profile or "",
         "model": model,
@@ -655,6 +657,7 @@ def _finalize_batch(
         "goals": event_record.get("goals"),
         "context": event_record.get("context"),
         "toolsets": event_record.get("toolsets"),
+        "header_toolsets": event_record.get("header_toolsets"),
         "role": event_record.get("role"),
         "profile": event_record.get("profile"),
         "model": event_record.get("model"),
