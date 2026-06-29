@@ -444,6 +444,53 @@ def test_batch_record_carries_child_metadata_routing_and_live_child_status():
     assert evt["thread_id"] == "77"
 
 
+def test_batch_completion_event_carries_profile():
+    """Regression: the batch completion event MUST carry the top-level `profile`
+    so the watcher's collapsed render keeps the pinned '🔀 … · <profile>' header.
+
+    The bug: `profile` was threaded onto the live record (so the RUNNING header
+    showed `· dual-review`) but dropped from the completion `evt`, so when the
+    bubble finalized from the evt the collapsed header lost the profile cell.
+    """
+    did = ad.new_delegation_id()
+
+    def runner():
+        return {
+            "results": [
+                {"task_index": 0, "status": "completed", "summary": "a", "duration_seconds": 1.0},
+                {"task_index": 1, "status": "completed", "summary": "b", "duration_seconds": 1.0},
+            ],
+            "total_duration_seconds": 1.0,
+        }
+
+    res = ad.dispatch_async_delegation_batch(
+        delegation_id=did,
+        goals=["g0", "g1"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="",
+        runner=runner,
+        profile="dual-review",
+        children=[
+            {"task_index": 0, "subagent_id": "s0", "goal": "g0", "profile": "reviewer-codex", "model": "m"},
+            {"task_index": 1, "subagent_id": "s1", "goal": "g1", "profile": "reviewer-opus", "model": "m"},
+        ],
+        max_async_children=3,
+    )
+    assert res == {"status": "dispatched", "delegation_id": did}
+
+    evt = _drain_one()
+    assert evt is not None
+    assert evt.get("is_batch") is True
+    # The field that used to be dropped — top-level profile for the pinned header.
+    assert evt.get("profile") == "dual-review"
+    # End-to-end: the header builder renders the profile cell from this evt.
+    from gateway.async_subagent_roster import build_async_dispatched_header
+    assert build_async_dispatched_header(evt) == "🔀 Delegate task — 2 agents · dual-review"
+
+
 def test_model_dispatch_forces_background():
     """The MODEL-facing dispatch path forces background=True for any top-level
     delegation (single task OR batch), and keeps it off for an orchestrator
