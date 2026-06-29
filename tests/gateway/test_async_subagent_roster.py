@@ -548,39 +548,7 @@ async def test_watcher_roster_latches_on_ambiguous_failure(monkeypatch):
     assert len(adapter.sent) == 1, "latched seed must not re-attempt on an ambiguous failure"
 
 
-# ── MERGE: dispatched card seed rows + cost (delegate-card-into-roster) ──
-
-from gateway.async_subagent_roster import build_async_dispatched_seed_rows
-
-
-def test_dispatched_seed_rows_use_per_child_profile():
-    record = {
-        "goals": ["Review auth refactor", "Audit the migration"],
-        "children": [
-            {"task_index": 0, "goal": "Review auth refactor", "profile": "reviewer-codex"},
-            {"task_index": 1, "goal": "Audit the migration", "profile": "reviewer-opus"},
-        ],
-    }
-    assert build_async_dispatched_seed_rows(record) == [
-        "reviewer-codex · `Review auth refactor`",
-        "reviewer-opus · `Audit the migration`",
-    ]
-
-
-def test_dispatched_seed_rows_fallback_to_record_role_toolsets_when_no_profile():
-    record = {
-        "goals": ["do a thing"],
-        "role": "reviewer",
-        "toolsets": ["terminal", "file"],
-        "children": [{"task_index": 0, "goal": "do a thing"}],
-    }
-    assert build_async_dispatched_seed_rows(record) == [
-        "role=reviewer · toolsets=terminal,file · `do a thing`",
-    ]
-
-
-def test_dispatched_seed_rows_empty_record_is_empty():
-    assert build_async_dispatched_seed_rows({}) == []
+# ── MERGE: per-child cost rendering (delegate-card-into-roster) ──
 
 
 def test_async_terminal_rows_carry_cost_usd():
@@ -647,9 +615,10 @@ def _config_args_and_roster_on():
 
 
 @pytest.mark.asyncio
-async def test_watcher_seed_frame_shows_dispatched_card_then_edits_to_rows(monkeypatch):
-    """args:on + roster:on -> first watcher send is the dispatched card (profile
-    · goal), then it EDITS the same message to live roster rows."""
+async def test_watcher_pins_dispatched_header_above_roster(monkeypatch):
+    """args:on + roster:on -> the '🔀 Delegate task — N agents · profile' header
+    is PINNED as the first line of the bubble and STAYS there across edits; the
+    live roster rows are appended BELOW it (no morph-away)."""
     import gateway.run as gateway_run
 
     monkeypatch.setattr(gateway_run, "_load_gateway_config", _config_args_and_roster_on)
@@ -657,33 +626,43 @@ async def test_watcher_seed_frame_shows_dispatched_card_then_edits_to_rows(monke
     adapter = AsyncRosterAdapter()
     runner = _runner(adapter)
     record = _record()
+    record["profile"] = "dual-review"
     record["children"][0]["profile"] = "reviewer-codex"
     record["children"][1]["profile"] = "reviewer-opus"
 
-    # First tick: not-yet-seeded -> dispatched card frame.
-    await runner._tick_async_delegation_rosters([record], [])
+    # First tick: bubble seeds with header + roster in ONE message.
+    await runner._tick_async_delegation_rosters(
+        [record],
+        [{"subagent_id": "sa-0", "started_at": 101.0, "tool_count": 1}],
+    )
     assert len(adapter.sent) == 1
     seed = adapter.sent[0]["content"]
-    assert seed.startswith("🔀 Delegate task — 2 tasks")
-    assert "reviewer-codex · `sleep 6`" in seed
-    assert "reviewer-opus · `sleep 10`" in seed
+    seed_lines = seed.split("\n")
+    assert seed_lines[0] == "🔀 Delegate task — 2 agents · dual-review"  # pinned header
+    assert seed_lines[1].startswith("🤖 Subagents")                      # roster appended
+    assert "reviewer-codex" in seed and "reviewer-opus" in seed          # per-row lanes
 
-    # Second publish (a child now running): edits the SAME message to roster rows.
+    # Subsequent publish: EDITS the same message; header is STILL there (not morphed away).
+    record["children"][0]["status"] = "completed"
+    record["children"][0]["duration_seconds"] = 6.0
     await runner._publish_async_delegation_roster(
         record,
-        [{"subagent_id": "sa-0", "started_at": 101.0, "tool_count": 1}],
+        [{"subagent_id": "sa-1", "started_at": 102.0, "tool_count": 0}],
         force=True,
         collapsed=False,
     )
     assert len(adapter.sent) == 1  # no second send
     assert adapter.edits
-    assert adapter.edits[-1]["content"].startswith("🤖 Subagents")
-    assert "🔀 Delegate task" not in adapter.edits[-1]["content"]
+    edited = adapter.edits[-1]["content"]
+    assert edited.startswith("🔀 Delegate task — 2 agents · dual-review")  # header PERSISTS
+    assert "🤖 Subagents" in edited
+    assert "reviewer-codex" in edited and "reviewer-opus" in edited
 
 
 @pytest.mark.asyncio
-async def test_watcher_no_seed_frame_when_args_off(monkeypatch):
-    """roster:on + args:OFF -> NO dispatched-card seed frame (toggle independence)."""
+async def test_watcher_no_header_when_args_off(monkeypatch):
+    """roster:on + args:OFF -> NO dispatched header (toggle independence); just
+    the bare roster."""
     import gateway.run as gateway_run
 
     monkeypatch.setattr(
@@ -695,19 +674,43 @@ async def test_watcher_no_seed_frame_when_args_off(monkeypatch):
     adapter = AsyncRosterAdapter()
     runner = _runner(adapter)
     record = _record()
+    record["profile"] = "dual-review"
     record["children"][0]["profile"] = "reviewer-codex"
 
     await runner._tick_async_delegation_rosters([record], [])
     assert len(adapter.sent) == 1
     assert "🔀 Delegate task" not in adapter.sent[0]["content"]
+    assert adapter.sent[0]["content"].startswith("🤖 Subagents")
 
 
-# ── Fix A: profile must PERSIST in roster rows after the seed card morphs ──
+# ── Pinned header builder (build_async_dispatched_header) ──
+from gateway.async_subagent_roster import build_async_dispatched_header
+
+
+def test_dispatched_header_agent_count_and_profile():
+    def rec(profile=None, toolsets=None, n=2):
+        return {"profile": profile, "toolsets": toolsets,
+                "children": [{"task_index": i, "subagent_id": f"sa-{i}", "goal": f"g{i}"} for i in range(n)]}
+
+    # N agents (post-expansion child count), profile shown, toolsets hidden when inherited.
+    assert build_async_dispatched_header(rec("dual-review", None)) == \
+        "🔀 Delegate task — 2 agents · dual-review"
+    # toolsets shown ONLY when explicitly set.
+    assert build_async_dispatched_header(rec("coder", ["terminal", "file"])) == \
+        "🔀 Delegate task — 2 agents · coder · toolsets=terminal,file"
+    # no profile -> no profile cell.
+    assert build_async_dispatched_header(rec(None, None)) == "🔀 Delegate task — 2 agents"
+    # singular.
+    assert build_async_dispatched_header(rec("explorer", None, n=1)) == \
+        "🔀 Delegate task — 1 agent · explorer"
+    # empty record -> empty header.
+    assert build_async_dispatched_header({}) == ""
+
+
+# ── Fix A: profile must PERSIST in roster rows (now BELOW the pinned header) ──
 # Regression for "I don't see the profile anymore, only the Subagents part":
-# the dispatched-card seed frame shows profile for one interval then EDITS into
-# the live roster, which previously rendered only model (gpt-5.5 / opus-4-8),
-# dropping the lane (reviewer-codex / reviewer-opus). The profile is now a row
-# cell so it survives the morph in running, partial-done, AND collapsed states.
+# the profile is a per-row cell so it shows in running, partial-done, AND
+# collapsed states — independently of the pinned header above.
 
 def test_roster_rows_carry_profile_in_all_states():
     """build_async_subagent_roster_rows threads child profile onto every row
@@ -729,9 +732,8 @@ def test_roster_rows_carry_profile_in_all_states():
     assert by_label["g1"]["profile"] == "reviewer-opus"    # running row
 
 
-def test_profile_suffix_renders_and_survives_morph():
-    """_profile_suffix renders the lane, and a full roster line keeps it in both
-    the live and collapsed render — the exact cell that used to vanish."""
+def test_profile_suffix_renders_on_rows():
+    """_profile_suffix renders the lane, kept in both live and collapsed render."""
     from gateway.subagent_roster import _profile_suffix
 
     assert _profile_suffix({"profile": "reviewer-codex"}) == " · reviewer-codex"
@@ -756,9 +758,10 @@ def test_profile_suffix_renders_and_survives_morph():
 
 
 @pytest.mark.asyncio
-async def test_watcher_profile_persists_through_card_to_roster_edit(monkeypatch):
-    """End-to-end watcher proof: the seed card shows profile, and after it EDITS
-    into the live roster the SAME profile is still present in the row (the bug)."""
+async def test_watcher_profile_persists_in_rows_through_edits(monkeypatch):
+    """End-to-end: per-row profile is present in BOTH the seed send and the
+    subsequent live-roster edit (the original 'profile vanished' regression),
+    now alongside the pinned header."""
     import gateway.run as gateway_run
 
     monkeypatch.setattr(gateway_run, "_load_gateway_config", _config_args_and_roster_on)
@@ -766,14 +769,13 @@ async def test_watcher_profile_persists_through_card_to_roster_edit(monkeypatch)
     adapter = AsyncRosterAdapter()
     runner = _runner(adapter)
     record = _record()
+    record["profile"] = "dual-review"
     record["children"][0]["profile"] = "reviewer-codex"
     record["children"][1]["profile"] = "reviewer-opus"
 
-    # Seed card frame.
     await runner._tick_async_delegation_rosters([record], [])
     assert "reviewer-codex" in adapter.sent[0]["content"]
 
-    # Morph to the live roster — profile must NOT vanish.
     await runner._publish_async_delegation_roster(
         record,
         [{"subagent_id": "sa-0", "started_at": 101.0, "tool_count": 1},
@@ -782,7 +784,7 @@ async def test_watcher_profile_persists_through_card_to_roster_edit(monkeypatch)
         collapsed=False,
     )
     edited = adapter.edits[-1]["content"]
-    assert edited.startswith("🤖 Subagents")
-    assert "🔀 Delegate task" not in edited
-    assert "reviewer-codex" in edited   # ← the regression: lane survives the morph
+    assert edited.startswith("🔀 Delegate task")  # header pinned
+    assert "🤖 Subagents" in edited
+    assert "reviewer-codex" in edited   # ← lane survives in the row
     assert "reviewer-opus" in edited
