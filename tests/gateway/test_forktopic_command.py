@@ -3,6 +3,7 @@
 import dataclasses
 import json
 import re
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -97,11 +98,17 @@ async def test_forktopic_creates_seeded_topic_copies_session_and_binds_routing(t
     adapter.create_forum_topic.assert_awaited_once_with("208214988", "Forked Lane")
     adapter.delete_forum_topic.assert_not_awaited()
 
-    adapter.send.assert_awaited_once()
-    send_kwargs = adapter.send.await_args.kwargs
+    assert adapter.send.await_count == 3
+    send_kwargs = adapter.send.await_args_list[0].kwargs
     assert send_kwargs["chat_id"] == "208214988"
     assert send_kwargs["metadata"]["thread_id"] == "888"
     assert "Forked conversation: Forked Lane" in send_kwargs["content"]
+    assert "original ask" not in send_kwargs["content"]
+    assert "original answer" not in send_kwargs["content"]
+    assert "**You**" in adapter.send.await_args_list[1].kwargs["content"]
+    assert "original ask" in adapter.send.await_args_list[1].kwargs["content"]
+    assert "**Hermes**" in adapter.send.await_args_list[2].kwargs["content"]
+    assert "original answer" in adapter.send.await_args_list[2].kwargs["content"]
 
     match = re.search(r"Fork: `([^`]+)`", result)
     assert match, result
@@ -143,43 +150,58 @@ async def test_forktopic_creates_seeded_topic_copies_session_and_binds_routing(t
 
 
 @pytest.mark.asyncio
-async def test_forktopic_seed_message_includes_recent_visible_context(tmp_path, monkeypatch):
+async def test_forktopic_sends_recent_context_as_separate_timestamped_messages(tmp_path, monkeypatch):
     runner, store, adapter, clear_security, evict_agent, release_running = _runner(tmp_path, monkeypatch)
     source = _source(thread_id="777")
     entry = store.get_or_create_session(source)
+    base_ts = datetime(2026, 6, 30, 12, 0).timestamp()
+    long_recent = "recent user five " + ("kept in full " * 80).strip()
     messages = [
-        ("user", "oldest user message should not be visible"),
-        ("assistant", "older assistant message should not be visible"),
-        ("user", "recent user one"),
-        ("assistant", "recent assistant two"),
-        ("user", "recent user three"),
-        ("assistant", "recent assistant four"),
-        ("user", "recent user five"),
+        ("user", "oldest user message should not be visible", base_ts),
+        ("assistant", "older assistant message should not be visible", base_ts + 60),
+        ("user", "recent user one", base_ts + 120),
+        ("assistant", "recent assistant two", base_ts + 180),
+        ("user", "recent user three", base_ts + 240),
+        ("assistant", "recent assistant four", base_ts + 300),
+        ("user", long_recent, base_ts + 360),
     ]
-    for role, content in messages:
-        store.append_to_transcript(entry.session_id, {"role": role, "content": content})
+    for role, content, timestamp in messages:
+        store.append_to_transcript(
+            entry.session_id,
+            {"role": role, "content": content, "timestamp": timestamp},
+        )
 
     event = MessageEvent(text="/forktopic Context Fork", source=source, message_id="m1")
     result = await runner._handle_forktopic_command(event)
 
     assert "Forked into Telegram topic" in result
-    adapter.send.assert_awaited_once()
-    seed_content = adapter.send.await_args.kwargs["content"]
-    assert "Recent context" in seed_content
-    assert "oldest user message should not be visible" not in seed_content
-    assert "older assistant message should not be visible" not in seed_content
-    assert "recent user one" in seed_content
-    assert "recent assistant two" in seed_content
-    assert "recent user three" in seed_content
-    assert "recent assistant four" in seed_content
-    assert "recent user five" in seed_content
+    assert adapter.send.await_count == 6
+    sent_contents = [call.kwargs["content"] for call in adapter.send.await_args_list]
+    seed_content = sent_contents[0]
+    context_messages = sent_contents[1:]
+    assert "Forked conversation: Context Fork" in seed_content
+    assert "Recent context" not in seed_content
+    assert "oldest user message should not be visible" not in "\n".join(sent_contents)
+    assert "older assistant message should not be visible" not in "\n".join(sent_contents)
+    assert "**You** · " in context_messages[0]
+    assert "recent user one" in context_messages[0]
+    assert "**Hermes** · " in context_messages[1]
+    assert "recent assistant two" in context_messages[1]
+    assert "**You** · " in context_messages[2]
+    assert "recent user three" in context_messages[2]
+    assert "**Hermes** · " in context_messages[3]
+    assert "recent assistant four" in context_messages[3]
+    assert "**You** · " in context_messages[4]
+    assert long_recent in context_messages[4]
+    assert datetime.fromtimestamp(base_ts + 120).strftime("%Y-%m-%d %H:%M") in context_messages[0]
+    assert all("Forked conversation" not in message for message in context_messages)
 
     match = re.search(r"Fork: `([^`]+)`", result)
     assert match, result
     db = store._db
     assert db is not None
     fork_messages = db.get_messages_as_conversation(match.group(1))
-    assert [m["content"] for m in fork_messages] == [content for _, content in messages]
+    assert [m["content"] for m in fork_messages] == [content for _, content, _ in messages]
 
 
 @pytest.mark.asyncio

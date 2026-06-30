@@ -19,6 +19,7 @@ import asyncio
 import dataclasses
 import hashlib
 import inspect
+import json
 import logging
 import os
 import re
@@ -3172,26 +3173,74 @@ class GatewaySlashCommandsMixin:
         return t(key, title=branch_title, count=msg_count, parent=parent_session_id, new=new_session_id)
 
     @staticmethod
-    def _compact_forktopic_visible_message(content: Any, *, limit: int = 320) -> str:
-        text = re.sub(r"\s+", " ", str(content or "")).strip()
-        if len(text) > limit:
-            text = f"{text[: limit - 1].rstrip()}…"
+    def _text_for_forktopic_visible_message(content: Any) -> str:
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, str):
+                    parts.append(part)
+                elif isinstance(part, dict):
+                    text = part.get("text") or part.get("content")
+                    if isinstance(text, str):
+                        parts.append(text)
+            if parts:
+                content = "\n".join(parts)
+        elif isinstance(content, dict):
+            try:
+                content = json.dumps(content, ensure_ascii=False)
+            except (TypeError, ValueError):
+                content = str(content)
+
+        text = str(content or "").replace("\r\n", "\n").replace("\r", "\n")
+        text = re.sub(r"[ \t\f\v]+", " ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
         return text or "(empty)"
 
-    def _format_forktopic_recent_context(self, history: list[dict[str, Any]], *, limit: int = 5) -> str:
+    @staticmethod
+    def _forktopic_visible_time(message: dict[str, Any]) -> str:
+        timestamp = message.get("timestamp")
+        if timestamp is None:
+            return "time unknown"
+        try:
+            if hasattr(timestamp, "timestamp"):
+                dt = timestamp
+            else:
+                dt = datetime.fromtimestamp(float(timestamp))
+            return dt.strftime("%Y-%m-%d %H:%M")
+        except (TypeError, ValueError, OSError):
+            return "time unknown"
+
+    @staticmethod
+    def _split_forktopic_visible_message(header: str, text: str, *, limit: int = 3800) -> list[str]:
+        available = max(500, limit - len(header) - 16)
+        chunks = [text[index : index + available] for index in range(0, len(text), available)] or [""]
+        if len(chunks) == 1:
+            return [f"{header}\n{text}"]
+        return [
+            f"{header} ({index}/{len(chunks)})\n{chunk}"
+            for index, chunk in enumerate(chunks, start=1)
+        ]
+
+    def _format_forktopic_recent_context_messages(
+        self,
+        history: list[dict[str, Any]],
+        *,
+        limit: int = 5,
+    ) -> list[str]:
         visible_messages = [
-            (message.get("role"), message.get("content"))
+            message
             for message in history
             if message.get("role") in {"user", "assistant"}
         ][-limit:]
-        if not visible_messages:
-            return ""
 
-        lines = ["", "", "**Recent context (visible excerpt):**"]
-        for role, content in visible_messages:
+        messages: list[str] = []
+        for message in visible_messages:
+            role = message.get("role")
             label = "You" if role == "user" else "Hermes"
-            lines.append(f"- **{label}:** {self._compact_forktopic_visible_message(content)}")
-        return "\n".join(lines)
+            header = f"**{label}** · {self._forktopic_visible_time(message)}"
+            text = self._text_for_forktopic_visible_message(message.get("content"))
+            messages.extend(self._split_forktopic_visible_message(header, text))
+        return messages
 
     async def _handle_forktopic_command(self, event: MessageEvent) -> str:
         """Handle /forktopic [name] — fork the current session into a new Telegram topic."""
@@ -3254,7 +3303,7 @@ class GatewaySlashCommandsMixin:
             parent=parent_session_id,
             new=new_session_id,
         )
-        seed_text = f"{seed_text}{self._format_forktopic_recent_context(history)}"
+        context_seed_messages = self._format_forktopic_recent_context_messages(history)
 
         dest_source = dataclasses.replace(
             source,
@@ -3342,13 +3391,15 @@ class GatewaySlashCommandsMixin:
         try:
             thread_metadata = getattr(self, "_thread_metadata_for_source", None)
             metadata = thread_metadata(dest_source) if callable(thread_metadata) else {"thread_id": new_thread_id}
-            send_result = await adapter.send(
-                chat_id=str(source.chat_id),
-                content=seed_text,
-                metadata=metadata,
-            )
-            if getattr(send_result, "success", True) is False:
-                send_error = getattr(send_result, "error", "send returned success=False")
+            for index, content in enumerate([seed_text, *context_seed_messages], start=1):
+                send_result = await adapter.send(
+                    chat_id=str(source.chat_id),
+                    content=content,
+                    metadata=metadata,
+                )
+                if getattr(send_result, "success", True) is False:
+                    send_error = f"message {index}: {getattr(send_result, 'error', 'send returned success=False')}"
+                    break
         except Exception as exc:
             logger.warning("forktopic: failed to send seed message", exc_info=True)
             send_error = str(exc)
