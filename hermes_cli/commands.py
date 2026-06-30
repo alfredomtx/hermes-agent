@@ -86,6 +86,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="<platform>", cli_only=True),
     CommandDef("branch", "Branch the current session (explore a different path)", "Session",
                aliases=("fork",), args_hint="[name]"),
+    CommandDef("forktopic", "Fork this Telegram topic into a new seeded topic", "Session",
+               gateway_only=True, args_hint="[name]"),
     CommandDef("compress", "Compress conversation context (add 'here [N]' to keep recent N turns)", "Session",
                args_hint="[here [N] | focus topic]"),
     CommandDef("rollback", "List or restore filesystem checkpoints", "Session",
@@ -534,6 +536,7 @@ _TELEGRAM_MENU_PRIORITY = (
     "status",
     "resume",
     "sessions",
+    "forktopic",
     "model",
     # Maintenance / diagnostics — the ones that prompted this priority list.
     "debug",

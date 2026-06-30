@@ -8557,6 +8557,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "branch":
             return await self._handle_branch_command(event)
 
+        if canonical == "forktopic":
+            return await self._handle_forktopic_command(event)
+
         if canonical == "rollback":
             return await self._handle_rollback_command(event)
 
