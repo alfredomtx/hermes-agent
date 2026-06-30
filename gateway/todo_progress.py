@@ -126,7 +126,8 @@ def format_todo_progress(
     args: Optional[dict],
     *,
     result: Any = None,
-    max_items: int = 12,
+    max_items: int = 0,
+    max_chars: int = 0,
     content_limit: int = 100,
 ) -> Optional[str]:
     """Render ``todo`` tool args as a compact plan card.
@@ -142,6 +143,19 @@ def format_todo_progress(
     completion re-render. If ``result`` is provided but carries no usable item
     list, returns None (the caller should keep the existing start card) rather
     than falling back to args or the "Reading task list" sentinel.
+
+    Row caps. Two independent caps decide how many task rows render; both are
+    ``0`` (off) by default, so the default renders EVERY task with no cap and no
+    "... N more" footer:
+      * ``max_items`` — a hard row count cap (used by tests / explicit callers).
+      * ``max_chars`` — a length budget so the rendered card fits ONE adapter
+        message. The gateway passes the platform's message limit here. When the
+        full card would exceed it, only the overflow TAIL collapses into a
+        "... N more" footer; everything that fits still renders. This keeps the
+        persistent plan card a single editable message even on adapters whose
+        edit path truncates (Discord) or sends unsplit (Slack/Mattermost/Feishu)
+        instead of splitting like Telegram.
+    When both caps are set the stricter one wins.
     """
     if not isinstance(args, dict):
         return None
@@ -179,10 +193,11 @@ def format_todo_progress(
         lines.append("No tasks")
         return "\n".join(lines)
 
+    # Build every renderable row first (skipping non-dict items, numbered by
+    # the running shown counter), then decide how many fit under the caps.
+    rows: list = []
     shown = 0
     for item in todos:
-        if shown >= max_items:
-            break
         if not isinstance(item, dict):
             continue
         status = str(item.get("status") or "pending")
@@ -193,11 +208,35 @@ def format_todo_progress(
         elapsed = _format_elapsed(item.get("elapsed_seconds"))
         duration = f" ({elapsed})" if elapsed else ""
         shown += 1
-        lines.append(f"{shown}. {icon} {label}{duration} - {content}")
+        rows.append(f"{shown}. {icon} {label}{duration} - {content}")
 
-    remaining = count - shown
-    if remaining > 0:
-        lines.append(f"... {remaining} more")
+    # Hard row-count cap (explicit callers / tests).
+    if max_items > 0 and len(rows) > max_items:
+        rows = rows[:max_items]
+
+    def _assemble(keep: int) -> list:
+        body = rows[:keep]
+        dropped = count - keep  # count = len(todos); non-dict skips count too
+        out = [header] + body
+        if dropped > 0:
+            out.append(f"... {dropped} more")
+        return out
+
+    if max_chars > 0:
+        # Length budget: keep the longest prefix of rows whose card (header +
+        # kept rows + "... N more" footer) fits one adapter message. Only the
+        # overflow tail collapses; everything that fits still renders. Reserve a
+        # small margin: platforms measure UTF-16 code units and MarkdownV2
+        # escaping inflates the payload past a raw char count, so leave room
+        # (mirrors the gateway's _PROGRESS_TEXT_LIMIT margin).
+        budget = max_chars - 64 if max_chars > 128 else max_chars
+        keep = len(rows)
+        lines = _assemble(keep)
+        while keep > 0 and len("\n".join(lines)) > budget:
+            keep -= 1
+            lines = _assemble(keep)
+    else:
+        lines = _assemble(len(rows))
 
     text = "\n".join(lines)
     try:

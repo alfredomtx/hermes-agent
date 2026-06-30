@@ -77,6 +77,66 @@ def test_todo_progress_limits_large_lists_and_long_content():
     assert "4. ⏳" not in card
 
 
+def test_todo_progress_default_renders_all_items_no_more_footer():
+    # Default max_items=0 + max_chars=0 -> every task renders, no collapse.
+    card = format_todo_progress(
+        {
+            "todos": [
+                {"id": str(i), "content": f"task {i}", "status": "pending"}
+                for i in range(24)
+            ]
+        }
+    )
+    assert card is not None
+    assert card.startswith("📋 Plan (24 tasks)")
+    assert "1. ⏳ pending - task 0" in card
+    assert "24. ⏳ pending - task 23" in card
+    assert "more" not in card
+
+
+def test_todo_progress_max_chars_collapses_only_overflow_tail():
+    # A length budget collapses ONLY the tail that doesn't fit; the card stays
+    # under the budget and the surviving rows still render in order.
+    todos = [
+        {"id": str(i), "content": "x" * 60, "status": "pending"}
+        for i in range(40)
+    ]
+    card = format_todo_progress({"todos": todos}, max_chars=600)
+    assert card is not None
+    assert card.startswith("📋 Plan (40 tasks)")
+    assert "1. ⏳ pending - " in card  # first rows survive
+    assert "40. ⏳" not in card  # tail collapsed
+    # Footer reflects the dropped count and the card fits the budget margin.
+    import re
+    m = re.search(r"\.\.\. (\d+) more", card)
+    assert m is not None
+    assert len(card) <= 600 - 64
+
+
+def test_todo_progress_max_chars_renders_all_when_it_fits():
+    # When the whole card fits the budget, nothing collapses.
+    todos = [
+        {"id": str(i), "content": f"task {i}", "status": "pending"}
+        for i in range(5)
+    ]
+    card = format_todo_progress({"todos": todos}, max_chars=4096)
+    assert card is not None
+    assert "5. ⏳ pending - task 4" in card
+    assert "more" not in card
+
+
+def test_todo_progress_max_chars_zero_is_unbounded():
+    # max_chars=0 (unknown adapter) keeps the render-all behavior.
+    todos = [
+        {"id": str(i), "content": "x" * 100, "status": "pending"}
+        for i in range(60)
+    ]
+    card = format_todo_progress({"todos": todos}, max_chars=0)
+    assert card is not None
+    assert "60. ⏳" in card
+    assert "more" not in card
+
+
 def test_todo_progress_reading_state():
     assert format_todo_progress({}) == "📋 Todo\nReading task list"
 
@@ -156,6 +216,34 @@ def test_base_adapter_uses_todo_progress_renderer():
     assert lines[0].startswith("📋 Plan (4 tasks)")
     assert "planning 4 task(s)" not in lines[0]
     assert "Inspect gateway progress rendering" in lines[0]
+
+
+def test_base_adapter_todo_card_bounded_without_max_message_length():
+    # Regression: an adapter that exposes no MAX_MESSAGE_LENGTH (Mattermost,
+    # IRC, LINE, whatsapp, the base class) must still render a BOUNDED todo
+    # card. format_tool_event falls back to 4096 so a long plan collapses its
+    # overflow tail instead of emitting one oversized card on an unsplit edit
+    # path.
+    adapter = _base_adapter()
+    assert not hasattr(adapter, "MAX_MESSAGE_LENGTH") or not getattr(
+        adapter, "MAX_MESSAGE_LENGTH", 0
+    )
+    big_args = {
+        "todos": [
+            {"id": str(i), "content": "x" * 100, "status": "pending"}
+            for i in range(80)
+        ]
+    }
+    from gateway.stream_events import ToolCallChunk
+
+    card = adapter.format_tool_event(
+        ToolCallChunk(tool_name="todo", preview="", args=big_args)
+    )
+    assert card is not None
+    # Bounded to the 4096 fallback (minus the 64-char margin), not the ~9.4k
+    # an unbounded render would produce.
+    assert len(card) <= 4096
+    assert "... " in card and "more" in card
 
 
 # ── header whole-plan wall-clock (DECISION B) ───────────────────────────────
