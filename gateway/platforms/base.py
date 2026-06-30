@@ -2067,6 +2067,36 @@ class EphemeralReply(str):
         return str.__str__(self)
 
 
+class ButtonReply(str):
+    """Text reply with optional inline buttons.
+
+    ``buttons`` is the same generic schema accepted by adapter ``send`` /
+    ``edit_message``: a flat list (one row) or list of rows. Each button must
+    have ``text`` plus either ``callback_data`` or ``url``. Subclassing ``str``
+    keeps existing text/media extraction code working while the send path can
+    read the button metadata.
+    """
+
+    buttons: Optional[list]
+    ttl_seconds: Optional[int]
+
+    def __new__(
+        cls,
+        text: str,
+        *,
+        buttons: Optional[list] = None,
+        ttl_seconds: Optional[int] = None,
+    ):
+        instance = super().__new__(cls, text)
+        instance.buttons = buttons
+        instance.ttl_seconds = ttl_seconds
+        return instance
+
+    @property
+    def text(self) -> str:
+        return str.__str__(self)
+
+
 def merge_pending_message_event(
     pending_messages: Dict[str, MessageEvent],
     session_key: str,
@@ -2162,9 +2192,10 @@ def _is_send_path_degraded_error(error: Optional[str]) -> bool:
 
 
 # Type for message handlers.  Handlers may return a plain string (normal
-# reply), an ``EphemeralReply`` to opt the reply into auto-deletion, or
-# ``None`` when the response was already delivered (e.g. via streaming).
-MessageHandler = Callable[[MessageEvent], Awaitable[Optional[Union[str, "EphemeralReply"]]]]
+# reply), an ``EphemeralReply`` to opt the reply into auto-deletion, a
+# ``ButtonReply`` to attach inline buttons, or ``None`` when the response was
+# already delivered (e.g. via streaming).
+MessageHandler = Callable[[MessageEvent], Awaitable[Optional[Union[str, "EphemeralReply", "ButtonReply"]]]]
 
 
 def resolve_channel_prompt(
@@ -2938,11 +2969,12 @@ class BasePlatformAdapter(ABC):
             reply_to: Optional message ID to reply to
             metadata: Additional platform-specific options
             buttons: Optional inline buttons. A flat list of
-                ``{"text": str, "callback_data": str}`` dicts (one row), or a
-                list of such rows. ``callback_data`` must be <=64 bytes.
-                Adapters without inline-button support ignore this argument.
-                Button callbacks that match no built-in prefix are dispatched
-                to the ``gateway_callback`` plugin hook.
+                ``{"text": str, "callback_data": str}`` or
+                ``{"text": str, "url": str}`` dicts (one row), or a list of
+                such rows. ``callback_data`` must be <=64 bytes. Adapters
+                without inline-button support ignore this argument. Button
+                callbacks that match no built-in prefix are dispatched to the
+                ``gateway_callback`` plugin hook.
         
         Returns:
             SendResult with success status and message ID
@@ -3013,11 +3045,11 @@ class BasePlatformAdapter(ABC):
         consumer) and leave it ``False`` on intermediate edits.
 
         ``buttons`` mirrors :meth:`send` — a flat list (one row) or list of
-        rows of ``{"text", "callback_data"}`` dicts. Pass ``None`` (the
-        default) to leave/clear the inline keyboard; adapters that support
-        it should clear the markup when ``buttons`` is falsy so a completed
-        message can drop its buttons. Adapters without inline-button support
-        ignore it.
+        rows of ``{"text", "callback_data"}`` / ``{"text", "url"}`` dicts.
+        Pass ``None`` (the default) to leave/clear the inline keyboard;
+        adapters that support it should clear the markup when ``buttons`` is
+        falsy so a completed message can drop its buttons. Adapters without
+        inline-button support ignore it.
         """
         return SendResult(success=False, error="Not supported")
 
@@ -4108,17 +4140,57 @@ class BasePlatformAdapter(ABC):
         doesn't override :meth:`delete_message` so non-supporting
         platforms silently degrade to normal sends.
         """
-        if isinstance(response, EphemeralReply):
-            ttl = response.ttl_seconds
-            if ttl is None:
-                try:
-                    ttl = int(self._get_ephemeral_system_ttl_default())
-                except Exception:
-                    ttl = 0
-            if ttl and ttl > 0 and type(self).delete_message is BasePlatformAdapter.delete_message:
+        text, ttl, _buttons = self._unwrap_reply(response)
+        return text, ttl
+
+    def _reply_ttl(self, ttl: Optional[int]) -> int:
+        if ttl is None:
+            try:
+                ttl = int(self._get_ephemeral_system_ttl_default())
+            except Exception:
                 ttl = 0
-            return response.text, int(ttl or 0)
-        return response, 0
+        if ttl and ttl > 0 and type(self).delete_message is BasePlatformAdapter.delete_message:
+            ttl = 0
+        return int(ttl or 0)
+
+    def _unwrap_reply(self, response: Any) -> Tuple[Optional[str], int, Optional[list]]:
+        """Unwrap text plus optional TTL/buttons from handler responses."""
+        if isinstance(response, ButtonReply):
+            ttl = self._reply_ttl(response.ttl_seconds) if response.ttl_seconds is not None else 0
+            return response.text, ttl, response.buttons
+        if isinstance(response, EphemeralReply):
+            return response.text, self._reply_ttl(response.ttl_seconds), None
+        return response, 0, None
+
+    @staticmethod
+    def _method_accepts_kwarg(method: Callable[..., Any], name: str) -> bool:
+        """Return True when ``method`` accepts ``name`` or ``**kwargs``."""
+        try:
+            params = inspect.signature(method).parameters
+        except (TypeError, ValueError):
+            return False
+        return name in params or any(
+            param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values()
+        )
+
+    def _send_call_kwargs(
+        self,
+        *,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str],
+        metadata: Any,
+        buttons: Optional[list],
+    ) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "chat_id": chat_id,
+            "content": content,
+            "reply_to": reply_to,
+            "metadata": metadata,
+        }
+        if buttons is not None and self._method_accepts_kwarg(self.send, "buttons"):
+            kwargs["buttons"] = buttons
+        return kwargs
 
     async def _send_with_retry(
         self,
@@ -4126,6 +4198,7 @@ class BasePlatformAdapter(ABC):
         content: str,
         reply_to: Optional[str] = None,
         metadata: Any = None,
+        buttons: Optional[list] = None,
         max_retries: int = 2,
         base_delay: float = 2.0,
     ) -> "SendResult":
@@ -4138,12 +4211,13 @@ class BasePlatformAdapter(ABC):
         know to retry rather than waiting indefinitely.
         """
 
-        result = await self.send(
+        result = await self.send(**self._send_call_kwargs(
             chat_id=chat_id,
             content=content,
             reply_to=reply_to,
             metadata=metadata,
-        )
+            buttons=buttons,
+        ))
 
         if result.success:
             return result
@@ -4183,12 +4257,13 @@ class BasePlatformAdapter(ABC):
                     self.name, attempt, effective_max_retries, delay, error_str,
                 )
                 await asyncio.sleep(delay)
-                result = await self.send(
+                result = await self.send(**self._send_call_kwargs(
                     chat_id=chat_id,
                     content=content,
                     reply_to=reply_to,
                     metadata=metadata,
-                )
+                    buttons=buttons,
+                ))
                 if result.success:
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
                     return result
@@ -4215,12 +4290,13 @@ class BasePlatformAdapter(ABC):
 
         # Non-network / post-retry formatting failure: try plain text as fallback
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
-        fallback_result = await self.send(
+        fallback_result = await self.send(**self._send_call_kwargs(
             chat_id=chat_id,
             content=f"(Response formatting failed, plain text:)\n\n{content[:3500]}",
             reply_to=reply_to,
             metadata=metadata,
-        )
+            buttons=buttons,
+        ))
         if not fallback_result.success:
             logger.error("[%s] Fallback send also failed: %s", self.name, fallback_result.error)
         return fallback_result
@@ -4601,7 +4677,7 @@ class BasePlatformAdapter(ABC):
 
         try:
             response = await self._message_handler(event)
-            _text, _eph_ttl = self._unwrap_ephemeral(response)
+            _text, _eph_ttl, _reply_buttons = self._unwrap_reply(response)
             # Send the response BEFORE cancelling the old task so the send
             # cannot be affected by task-cancellation side effects (race
             # condition fix — issue #18912).  Previously the send happened
@@ -4620,6 +4696,7 @@ class BasePlatformAdapter(ABC):
                     content=_text,
                     reply_to=_reply_anchor_for_event(event),
                     metadata=_mark_notify_metadata(thread_meta),
+                    buttons=_reply_buttons,
                 )
                 if _eph_ttl > 0 and _r.success and _r.message_id:
                     self._schedule_ephemeral_delete(
@@ -4740,13 +4817,14 @@ class BasePlatformAdapter(ABC):
                 try:
                     _thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
                     response = await self._message_handler(event)
-                    _text, _eph_ttl = self._unwrap_ephemeral(response)
+                    _text, _eph_ttl, _reply_buttons = self._unwrap_reply(response)
                     if _text:
                         _r = await self._send_with_retry(
                             chat_id=event.source.chat_id,
                             content=_text,
                             reply_to=_reply_anchor_for_event(event),
                             metadata=_mark_notify_metadata(_thread_meta),
+                            buttons=_reply_buttons,
                         )
                         if _eph_ttl > 0 and _r.success and _r.message_id:
                             self._schedule_ephemeral_delete(
@@ -4793,13 +4871,14 @@ class BasePlatformAdapter(ABC):
                             event.source, _reply_anchor_for_event(event)
                         )
                         response = await self._message_handler(event)
-                        _text, _eph_ttl = self._unwrap_ephemeral(response)
+                        _text, _eph_ttl, _reply_buttons = self._unwrap_reply(response)
                         if _text:
                             _r = await self._send_with_retry(
                                 chat_id=event.source.chat_id,
                                 content=_text,
                                 reply_to=_reply_anchor_for_event(event),
                                 metadata=_mark_notify_metadata(_thread_meta),
+                                buttons=_reply_buttons,
                             )
                             if _eph_ttl > 0 and _r.success and _r.message_id:
                                 self._schedule_ephemeral_delete(
@@ -4946,11 +5025,11 @@ class BasePlatformAdapter(ABC):
             # Slash-command handlers may return an EphemeralReply sentinel to
             # request that their reply message auto-delete after a TTL (used
             # for system notices like "✨ New session started!" that the user
-            # doesn't need to keep in the thread).  Unwrap here so all the
-            # downstream extract_media / text-processing logic sees a plain
-            # string, and remember the TTL + platform capability so the
-            # post-send block can schedule the deletion.
-            response, _ephemeral_ttl = self._unwrap_ephemeral(response)
+            # doesn't need to keep in the thread). ButtonReply carries inline
+            # button metadata while staying string-compatible. Unwrap here so
+            # all downstream extract_media / text-processing logic sees a
+            # plain string, and remember TTL/buttons for the send call.
+            response, _ephemeral_ttl, _reply_buttons = self._unwrap_reply(response)
 
             # Send response if any.  A None/empty response is normal when
             # streaming already delivered the text (already_sent=True) or
@@ -5092,6 +5171,7 @@ class BasePlatformAdapter(ABC):
                         content=text_content,
                         reply_to=_reply_anchor,
                         metadata=_final_thread_metadata,
+                        buttons=_reply_buttons,
                     )
                     _record_delivery(result)
 
