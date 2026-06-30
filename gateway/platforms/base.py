@@ -2148,6 +2148,18 @@ _RETRYABLE_ERROR_PATTERNS = (
     "eoferror",
 )
 
+_SEND_PATH_DEGRADED_ERROR = "send_path_degraded"
+# Telegram sets send_path_degraded while polling recovers. Worst case is a
+# reconnect backoff (up to ~60s) plus the follow-up heartbeat probe delay
+# (~60s). Normal final replies must wait through that known recovery window
+# instead of exhausting the generic two-retry budget and disappearing.
+_SEND_PATH_DEGRADED_RETRY_ATTEMPTS = 26
+_SEND_PATH_DEGRADED_RETRY_DELAY = 5.0
+
+
+def _is_send_path_degraded_error(error: Optional[str]) -> bool:
+    return str(error or "").strip().lower() == _SEND_PATH_DEGRADED_ERROR
+
 
 # Type for message handlers.  Handlers may return a plain string (normal
 # reply), an ``EphemeralReply`` to opt the reply into auto-deletion, or
@@ -4148,16 +4160,27 @@ class BasePlatformAdapter(ABC):
             # Retry with exponential backoff for transient errors.
             # Honor server-requested retry_after (e.g. Telegram FloodWait)
             # when present — it is authoritative over our backoff schedule.
+            # The Telegram-specific send_path_degraded sentinel is different:
+            # no send has been attempted yet, and it normally clears after the
+            # reconnect heartbeat (~60s), so use a fixed extended retry window.
+            effective_max_retries = max_retries
+            if _is_send_path_degraded_error(error_str):
+                effective_max_retries = max(effective_max_retries, _SEND_PATH_DEGRADED_RETRY_ATTEMPTS)
             server_retry_after = result.retry_after
-            for attempt in range(1, max_retries + 1):
+
+            attempt = 1
+            while attempt <= effective_max_retries:
                 if server_retry_after is not None:
                     delay = server_retry_after + random.uniform(0, 1)
                     server_retry_after = None  # only honor once per send
+                elif _is_send_path_degraded_error(error_str):
+                    effective_max_retries = max(effective_max_retries, _SEND_PATH_DEGRADED_RETRY_ATTEMPTS)
+                    delay = _SEND_PATH_DEGRADED_RETRY_DELAY
                 else:
                     delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
                 logger.warning(
                     "[%s] Send failed (attempt %d/%d, retrying in %.1fs): %s",
-                    self.name, attempt, max_retries, delay, error_str,
+                    self.name, attempt, effective_max_retries, delay, error_str,
                 )
                 await asyncio.sleep(delay)
                 result = await self.send(
@@ -4174,9 +4197,12 @@ class BasePlatformAdapter(ABC):
                     server_retry_after = result.retry_after
                 if not (result.retryable or self._is_retryable_error(error_str)):
                     break  # error switched to non-transient — fall through to plain-text fallback
+                if _is_send_path_degraded_error(error_str):
+                    effective_max_retries = max(effective_max_retries, _SEND_PATH_DEGRADED_RETRY_ATTEMPTS)
+                attempt += 1
             else:
                 # All retries exhausted (loop completed without break) — notify user
-                logger.error("[%s] Failed to deliver response after %d retries: %s", self.name, max_retries, error_str)
+                logger.error("[%s] Failed to deliver response after %d retries: %s", self.name, effective_max_retries, error_str)
                 notice = (
                     "\u26a0\ufe0f Message delivery failed after multiple attempts. "
                     "Please try again \u2014 your request was processed but the response could not be sent."
