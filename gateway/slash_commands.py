@@ -3800,6 +3800,28 @@ class GatewaySlashCommandsMixin:
         key = "gateway.branch.branched_one" if msg_count == 1 else "gateway.branch.branched_many"
         return t(key, title=branch_title, count=msg_count, parent=parent_session_id, new=new_session_id)
 
+    @staticmethod
+    def _compact_forktopic_visible_message(content: Any, *, limit: int = 320) -> str:
+        text = re.sub(r"\s+", " ", str(content or "")).strip()
+        if len(text) > limit:
+            text = f"{text[: limit - 1].rstrip()}…"
+        return text or "(empty)"
+
+    def _format_forktopic_recent_context(self, history: list[dict[str, Any]], *, limit: int = 5) -> str:
+        visible_messages = [
+            (message.get("role"), message.get("content"))
+            for message in history
+            if message.get("role") in {"user", "assistant"}
+        ][-limit:]
+        if not visible_messages:
+            return ""
+
+        lines = ["", "", "**Recent context (visible excerpt):**"]
+        for role, content in visible_messages:
+            label = "You" if role == "user" else "Hermes"
+            lines.append(f"- **{label}:** {self._compact_forktopic_visible_message(content)}")
+        return "\n".join(lines)
+
     async def _handle_forktopic_command(self, event: MessageEvent) -> str:
         """Handle /forktopic [name] — fork the current session into a new Telegram topic."""
         import uuid as _uuid
@@ -3861,6 +3883,7 @@ class GatewaySlashCommandsMixin:
             parent=parent_session_id,
             new=new_session_id,
         )
+        seed_text = f"{seed_text}{self._format_forktopic_recent_context(history)}"
 
         dest_source = dataclasses.replace(
             source,
