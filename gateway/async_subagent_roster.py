@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional
 
-from gateway.subagent_roster import STATUS_GLYPH, roster_label
+from gateway.subagent_roster import STATUS_GLYPH, _inline_code, roster_label
 
 _PENDING_STATUSES = {"pending", "queued", "dispatched", "running"}
 
@@ -171,12 +171,12 @@ def build_async_dispatched_header(record: Dict[str, Any]) -> str:
     (it does NOT morph away into the roster the way the old seed-card frame did).
     The live/collapsed roster rows are appended BELOW it.
 
-    Shape: ``🔀 Delegate task — N agents · <profile> · toolsets=a,b``
+    Shape example: 🔀 Delegate task — N agents · profile: `x` · toolsets=`a,b`
       * ``N agents`` — the post-expansion child count (a ``dual-review`` fans
         into one agent per lane, so this is the real number of agents running,
         not the number of model-issued tasks). Singular ``— 1 agent``.
       * ``<profile>`` — the top-level delegation profile when one was set
-        (``dual-review`` / ``coder`` / …); rendered as ``profile: none`` when no
+        (``dual-review`` / ``coder`` / …); rendered as profile: `none` when no
         profile was passed, so a plain delegate is EXPLICITLY marked rather than
         leaving the reader to wonder whether the cell is missing.
       * ``toolsets=…`` — ONLY when toolsets were EXPLICITLY passed on the
@@ -194,11 +194,11 @@ def build_async_dispatched_header(record: Dict[str, Any]) -> str:
 
     profile = record.get("profile")
     if profile not in (None, "", [], {}):
-        head += " · " + " ".join(str(profile).replace("`", "").split())
+        head += " · profile: " + _inline_code(profile)
     else:
         # No delegation profile -> mark it explicitly so a plain delegate is
         # unambiguous (not "did the profile cell go missing?").
-        head += " · profile: none"
+        head += " · profile: " + _inline_code("none")
 
     toolsets = record.get("header_toolsets")
     if toolsets in (None, "", [], {}):
@@ -206,5 +206,5 @@ def build_async_dispatched_header(record: Dict[str, Any]) -> str:
     if isinstance(toolsets, (list, tuple)) and toolsets:
         cleaned = [str(t).replace("`", "").strip() for t in toolsets if str(t).strip()]
         if cleaned:
-            head += " · toolsets=" + ",".join(cleaned)
+            head += " · toolsets=" + _inline_code(",".join(cleaned))
     return head

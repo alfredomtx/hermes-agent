@@ -93,7 +93,7 @@ class TestRosterLabelBackticks:
 
         rows = [{"glyph": "▶", "label": "verify php", "elapsed": 5.0, "running": True, "tools": 0}]
         text = format_subagent_roster(rows)
-        assert "▶ `verify php` · 5s" in text
+        assert "▶ `verify php` · `5s`" in text
 
     def test_backticks_in_goal_are_stripped(self):
         # A goal containing backticks must not break the inline code span.
@@ -234,11 +234,11 @@ class TestFormatSubagentRoster:
         lines = text.split("\n")
         # Live header carries the WALL-CLOCK fallback = slowest row's elapsed
         # (max(83,80,45,30)=83), NOT the sum: children run in parallel.
-        assert lines[0] == "🤖 Subagents — 2 running, 1 done, 1 failed · 1m 23s"
-        assert lines[1] == "▶ `verify php` · 1m 23s · 8 tools"
-        assert lines[2] == "▶ `verify fe` · 1m 20s"
-        assert lines[3] == "✓ `run tests` · 45s"
-        assert lines[4] == "✗ `check types` · 30s"
+        assert lines[0] == "🤖 Subagents — 2 running, 1 done, 1 failed · `1m 23s`"
+        assert lines[1] == "▶ `verify php` · `1m 23s` · 8 tools"
+        assert lines[2] == "▶ `verify fe` · `1m 20s`"
+        assert lines[3] == "✓ `run tests` · `45s`"
+        assert lines[4] == "✗ `check types` · `30s`"
 
     def test_terminal_rows_keep_tool_count(self):
         # Tool count must persist on a DONE row, not vanish when running flips
@@ -252,9 +252,9 @@ class TestFormatSubagentRoster:
         ]
         text = format_subagent_roster(rows)
         lines = text.split("\n")
-        assert lines[1] == "✓ `review` · 15m 49s · 56 tools"
-        assert lines[2] == "✗ `audit` · 30s · 1 tool"  # singular
-        assert lines[3] == "✓ `noop` · 5s"  # 0 tools -> omit suffix
+        assert lines[1] == "✓ `review` · `15m 49s` · 56 tools"
+        assert lines[2] == "✗ `audit` · `30s` · 1 tool"  # singular
+        assert lines[3] == "✓ `noop` · `5s`"  # 0 tools -> omit suffix
 
     def test_collapsed_keeps_breakdown_with_summary_header(self):
         # On finish the roster keeps the per-child breakdown (each marked with
@@ -272,10 +272,10 @@ class TestFormatSubagentRoster:
         # A failure is present -> ⚠️ leads (a green check there would lie).
         # Header elapsed is the WALL-CLOCK fallback = slowest child
         # (max(45,60,134)=134), NOT the sum: children run in parallel.
-        assert lines[0] == "⚠️ 3 subagents · 2 ✓ · 1 ✗ · 2m 14s"
-        assert lines[1] == "✓ `a` · 45s"
-        assert lines[2] == "✓ `b` · 1m"
-        assert lines[3] == "✗ `c` · 2m 14s"
+        assert lines[0] == "⚠️ 3 subagents · 2 ✓ · 1 ✗ · `2m 14s`"
+        assert lines[1] == "✓ `a` · `45s`"
+        assert lines[2] == "✓ `b` · `1m`"
+        assert lines[3] == "✗ `c` · `2m 14s`"
 
     def test_collapsed_all_success_leads_with_green_check(self):
         # Clear "all done" indicator: when every child finished successfully the
@@ -290,14 +290,14 @@ class TestFormatSubagentRoster:
         lines = out.split("\n")
         # Header elapsed is the WALL-CLOCK fallback = slowest child
         # (max(45,60)=60), NOT the sum: children run in parallel.
-        assert lines[0] == "✅ 2 subagents · 2 ✓ · 1m"
+        assert lines[0] == "✅ 2 subagents · 2 ✓ · `1m`"
 
     def test_collapsed_single_success_leads_with_green_check(self):
         from gateway.subagent_roster import format_subagent_roster
 
         rows = [{"glyph": "✓", "label": "a", "elapsed": 5.0, "running": False, "tools": 0}]
         out = format_subagent_roster(rows, collapsed=True)
-        assert out.split("\n")[0] == "✅ 1 subagent · 1 ✓ · 5s"
+        assert out.split("\n")[0] == "✅ 1 subagent · 1 ✓ · `5s`"
 
     def test_collapsed_with_running_row_keeps_robot(self):
         # Defensive: if a running row somehow reaches the collapsed render, do
@@ -328,8 +328,8 @@ class TestFormatSubagentRoster:
         ]
         out = format_subagent_roster(rows, collapsed=True)
         lines = out.split("\n")
-        assert lines[1] == "✓ `a` · 45s · 9 tools"
-        assert lines[2] == "✗ `b` · 1m"
+        assert lines[1] == "✓ `a` · `45s` · 9 tools"
+        assert lines[2] == "✗ `b` · `1m`"
 
     def test_collapsed_renders_model_and_reasoning(self):
         from gateway.subagent_roster import format_subagent_roster
@@ -343,7 +343,7 @@ class TestFormatSubagentRoster:
             },
         ]
         out = format_subagent_roster(rows, collapsed=True)
-        assert "✓ `review` · opus-4-8 high · 5m 22s" in out
+        assert "✓ `review` · opus-4-8 high · `5m 22s`" in out
 
     def test_row_cap_overflow(self):
         from gateway.subagent_roster import format_subagent_roster
@@ -365,7 +365,7 @@ class TestFormatSubagentRoster:
             {"glyph": "✓", "label": "b", "elapsed": 10.0, "running": False, "tools": 0},
         ]
         out = format_subagent_roster(rows, collapsed=True, wall_clock=4.0)
-        assert out.split("\n")[0] == "✅ 2 subagents · 2 ✓ · 4s"
+        assert out.split("\n")[0] == "✅ 2 subagents · 2 ✓ · `4s`"
 
     def test_header_fallback_is_max_not_sum(self):
         # With no wall_clock, the header falls back to the SLOWEST child
@@ -377,7 +377,7 @@ class TestFormatSubagentRoster:
             {"glyph": "✓", "label": "b", "elapsed": 10.0, "running": False, "tools": 0},
         ]
         out = format_subagent_roster(rows, collapsed=True)
-        assert out.split("\n")[0] == "✅ 2 subagents · 2 ✓ · 10s"
+        assert out.split("\n")[0] == "✅ 2 subagents · 2 ✓ · `10s`"
 
     def test_header_ignores_bad_wall_clock(self):
         # A malformed/non-finite wall_clock must NOT crash the render and must
@@ -391,7 +391,7 @@ class TestFormatSubagentRoster:
         ]
         for bad in ("x", -5, float("inf"), float("-inf"), float("nan"), None, 10**400):
             out = format_subagent_roster(rows, collapsed=True, wall_clock=bad)
-            assert out.split("\n")[0] == "✅ 2 subagents · 2 ✓ · 10s", bad
+            assert out.split("\n")[0] == "✅ 2 subagents · 2 ✓ · `10s`", bad
 
 
 class TestShortenModel:
