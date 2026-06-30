@@ -1292,6 +1292,8 @@ class TelegramAdapter(BasePlatformAdapter):
         chat_id: str,
         message_id: str,
         content: str,
+        *,
+        markup_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Optional[SendResult]:
         """Edit an existing message in place as a rich message (Bot API 10.1).
 
@@ -1311,6 +1313,8 @@ class TelegramAdapter(BasePlatformAdapter):
             "message_id": int(message_id),
             "rich_message": self._rich_message_payload(content),
         }
+        if markup_kwargs:
+            payload.update(markup_kwargs)
         if getattr(self, "_disable_link_previews", False):
             payload["link_preview_options"] = {"is_disabled": True}
         try:
@@ -2877,6 +2881,18 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
+        # Markup semantics: only touch reply_markup when buttons were provided
+        # (a list). None = leave as-is. [] -> reply_markup=None clears it.
+        # Compute this before the rich/overflow paths so final workflow progress
+        # bubble edits can clear their Stop button no matter which edit backend
+        # handles the final message.
+        _buttons_provided = buttons is not None
+        _markup_kw: Dict[str, Any] = (
+            {"reply_markup": self._inline_keyboard_from_buttons(buttons)}
+            if _buttons_provided
+            else {}
+        )
+
         # Rich finalize (Bot API 10.1): when the completed content has
         # constructs the legacy MarkdownV2 edit degrades (tables → bullet
         # lists, task lists, <details>, block math) and rich is available,
@@ -2888,23 +2904,18 @@ class TelegramAdapter(BasePlatformAdapter):
         # chunks.  Falls back to the legacy edit path (overflow split included)
         # on capability/permanent rejection.
         if finalize and self._rich_eligible(content):
-            rich_result = await self._try_edit_rich(chat_id, message_id, content)
+            rich_result = await self._try_edit_rich(
+                chat_id, message_id, content, markup_kwargs=_markup_kw,
+            )
             if rich_result is not None:
                 return rich_result
-        # Markup semantics: only touch reply_markup when buttons were provided
-        # (a list). None = leave as-is. [] -> reply_markup=None clears it.
-        _buttons_provided = buttons is not None
-        _markup_kw: Dict[str, Any] = (
-            {"reply_markup": self._inline_keyboard_from_buttons(buttons)}
-            if _buttons_provided
-            else {}
-        )
 
         # Pre-flight: if content already exceeds the limit, split-and-deliver
         # without round-tripping a doomed edit.
         if utf16_len(content) > self.MAX_MESSAGE_LENGTH:
             return await self._edit_overflow_split(
                 chat_id, message_id, content, finalize=finalize, metadata=metadata,
+                markup_kwargs=_markup_kw,
             )
 
         try:
@@ -2959,6 +2970,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
                 return await self._edit_overflow_split(
                     chat_id, message_id, content, finalize=finalize, metadata=metadata,
+                    markup_kwargs=_markup_kw,
                 )
             # Flood control / RetryAfter — short waits are retried inline,
             # long waits return a failure immediately so streaming can fall back
@@ -3031,6 +3043,7 @@ class TelegramAdapter(BasePlatformAdapter):
         *,
         finalize: bool,
         metadata: Optional[Dict[str, Any]] = None,
+        markup_kwargs: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Split an oversized edit across the existing message + continuations.
 
@@ -3055,6 +3068,7 @@ class TelegramAdapter(BasePlatformAdapter):
             chunks = [content]
 
         # Step 1 — edit the existing message with the first chunk.
+        markup_kwargs = markup_kwargs or {}
         first_chunk = chunks[0]
         try:
             if finalize:
@@ -3067,6 +3081,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         message_id=int(message_id),
                         text=formatted,
                         parse_mode=ParseMode.MARKDOWN_V2,
+                        **markup_kwargs,
                     )
                 except Exception as fmt_err:
                     if "not modified" not in str(fmt_err).lower():
@@ -3079,12 +3094,14 @@ class TelegramAdapter(BasePlatformAdapter):
                             chat_id=int(chat_id),
                             message_id=int(message_id),
                             text=_strip_mdv2(first_chunk),
+                            **markup_kwargs,
                         )
             else:
                 await self._bot.edit_message_text(
                     chat_id=int(chat_id),
                     message_id=int(message_id),
                     text=first_chunk,
+                    **markup_kwargs,
                 )
         except Exception as e:
             err_str = str(e).lower()
