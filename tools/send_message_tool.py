@@ -6,6 +6,7 @@ human-friendly channel names to IDs. Works in both CLI and gateway contexts.
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -86,6 +87,83 @@ def _sanitize_error_text(text) -> str:
 def _error(message: str) -> dict:
     """Build a standardized error payload with redacted content."""
     return {"error": _sanitize_error_text(message)}
+
+
+def _normalize_buttons(buttons):
+    """Return a clean generic inline-button spec or None.
+
+    Accepts a flat list of dicts (one row) or list-of-rows. Each button must
+    have text plus either callback_data or url.
+    """
+    if not buttons:
+        return None
+    if not isinstance(buttons, list):
+        raise ValueError("buttons must be a list")
+    rows = [buttons] if buttons and isinstance(buttons[0], dict) else buttons
+    normalized = []
+    for row in rows:
+        if not isinstance(row, list):
+            continue
+        out_row = []
+        for item in row:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text") or "").strip()
+            callback_data = item.get("callback_data")
+            url = item.get("url")
+            if not text:
+                continue
+            if callback_data:
+                out_row.append({"text": text, "callback_data": str(callback_data)})
+            elif url:
+                out_row.append({"text": text, "url": str(url)})
+        if out_row:
+            normalized.append(out_row)
+    if not normalized:
+        return None
+    return normalized[0] if len(normalized) == 1 else normalized
+
+
+def _call_accepts_kw(fn, name: str) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    return name in sig.parameters or any(
+        param.kind == inspect.Parameter.VAR_KEYWORD
+        for param in sig.parameters.values()
+    )
+
+
+def _call_kwargs_if_accepted(fn, **kwargs):
+    return {key: value for key, value in kwargs.items() if _call_accepts_kw(fn, key)}
+
+
+def _telegram_inline_keyboard_from_buttons(buttons):
+    buttons = _normalize_buttons(buttons)
+    if not buttons:
+        return None
+    try:
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    except Exception:
+        return None
+    rows = [buttons] if buttons and isinstance(buttons[0], dict) else buttons
+    keyboard = []
+    for row in rows:
+        built = []
+        for item in row:
+            text = item.get("text")
+            if item.get("callback_data"):
+                built.append(
+                    InlineKeyboardButton(str(text), callback_data=str(item["callback_data"]))
+                )
+            elif item.get("url"):
+                built.append(InlineKeyboardButton(str(text), url=str(item["url"])))
+        if built:
+            keyboard.append(built)
+    if not keyboard:
+        return None
+    return InlineKeyboardMarkup(keyboard)
 
 
 def _display_chat_id(platform_name: str, chat_id: str) -> str:
@@ -171,6 +249,35 @@ SEND_MESSAGE_SCHEMA = {
             "message_id": {
                 "type": "string",
                 "description": "For action='react'/'unreact': id of the message to react to. Omit to target the most recent message received in that chat (usually the one being replied to)."
+            },
+            "buttons": {
+                "type": "array",
+                "description": "Optional inline buttons for action='send'. Use a flat list for one row or a list of rows. Each button is {text, callback_data} or {text, url}. Telegram supports both callback and URL buttons; unsupported platforms ignore or reject buttons.",
+                "items": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "text": {"type": "string"},
+                                "callback_data": {"type": "string"},
+                                "url": {"type": "string"}
+                            },
+                            "required": ["text"]
+                        },
+                        {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "text": {"type": "string"},
+                                    "callback_data": {"type": "string"},
+                                    "url": {"type": "string"}
+                                },
+                                "required": ["text"]
+                            }
+                        }
+                    ]
+                }
             }
         },
         "required": []
@@ -299,6 +406,10 @@ def _handle_send(args):
     """Send a message to a platform target."""
     target = args.get("target", "")
     message = args.get("message", "")
+    try:
+        buttons = _normalize_buttons(args.get("buttons"))
+    except ValueError as exc:
+        return tool_error(str(exc))
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
 
@@ -432,15 +543,20 @@ def _handle_send(args):
 
     try:
         from model_tools import _run_async
+        send_kwargs = {
+            "thread_id": thread_id,
+            "media_files": media_files,
+            "force_document": force_document_attachments,
+        }
+        if buttons is not None:
+            send_kwargs["buttons"] = buttons
         result = _run_async(
             _send_to_platform(
                 platform,
                 pconfig,
                 chat_id,
                 cleaned_message,
-                thread_id=thread_id,
-                media_files=media_files,
-                force_document=force_document_attachments,
+                **send_kwargs,
             )
         )
         if used_home_channel and isinstance(result, dict) and result.get("success"):
@@ -627,6 +743,7 @@ async def _send_via_adapter(
     thread_id=None,
     media_files=None,
     force_document=False,
+    buttons=None,
 ):
     """Send a message via a live gateway adapter, with a standalone fallback
     for out-of-process callers (e.g. cron running separately from the gateway).
@@ -661,7 +778,14 @@ async def _send_via_adapter(
                     metadata["publish_topic"] = chat_id
                 if not metadata:
                     metadata = None
-                result = await adapter.send(chat_id=chat_id, content=chunk, metadata=metadata)
+                send_kwargs = {
+                    "chat_id": chat_id,
+                    "content": chunk,
+                    "metadata": metadata,
+                }
+                if buttons is not None and _call_accepts_kw(adapter.send, "buttons"):
+                    send_kwargs["buttons"] = buttons
+                result = await adapter.send(**send_kwargs)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -679,13 +803,18 @@ async def _send_via_adapter(
 
     if entry is not None and entry.standalone_sender_fn is not None:
         try:
+            standalone_kwargs = {
+                "thread_id": thread_id,
+                "media_files": media_files,
+                "force_document": force_document,
+            }
+            if buttons is not None and _call_accepts_kw(entry.standalone_sender_fn, "buttons"):
+                standalone_kwargs["buttons"] = buttons
             result = await entry.standalone_sender_fn(
                 pconfig,
                 chat_id,
                 chunk,
-                thread_id=thread_id,
-                media_files=media_files,
-                force_document=force_document,
+                **standalone_kwargs,
             )
         except asyncio.CancelledError:
             raise
@@ -713,7 +842,7 @@ async def _send_via_adapter(
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, allow_thread_fallback=True):
+async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, allow_thread_fallback=True, buttons=None):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -783,15 +912,20 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         disable_link_previews = bool(getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews"))
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
+            telegram_kwargs = {
+                "media_files": media_files if is_last else [],
+                "thread_id": thread_id,
+                "disable_link_previews": disable_link_previews,
+                "force_document": force_document,
+                "allow_thread_fallback": allow_thread_fallback,
+            }
+            if buttons is not None and i == 0:
+                telegram_kwargs["buttons"] = buttons
             result = await _send_telegram(
                 pconfig.token,
                 chat_id,
                 chunk,
-                media_files=media_files if is_last else [],
-                thread_id=thread_id,
-                disable_link_previews=disable_link_previews,
-                force_document=force_document,
-                allow_thread_fallback=allow_thread_fallback,
+                **telegram_kwargs,
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
@@ -913,7 +1047,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         )
 
     last_result = None
-    for chunk in chunks:
+    for i, chunk in enumerate(chunks):
         if platform == Platform.SLACK:
             # Slack migrated to a bundled plugin (#41112); delivery flows
             # through the registry's standalone_sender_fn, which applies
@@ -959,6 +1093,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 thread_id=thread_id,
                 media_files=media_files,
                 force_document=force_document,
+                buttons=buttons if i == 0 else None,
             )
 
         if isinstance(result, dict) and result.get("error"):
@@ -981,7 +1116,7 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
     return "thread not found" in str(error).lower()
 
 
-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False, allow_thread_fallback=True):
+async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False, allow_thread_fallback=True, buttons=None):
     """Send via Telegram Bot API (one-shot, no polling needed).
 
     Applies markdown→MarkdownV2 formatting (same as the gateway adapter)
@@ -1035,6 +1170,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                 bot = Bot(token=token)
         else:
             bot = Bot(token=token)
+        reply_markup = _telegram_inline_keyboard_from_buttons(buttons)
         int_chat_id = int(chat_id)
         media_files = media_files or []
         thread_kwargs = {}
@@ -1066,6 +1202,8 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         text_kwargs = dict(thread_kwargs)
         if disable_link_previews:
             text_kwargs["disable_web_page_preview"] = True
+        if reply_markup is not None:
+            text_kwargs["reply_markup"] = reply_markup
 
         last_msg = None
         warnings = []

@@ -1411,11 +1411,12 @@ class TelegramAdapter(BasePlatformAdapter):
     def _inline_keyboard_from_buttons(buttons: Optional[list]) -> Optional["InlineKeyboardMarkup"]:
         """Build an InlineKeyboardMarkup from a generic ``buttons`` spec.
 
-        Accepts a flat list of ``{"text", "callback_data"}`` dicts (rendered as
-        a single row) or a list of such rows. Returns ``None`` when ``buttons``
-        is empty/falsy so callers can pass ``reply_markup=None`` to clear an
-        existing inline keyboard on edit. Malformed entries are skipped; a row
-        that ends up empty is dropped. Returns ``None`` if nothing valid remains.
+        Accepts a flat list of ``{"text", "callback_data"}`` / ``{"text",
+        "url"}`` dicts (rendered as a single row) or a list of such rows.
+        Returns ``None`` when ``buttons`` is empty/falsy so callers can pass
+        ``reply_markup=None`` to clear an existing inline keyboard on edit.
+        Malformed entries are skipped; a row that ends up empty is dropped.
+        Returns ``None`` if nothing valid remains.
         """
         if not buttons or InlineKeyboardMarkup is None or InlineKeyboardButton is None:
             return None
@@ -1433,10 +1434,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 if not isinstance(spec, dict):
                     continue
                 text = spec.get("text")
-                callback_data = spec.get("callback_data")
-                if not text or not callback_data:
+                if not text:
                     continue
-                built_row.append(InlineKeyboardButton(str(text), callback_data=str(callback_data)))
+                callback_data = spec.get("callback_data")
+                url = spec.get("url")
+                if callback_data:
+                    built_row.append(InlineKeyboardButton(str(text), callback_data=str(callback_data)))
+                elif url:
+                    built_row.append(InlineKeyboardButton(str(text), url=str(url)))
             if built_row:
                 keyboard.append(built_row)
         if not keyboard:
@@ -2524,7 +2529,7 @@ class TelegramAdapter(BasePlatformAdapter):
             # through to the legacy MarkdownV2 path on permanent/capability
             # errors or DM-topic routing skips; returns directly on success or
             # on a transient failure (which must NOT be legacy-resent).
-            if self._should_attempt_rich(content, metadata=metadata):
+            if _reply_markup is None and self._should_attempt_rich(content, metadata=metadata):
                 rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
                 if rich_result is not None:
                     if rich_result.success:
