@@ -17308,6 +17308,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # `pop(0) if flags else False` at the completion site tolerates under-pop.
         _todo_card_new_plan_flags: List[bool] = []
 
+        # Length budget for the todo plan card: the active adapter's per-message
+        # char limit. Passed to format_todo_progress so a long plan collapses
+        # only its overflow tail (keeping the card ONE editable message) instead
+        # of overflowing adapters whose edit path truncates/sends-unsplit.
+        # Adapters that expose no positive MAX_MESSAGE_LENGTH (Mattermost, IRC,
+        # LINE, whatsapp, the base class) fall back to 4096 — matching this
+        # gateway's existing convention (stream_consumer.py:898, run.py
+        # _PROGRESS_TEXT_LIMIT) — rather than 0, which would leave the card
+        # unbounded and re-open the overflow on those unsplit edit paths.
+        try:
+            _todo_progress_adapter = self.adapters.get(source.platform)
+            _todo_card_max_chars = int(
+                getattr(_todo_progress_adapter, "MAX_MESSAGE_LENGTH", 0) or 4096
+            )
+        except Exception:
+            _todo_card_max_chars = 4096
+
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
             # "log" mode: append tool.started lines to the log queue and stay
@@ -17525,7 +17542,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 from gateway.todo_card import todo_list_finished
 
                                 _card = format_todo_progress(
-                                    {"merge": False}, result=_todo_result
+                                    {"merge": False}, result=_todo_result,
+                                    max_chars=_todo_card_max_chars,
                                 )
                                 _finished = todo_list_finished(
                                     extract_todo_items(_todo_result)
@@ -17560,6 +17578,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _todo_done_card = format_todo_progress(
                                 {"merge": _merge_flag},
                                 result=_todo_result,
+                                max_chars=_todo_card_max_chars,
                             )
                         except Exception:
                             _todo_done_card = None
@@ -17760,7 +17779,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 try:
                     from gateway.todo_progress import format_todo_progress
 
-                    _todo_card = format_todo_progress(args)
+                    _todo_card = format_todo_progress(
+                        args, max_chars=_todo_card_max_chars,
+                    )
                 except Exception:
                     _todo_card = None
                 if _todo_card:

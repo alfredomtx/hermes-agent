@@ -2621,7 +2621,14 @@ class BasePlatformAdapter(ABC):
             try:
                 from gateway.todo_progress import format_todo_progress
 
-                todo_card = format_todo_progress(event.args)
+                # Fall back to 4096 (the gateway's conventional message limit)
+                # when this adapter exposes no positive MAX_MESSAGE_LENGTH, so
+                # the card stays bounded rather than unbounded on unsplit edit
+                # paths.
+                todo_card = format_todo_progress(
+                    event.args,
+                    max_chars=int(getattr(self, "MAX_MESSAGE_LENGTH", 0) or 4096),
+                )
             except Exception:
                 todo_card = None
             if todo_card:
