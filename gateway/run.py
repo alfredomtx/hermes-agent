@@ -19027,6 +19027,29 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                  Useful for systemd services to avoid restart-loop deadlocks
                  when the previous process hasn't fully exited yet.
     """
+    # ── Raise RLIMIT_NOFILE before anything opens FDs ─────────────────
+    # macOS launchd starts daemons with a soft RLIMIT_NOFILE of 256 and
+    # editing the plist does not take effect until launchd is bootout/
+    # bootstrap-reloaded (a plain --replace/KeepAlive respawn keeps the
+    # cached 256). Under parallel orchestration (dual-review subagents +
+    # the plan-review HTTP server + Telegram sockets + SQLite WAL + MCP
+    # servers) the gateway crosses 256 and every subsequent open raises
+    # OSError EMFILE "Too many open files" — which silently drops message
+    # sends and plan_review_start while cosmetic topic renames still retry
+    # through. The hard limit is effectively unbounded, so the process can
+    # lift its own soft limit with zero launchd/plist dependency. This is
+    # the durable fix; the plist SoftResourceLimits is belt-and-suspenders.
+    try:
+        import resource as _resource
+        _soft, _hard = _resource.getrlimit(_resource.RLIMIT_NOFILE)
+        _target = 10240
+        if _soft < _target:
+            _new_soft = _target if (_hard == _resource.RLIM_INFINITY or _hard >= _target) else _hard
+            _resource.setrlimit(_resource.RLIMIT_NOFILE, (_new_soft, _hard))
+            logger.info("Raised RLIMIT_NOFILE soft limit %d -> %d (hard=%s)", _soft, _new_soft, _hard)
+    except Exception as _e:
+        logger.warning("Could not raise RLIMIT_NOFILE (continuing): %s", _e)
+
     # ── Duplicate-instance guard ──────────────────────────────────────
     # Prevent two gateways from running under the same HERMES_HOME.
     # The PID file is scoped to HERMES_HOME, so future multi-profile
