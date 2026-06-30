@@ -21358,6 +21358,22 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                  Useful for systemd services to avoid restart-loop deadlocks
                  when the previous process hasn't fully exited yet.
     """
+    # ── Raise RLIMIT_NOFILE before anything opens FDs ─────────────────
+    # macOS launchd starts daemons with a soft RLIMIT_NOFILE of 256 and
+    # editing the plist does not take effect until launchd is bootout/
+    # bootstrap-reloaded (a plain --replace/KeepAlive respawn keeps the
+    # cached 256). Under parallel orchestration the gateway can cross 256.
+    try:
+        import resource as _resource
+        _soft, _hard = _resource.getrlimit(_resource.RLIMIT_NOFILE)
+        _target = 10240
+        if _soft < _target:
+            _new_soft = _target if (_hard == _resource.RLIM_INFINITY or _hard >= _target) else _hard
+            _resource.setrlimit(_resource.RLIMIT_NOFILE, (_new_soft, _hard))
+            logger.info("Raised RLIMIT_NOFILE soft limit %d -> %d (hard=%s)", _soft, _new_soft, _hard)
+    except Exception as _e:
+        logger.warning("Could not raise RLIMIT_NOFILE (continuing): %s", _e)
+
     # Snapshot the checkout revision now, while sys.modules still matches disk,
     # so a later `git pull` under this long-lived process can be detected (and
     # risky work like model switching refused) instead of crashing on a stale
