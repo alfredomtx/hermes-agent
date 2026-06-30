@@ -217,7 +217,7 @@ The messaging gateway supports the following built-in commands inside Telegram, 
 | `/sethome` (alias: `/set-home`) | Mark the current chat as the platform home channel for deliveries. |
 | `/compress [here [N] \| focus topic]` | Manually compress conversation context. `/compress here [N]` keeps the most recent N exchanges (default 2) verbatim and summarizes the rest. A focus topic narrows what a full summary preserves. |
 | `/topic [off\|help\|session-id]` | **Telegram DM only.** Manage user-managed multi-session topic mode. `/topic` enables it or shows status; `/topic off` disables it and clears bindings; `/topic help` shows usage; `/topic <session-id>` inside a topic restores a previous session. See [Multi-session DM mode](/user-guide/messaging/telegram#multi-session-dm-mode-topic). |
-| `/forktopic [name]` | **Telegram only.** Fork the current conversation into a newly-created Telegram topic: copies the transcript into a new session, binds the new topic to that session, and posts a seed message with a short recent-context excerpt there. |
+| `/forktopic [name]` | **Telegram only.** Fork the current conversation into a newly-created Telegram topic: copies the transcript into a new session, binds the new topic to that session, posts a seed message, then posts the recent visible context as separate timestamped messages. |
 | `/title [name]` | Set or show the session title. |
 | `/resume [name]` | Resume a previously named session. |
 | `/usage` | Show token usage, estimated cost breakdown (input/output), context window state, session duration, and — when available from the active provider — an **Account limits** section with remaining quota / credits pulled live from the provider's API. |
