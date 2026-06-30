@@ -45,8 +45,8 @@ def test_async_rows_use_record_status_for_live_done_counts():
     text = format_subagent_roster(rows)
 
     assert "🤖 Subagents — 1 running, 1 done" in text
-    assert "✓ `sleep 6` · 6s" in text
-    assert "▶ `sleep 10` · 8s" in text
+    assert "✓ `sleep 6` · `6s`" in text
+    assert "▶ `sleep 10` · `8s`" in text
 
 
 def test_async_terminal_row_keeps_final_tool_count():
@@ -78,8 +78,8 @@ def test_async_terminal_row_keeps_final_tool_count():
     assert rows[0]["tools"] == 56
     assert rows[1]["tools"] == 23  # falls back to api_calls
     text = format_subagent_roster(rows, collapsed=True)
-    assert "✓ `review` · 15m 49s · 56 tools" in text
-    assert "✓ `audit` · 4m 47s · 23 tools" in text
+    assert "✓ `review` · `15m 49s` · 56 tools" in text
+    assert "✓ `audit` · `4m 47s` · 23 tools" in text
 
 
 def test_async_final_rows_fallback_to_results_when_children_missing():
@@ -99,9 +99,9 @@ def test_async_final_rows_fallback_to_results_when_children_missing():
     lines = text.split("\n")
     # Header elapsed is the WALL-CLOCK fallback = slowest child (max(6,10)=10),
     # NOT the sum (16): this direct call passes no wall_clock.
-    assert lines[0] == "⚠️ 2 subagents · 1 ✓ · 1 ✗ · 10s"
-    assert lines[1] == "✓ `sleep 6` · 6s"
-    assert lines[2] == "✗ `sleep 10` · 10s"
+    assert lines[0] == "⚠️ 2 subagents · 1 ✓ · 1 ✗ · `10s`"
+    assert lines[1] == "✓ `sleep 6` · `6s`"
+    assert lines[2] == "✗ `sleep 10` · `10s`"
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +226,7 @@ async def test_watcher_roster_seeds_edits_and_collapses(monkeypatch):
     assert len(adapter.sent) == 1
     assert adapter.edits
     assert "1 running, 1 done" in adapter.edits[-1]["content"]
-    assert "✓ `sleep 6` · 6s" in adapter.edits[-1]["content"]
+    assert "✓ `sleep 6` · `6s`" in adapter.edits[-1]["content"]
 
     final_evt = _record(status="completed")
     final_evt["total_duration_seconds"] = 4.0  # authoritative batch wall-clock
@@ -239,7 +239,7 @@ async def test_watcher_roster_seeds_edits_and_collapses(monkeypatch):
 
     # Header elapsed is the batch WALL-CLOCK (total_duration_seconds=4.0),
     # threaded end-to-end, NOT the sum of children (6+10=16s).
-    assert "✅ 2 subagents · 2 ✓ · 4s" in adapter.edits[-1]["content"]
+    assert "✅ 2 subagents · 2 ✓ · `4s`" in adapter.edits[-1]["content"]
     assert "deleg_bg" not in runner._async_subagent_roster_bubbles
 
 
@@ -269,7 +269,7 @@ async def test_watcher_live_header_uses_wall_clock(monkeypatch):
     assert adapter.sent
     # Live header carries wall-clock since dispatch (96s -> "1m 36s"), never a
     # sum of the two child elapsed.
-    assert "· 1m 36s" in adapter.sent[0]["content"]
+    assert "· `1m 36s`" in adapter.sent[0]["content"]
 
 
 @pytest.mark.asyncio
@@ -578,10 +578,10 @@ def test_async_terminal_rows_carry_cost_usd():
     assert rows[1]["cost_usd"] is None
 
     text = format_subagent_roster(rows, collapsed=True)
-    assert "· $0.0231" in text          # per-row cost (adaptive 4dp <$1)
-    assert "· $0.0231" in text.split("\n")[0] or "$0.0231" in text  # header total sums known only
+    assert "· `$0.0231`" in text          # per-row cost (adaptive 4dp <$1)
+    assert "· `$0.0231`" in text.split("\n")[0] or "$0.0231" in text  # header total sums known only
     # header total == only the known cost
-    assert "$0.0231" in text.split("\n")[0]
+    assert "`$0.0231`" in text.split("\n")[0]
 
 
 def test_cost_format_adaptive_and_header_total():
@@ -591,8 +591,8 @@ def test_cost_format_adaptive_and_header_total():
     assert _format_cost(1.0) == "$1.00"
     assert _format_cost(1.2345) == "$1.23"
     assert _format_cost(0.999) == "$0.9990"
-    assert _cost_suffix({"cost_usd": 0.0123}) == " · $0.0123"
-    assert _cost_suffix({"cost_usd": 2.5}) == " · $2.50"
+    assert _cost_suffix({"cost_usd": 0.0123}) == " · `$0.0123`"
+    assert _cost_suffix({"cost_usd": 2.5}) == " · `$2.50`"
     assert _cost_suffix({"cost_usd": None}) == ""
     assert _cost_suffix({"cost_usd": 0}) == ""
     assert _cost_suffix({"cost_usd": "x"}) == ""
@@ -606,7 +606,7 @@ def test_cost_format_adaptive_and_header_total():
          "bucket": "done", "model": "", "cost_usd": 0.6},
     ]
     head = format_subagent_roster(rows, collapsed=True).split("\n")[0]
-    assert "$1.20" in head
+    assert "`$1.20`" in head
 
 
 def _config_args_and_roster_on():
@@ -638,7 +638,7 @@ async def test_watcher_pins_dispatched_header_above_roster(monkeypatch):
     assert len(adapter.sent) == 1
     seed = adapter.sent[0]["content"]
     seed_lines = seed.split("\n")
-    assert seed_lines[0] == "🔀 Delegate task — 2 agents · dual-review"  # pinned header
+    assert seed_lines[0] == "🔀 Delegate task — 2 agents · profile: `dual-review`"  # pinned header
     assert seed_lines[1].startswith("🤖 Subagents")                      # roster appended
     assert "reviewer-codex" in seed and "reviewer-opus" in seed          # per-row lanes
 
@@ -654,7 +654,7 @@ async def test_watcher_pins_dispatched_header_above_roster(monkeypatch):
     assert len(adapter.sent) == 1  # no second send
     assert adapter.edits
     edited = adapter.edits[-1]["content"]
-    assert edited.startswith("🔀 Delegate task — 2 agents · dual-review")  # header PERSISTS
+    assert edited.startswith("🔀 Delegate task — 2 agents · profile: `dual-review`")  # header PERSISTS
     assert "🤖 Subagents" in edited
     assert "reviewer-codex" in edited and "reviewer-opus" in edited
 
@@ -694,17 +694,17 @@ def test_dispatched_header_agent_count_and_profile():
 
     # N agents (post-expansion child count), profile shown, toolsets hidden when inherited.
     assert build_async_dispatched_header(rec("dual-review", None)) == \
-        "🔀 Delegate task — 2 agents · dual-review"
+        "🔀 Delegate task — 2 agents · profile: `dual-review`"
     # toolsets shown ONLY when explicitly set.
     assert build_async_dispatched_header(rec("coder", ["terminal", "file"])) == \
-        "🔀 Delegate task — 2 agents · coder · toolsets=terminal,file"
+        "🔀 Delegate task — 2 agents · profile: `coder` · toolsets=`terminal,file`"
     # no profile -> EXPLICIT "profile: none" cell (not omitted), so a plain
     # delegate is unambiguous.
     assert build_async_dispatched_header(rec(None, None)) == \
-        "🔀 Delegate task — 2 agents · profile: none"
+        "🔀 Delegate task — 2 agents · profile: `none`"
     # singular.
     assert build_async_dispatched_header(rec("explorer", None, n=1)) == \
-        "🔀 Delegate task — 1 agent · explorer"
+        "🔀 Delegate task — 1 agent · profile: `explorer`"
     # empty record -> empty header.
     assert build_async_dispatched_header({}) == ""
 
@@ -717,13 +717,13 @@ def test_dispatched_header_prefers_header_toolsets_over_resolved():
                          {"task_index": 1, "subagent_id": "s1", "goal": "g1"}]}
     # header_toolsets present -> used.
     assert build_async_dispatched_header({**base, "header_toolsets": ["terminal", "file"]}) == \
-        "🔀 Delegate task — 2 agents · profile: none · toolsets=terminal,file"
+        "🔀 Delegate task — 2 agents · profile: `none` · toolsets=`terminal,file`"
     # header_toolsets absent -> falls back to top-level toolsets (back-compat).
     assert build_async_dispatched_header({**base, "toolsets": ["web"]}) == \
-        "🔀 Delegate task — 2 agents · profile: none · toolsets=web"
+        "🔀 Delegate task — 2 agents · profile: `none` · toolsets=`web`"
     # neither -> no toolsets cell.
     assert build_async_dispatched_header(base) == \
-        "🔀 Delegate task — 2 agents · profile: none"
+        "🔀 Delegate task — 2 agents · profile: `none`"
 
 
 # ── Fix A: profile must PERSIST in roster rows (now BELOW the pinned header) ──
@@ -755,8 +755,8 @@ def test_profile_suffix_renders_on_rows():
     """_profile_suffix renders the lane, kept in both live and collapsed render."""
     from gateway.subagent_roster import _profile_suffix
 
-    assert _profile_suffix({"profile": "reviewer-codex"}) == " · reviewer-codex"
-    assert _profile_suffix({"profile": "  reviewer`-`opus "}) == " · reviewer-opus"
+    assert _profile_suffix({"profile": "reviewer-codex"}) == " · `reviewer-codex`"
+    assert _profile_suffix({"profile": "  reviewer`-`opus "}) == " · `reviewer-opus`"
     assert _profile_suffix({"profile": ""}) == ""
     assert _profile_suffix({}) == ""
 
@@ -772,8 +772,8 @@ def test_profile_suffix_renders_on_rows():
     for text in (live, collapsed):
         assert "reviewer-codex" in text
         assert "reviewer-opus" in text
-        # profile sits before the model cell: `g0` · reviewer-codex · gpt-5.5
-        assert "`g0` · reviewer-codex · gpt-5.5" in text
+        # profile sits before the model cell: `g0` · `reviewer-codex` · gpt-5.5
+        assert "`g0` · `reviewer-codex` · gpt-5.5" in text
 
 
 @pytest.mark.asyncio

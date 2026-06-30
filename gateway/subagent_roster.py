@@ -74,7 +74,7 @@ def is_flood_error(result: Any) -> bool:
     return _is_flood_error(result)
 
 
-_LABEL_CAP = 80
+_LABEL_CAP = 60
 _MAX_ROWS = 10
 
 
@@ -145,13 +145,21 @@ def reasoning_tag(reasoning: Any) -> str:
     return ""
 
 
+def _inline_code(raw: Any) -> str:
+    """Sanitise a short scan cell and render it as a Markdown inline-code span."""
+    text = " ".join(str(raw or "").replace("`", "").split())
+    return f"`{text}`" if text else ""
+
+
 def _model_suffix(row: Dict[str, Any]) -> str:
-    """`· <model> <reasoning>` suffix for a row, or '' when no model known."""
+    """Model/reasoning suffix as plain text, or '' when unknown."""
     model = shorten_model(row.get("model"))
     if not model:
         return ""
     tag = reasoning_tag(row.get("reasoning"))
-    return f" · {model} {tag}".rstrip() if tag else f" · {model}"
+    rendered = f"{model} {tag}".rstrip() if tag else model
+    rendered = " ".join(rendered.replace("`", "").split())
+    return f" · {rendered}" if rendered else ""
 
 
 def _profile_suffix(row: Dict[str, Any]) -> str:
@@ -169,7 +177,7 @@ def _profile_suffix(row: Dict[str, Any]) -> str:
     profile = " ".join(str(raw).replace("`", "").split())
     if not profile:
         return ""
-    return f" · {profile}"
+    return f" · {_inline_code(profile)}"
 
 
 def _tools_suffix(row: Dict[str, Any]) -> str:
@@ -211,7 +219,7 @@ def _cost_suffix(row: Dict[str, Any]) -> str:
         return ""
     if cost <= 0:
         return ""
-    return f" · {_format_cost(cost)}"
+    return f" · {_inline_code(_format_cost(cost))}"
 
 # delegate_tool subagent.complete status string -> (glyph, display bucket).
 # Vocabulary verified in tools/delegate_tool.py: completed | failed |
@@ -465,7 +473,7 @@ def format_subagent_roster(
             head_parts.append(f"{len(done)} ✓")
         if failed_total:
             head_parts.append(f"{len(failed_total)} ✗")
-        head_parts.append(format_elapsed(total))
+        head_parts.append(_inline_code(format_elapsed(total)))
         # Total cost across all children (adaptive format), when known. Sums only
         # rows that carry a numeric cost_usd; absent costs contribute nothing.
         total_cost = 0.0
@@ -475,7 +483,7 @@ def format_subagent_roster(
             except (TypeError, ValueError):
                 pass
         if total_cost > 0:
-            head_parts.append(_format_cost(total_cost))
+            head_parts.append(_inline_code(_format_cost(total_cost)))
         head = " · ".join(head_parts)
 
         lines = [head]
@@ -486,7 +494,7 @@ def format_subagent_roster(
             # is kept on done rows too, not dropped when running flips to False.
             line = (
                 f"{r['glyph']} `{r['label']}`{_profile_suffix(r)}{_model_suffix(r)}"
-                f" · {format_elapsed(r['elapsed'])}{_tools_suffix(r)}{_cost_suffix(r)}"
+                f" · {_inline_code(format_elapsed(r['elapsed']))}{_tools_suffix(r)}{_cost_suffix(r)}"
             )
             lines.append(line)
         extra = len(rows) - len(shown)
@@ -506,14 +514,14 @@ def format_subagent_roster(
     # sum: children run in parallel, so a ticking sum overcounts wall-clock.
     live_total = header_elapsed
     if live_total > 0:
-        head += f" · {format_elapsed(live_total)}"
+        head += f" · {_inline_code(format_elapsed(live_total))}"
 
     lines = [head]
     shown = rows[:_MAX_ROWS]
     for r in shown:
         line = (
             f"{r['glyph']} `{r['label']}`{_profile_suffix(r)}{_model_suffix(r)}"
-            f" · {format_elapsed(r['elapsed'])}{_tools_suffix(r)}{_cost_suffix(r)}"
+            f" · {_inline_code(format_elapsed(r['elapsed']))}{_tools_suffix(r)}{_cost_suffix(r)}"
         )
         lines.append(line)
     extra = len(rows) - len(shown)
