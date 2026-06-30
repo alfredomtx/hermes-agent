@@ -143,6 +143,46 @@ async def test_forktopic_creates_seeded_topic_copies_session_and_binds_routing(t
 
 
 @pytest.mark.asyncio
+async def test_forktopic_seed_message_includes_recent_visible_context(tmp_path, monkeypatch):
+    runner, store, adapter, clear_security, evict_agent, release_running = _runner(tmp_path, monkeypatch)
+    source = _source(thread_id="777")
+    entry = store.get_or_create_session(source)
+    messages = [
+        ("user", "oldest user message should not be visible"),
+        ("assistant", "older assistant message should not be visible"),
+        ("user", "recent user one"),
+        ("assistant", "recent assistant two"),
+        ("user", "recent user three"),
+        ("assistant", "recent assistant four"),
+        ("user", "recent user five"),
+    ]
+    for role, content in messages:
+        store.append_to_transcript(entry.session_id, {"role": role, "content": content})
+
+    event = MessageEvent(text="/forktopic Context Fork", source=source, message_id="m1")
+    result = await runner._handle_forktopic_command(event)
+
+    assert "Forked into Telegram topic" in result
+    adapter.send.assert_awaited_once()
+    seed_content = adapter.send.await_args.kwargs["content"]
+    assert "Recent context" in seed_content
+    assert "oldest user message should not be visible" not in seed_content
+    assert "older assistant message should not be visible" not in seed_content
+    assert "recent user one" in seed_content
+    assert "recent assistant two" in seed_content
+    assert "recent user three" in seed_content
+    assert "recent assistant four" in seed_content
+    assert "recent user five" in seed_content
+
+    match = re.search(r"Fork: `([^`]+)`", result)
+    assert match, result
+    db = store._db
+    assert db is not None
+    fork_messages = db.get_messages_as_conversation(match.group(1))
+    assert [m["content"] for m in fork_messages] == [content for _, content in messages]
+
+
+@pytest.mark.asyncio
 async def test_forktopic_rolls_back_created_topic_when_binding_fails(tmp_path, monkeypatch):
     runner, store, adapter, clear_security, evict_agent, release_running = _runner(tmp_path, monkeypatch)
     source = _source()
