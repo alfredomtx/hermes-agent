@@ -96,8 +96,9 @@ def format_long_running_heartbeat(
     todo = activity.get("current_todo")
     if isinstance(todo, dict) and todo.get("content"):
         status = _STATUS_LABELS.get(str(todo.get("status") or ""), str(todo.get("status") or "todo"))
+        todo_label = "• todo:" if status == "now" else f"• todo {status}:"
         lines.append(_truncate(
-            f"• todo {status}: {todo.get('content')}{_duration_suffix(todo.get('elapsed_seconds'))}"
+            f"{todo_label} {todo.get('content')}{_duration_suffix(todo.get('elapsed_seconds'))}"
         ))
 
     current_tool = _oneline(activity.get("current_tool"))

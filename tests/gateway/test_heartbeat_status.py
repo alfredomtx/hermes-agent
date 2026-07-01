@@ -28,7 +28,7 @@ def test_rich_heartbeat_includes_iteration_todo_tool_preview_and_last_tool():
 
     assert text.splitlines()[0] == "⏳ Working — `29m`"
     assert "• `iteration:` 51/120" in text
-    assert "• todo now: Patch heartbeat bubble with richer live details · `2m 5s`" in text
+    assert "• todo: Patch heartbeat bubble with richer live details · `2m 5s`" in text
     assert "• `tool:` terminal · `1m 30s`" in text
     assert "• `doing:` pytest tests/gateway/test_heartbeat_status.py -q" in text
     assert "• `last:` read_file done in `0s` `30s` ago" in text
