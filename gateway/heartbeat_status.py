@@ -5,8 +5,6 @@ from __future__ import annotations
 import time
 from typing import Any, Optional
 
-from gateway.duration_format import format_duration
-
 _MAX_LINE = 180
 _MAX_LINES = 6
 _MAX_TOTAL = 900
@@ -29,6 +27,25 @@ def _truncate(value: Any, max_len: int = _MAX_LINE) -> str:
     return text[: max_len - 1].rstrip() + "…"
 
 
+def _format_elapsed(seconds: Any) -> str:
+    try:
+        total = int(round(float(seconds)))
+    except (TypeError, ValueError):
+        total = 0
+    if total < 0:
+        total = 0
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    parts: list[str] = []
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if secs or not parts:
+        parts.append(f"{secs}s")
+    return " ".join(parts)
+
+
 def _duration_suffix(seconds: Any) -> str:
     if not isinstance(seconds, (int, float)):
         return ""
@@ -37,7 +54,7 @@ def _duration_suffix(seconds: Any) -> str:
             return ""
     except Exception:
         return ""
-    return f" · {format_duration(float(seconds))}"
+    return f" · {_format_elapsed(float(seconds))}"
 
 
 def _age_suffix(completed_at: Any, *, now: Optional[float] = None) -> str:
@@ -47,11 +64,11 @@ def _age_suffix(completed_at: Any, *, now: Optional[float] = None) -> str:
     age = max(0.0, end - float(completed_at))
     if age < 2:
         return " just now"
-    return f" {format_duration(age)} ago"
+    return f" {_format_elapsed(age)} ago"
 
 
 def format_long_running_heartbeat(
-    elapsed_mins: int,
+    elapsed_seconds: float,
     activity: Optional[dict[str, Any]] = None,
     *,
     want_iteration_detail: bool = False,
@@ -63,12 +80,9 @@ def format_long_running_heartbeat(
     when the agent exposes them.
     """
     activity = activity if isinstance(activity, dict) else {}
-    try:
-        mins = max(0, int(elapsed_mins))
-    except Exception:
-        mins = 0
+    elapsed = _format_elapsed(elapsed_seconds)
 
-    lines = [f"⏳ Working — {mins} min"]
+    lines = [f"⏳ Working — {elapsed}"]
 
     if want_iteration_detail:
         api = activity.get("api_call_count")
@@ -99,7 +113,7 @@ def format_long_running_heartbeat(
     if isinstance(last, dict) and last.get("name"):
         state = "failed" if last.get("is_error") else "done"
         lines.append(_truncate(
-            f"• last: {last.get('name')} {state} in {format_duration(last.get('duration') or 0)}"
+            f"• last: {last.get('name')} {state} in {_format_elapsed(last.get('duration') or 0)}"
             f"{_age_suffix(last.get('completed_at'), now=now)}"
         ))
 

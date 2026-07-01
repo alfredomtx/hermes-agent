@@ -3,7 +3,7 @@ from gateway.heartbeat_status import format_long_running_heartbeat
 
 def test_rich_heartbeat_includes_iteration_todo_tool_preview_and_last_tool():
     text = format_long_running_heartbeat(
-        29,
+        29 * 60,
         {
             "api_call_count": 51,
             "max_iterations": 120,
@@ -26,12 +26,18 @@ def test_rich_heartbeat_includes_iteration_todo_tool_preview_and_last_tool():
         now=130.0,
     )
 
-    assert text.splitlines()[0] == "⏳ Working — 29 min"
+    assert text.splitlines()[0] == "⏳ Working — 29m"
     assert "• iteration: 51/120" in text
-    assert "• todo now: Patch heartbeat bubble with richer live details · 2:05" in text
-    assert "• tool: terminal · 1:30" in text
+    assert "• todo now: Patch heartbeat bubble with richer live details · 2m 5s" in text
+    assert "• tool: terminal · 1m 30s" in text
     assert "• doing: pytest tests/gateway/test_heartbeat_status.py -q" in text
-    assert "• last: read_file done in 0:00 0:30 ago" in text
+    assert "• last: read_file done in 0s 30s ago" in text
+
+
+def test_heartbeat_elapsed_seconds_use_human_units():
+    text = format_long_running_heartbeat(90, {}, want_iteration_detail=False)
+
+    assert text.splitlines()[0] == "⏳ Working — 1m 30s"
 
 
 def test_heartbeat_omits_iteration_when_busy_detail_disabled():

@@ -20434,7 +20434,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_key, agent_holder[0], _exec_ref
                 ):
                     break
-                _elapsed_mins = int((time.time() - _notify_start) // 60)
+                _elapsed_seconds = time.time() - _notify_start
                 # Include bounded activity context if available. Default
                 # heartbeat edits ONE bubble in place; richer detail is useful
                 # only if it stays compact and non-spammy.
@@ -20457,7 +20457,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     from gateway.heartbeat_status import format_long_running_heartbeat
 
                     _heartbeat_text = format_long_running_heartbeat(
-                        _elapsed_mins,
+                        _elapsed_seconds,
                         _activity,
                         want_iteration_detail=_want_iteration_detail,
                     )
@@ -20475,7 +20475,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _parts.append(str(_action))
                     if _parts:
                         _status_detail = " — " + ", ".join(_parts)
-                    _heartbeat_text = f"⏳ Working — {_elapsed_mins} min{_status_detail}"
+                    _elapsed_total = max(0, int(round(_elapsed_seconds)))
+                    _elapsed_minutes, _elapsed_secs = divmod(_elapsed_total, 60)
+                    _elapsed_display = (
+                        f"{_elapsed_minutes}m" + (f" {_elapsed_secs}s" if _elapsed_secs else "")
+                        if _elapsed_minutes else f"{_elapsed_secs}s"
+                    )
+                    _heartbeat_text = f"⏳ Working — {_elapsed_display}{_status_detail}"
                 try:
                     _notify_res = None
                     if _heartbeat_msg_id:
