@@ -20490,6 +20490,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 source.chat_id,
                                 _heartbeat_msg_id,
                                 _heartbeat_text,
+                                finalize=True,
                             )
                         except Exception as _ee:
                             logger.debug("Heartbeat edit failed: %s", _ee)

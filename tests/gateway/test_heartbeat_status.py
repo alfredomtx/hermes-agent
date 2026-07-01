@@ -37,9 +37,9 @@ def test_rich_heartbeat_includes_iteration_todo_tool_preview_and_last_tool():
     assert "• tool: `terminal` · 1m 30s" in text
     assert "• last: `read_file` · done · took 0s (30s ago)" in text
     assert "• doing:" in text
-    assert "  • done · `search_files` · took 2s" in text
-    assert "  • done · `read_file` · took 0s" in text
-    assert "  • running · `pytest tests/gateway/test_heartbeat_status.py -q` · 1m 30s" in text
+    assert "    ▶ done · `search_files` · took 2s" in text
+    assert "    ▶ done · `read_file` · took 0s" in text
+    assert "    ▶ running · `pytest tests/gateway/test_heartbeat_status.py -q` · 1m 30s" in text
 
 
 def test_heartbeat_elapsed_seconds_use_human_units():

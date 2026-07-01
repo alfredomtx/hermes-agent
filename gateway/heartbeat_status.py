@@ -148,7 +148,7 @@ def format_long_running_heartbeat(
         for item in history[-3:]:
             if isinstance(item, dict):
                 lines.append(_code_line(
-                    f"  • {_action_state(item)} · ",
+                    f"    ▶ {_action_state(item)} · ",
                     item.get("label") or item.get("name") or "tool",
                     _action_duration_suffix(item),
                 ))
