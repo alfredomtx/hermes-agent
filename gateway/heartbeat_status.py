@@ -46,6 +46,10 @@ def _format_elapsed(seconds: Any) -> str:
     return " ".join(parts)
 
 
+def _elapsed_code(seconds: Any) -> str:
+    return f"`{_format_elapsed(seconds)}`"
+
+
 def _duration_suffix(seconds: Any) -> str:
     if not isinstance(seconds, (int, float)):
         return ""
@@ -54,7 +58,7 @@ def _duration_suffix(seconds: Any) -> str:
             return ""
     except Exception:
         return ""
-    return f" · {_format_elapsed(float(seconds))}"
+    return f" · {_elapsed_code(float(seconds))}"
 
 
 def _age_suffix(completed_at: Any, *, now: Optional[float] = None) -> str:
@@ -64,7 +68,7 @@ def _age_suffix(completed_at: Any, *, now: Optional[float] = None) -> str:
     age = max(0.0, end - float(completed_at))
     if age < 2:
         return " just now"
-    return f" {_format_elapsed(age)} ago"
+    return f" {_elapsed_code(age)} ago"
 
 
 def format_long_running_heartbeat(
@@ -80,15 +84,14 @@ def format_long_running_heartbeat(
     when the agent exposes them.
     """
     activity = activity if isinstance(activity, dict) else {}
-    elapsed = _format_elapsed(elapsed_seconds)
 
-    lines = [f"⏳ Working — {elapsed}"]
+    lines = [f"⏳ Working — {_elapsed_code(elapsed_seconds)}"]
 
     if want_iteration_detail:
         api = activity.get("api_call_count")
         max_iter = activity.get("max_iterations")
         if api is not None and max_iter is not None:
-            lines.append(_truncate(f"• iteration: {api}/{max_iter}"))
+            lines.append(_truncate(f"• `iteration:` {api}/{max_iter}"))
 
     todo = activity.get("current_todo")
     if isinstance(todo, dict) and todo.get("content"):
@@ -101,9 +104,9 @@ def format_long_running_heartbeat(
     current_preview = _oneline(activity.get("current_tool_preview"))
     current_elapsed = activity.get("current_tool_elapsed")
     if current_tool:
-        lines.append(_truncate(f"• tool: {current_tool}{_duration_suffix(current_elapsed)}"))
+        lines.append(_truncate(f"• `tool:` {current_tool}{_duration_suffix(current_elapsed)}"))
         if current_preview and current_preview != current_tool:
-            lines.append(_truncate(f"• doing: {current_preview}"))
+            lines.append(_truncate(f"• `doing:` {current_preview}"))
     else:
         desc = _oneline(activity.get("last_activity_desc"))
         if desc:
@@ -113,7 +116,7 @@ def format_long_running_heartbeat(
     if isinstance(last, dict) and last.get("name"):
         state = "failed" if last.get("is_error") else "done"
         lines.append(_truncate(
-            f"• last: {last.get('name')} {state} in {_format_elapsed(last.get('duration') or 0)}"
+            f"• `last:` {last.get('name')} {state} in {_elapsed_code(last.get('duration') or 0)}"
             f"{_age_suffix(last.get('completed_at'), now=now)}"
         ))
 
