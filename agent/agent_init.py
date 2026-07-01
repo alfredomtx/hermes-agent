@@ -546,6 +546,7 @@ def init_agent(
     agent._current_tool_preview = None
     agent._current_tool_started_at = None
     agent._last_completed_tool = None
+    agent._recent_tool_activity = []
     agent._api_call_count: int = 0
     # Opt-out flag for the between-turns MCP tool refresh (build_turn_context).
     # Set on internal forks (e.g. background_review) that must keep ``tools[]``

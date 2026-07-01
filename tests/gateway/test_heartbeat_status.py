@@ -21,23 +21,31 @@ def test_rich_heartbeat_includes_iteration_todo_tool_preview_and_last_tool():
                 "is_error": False,
                 "completed_at": 100.0,
             },
+            "recent_tool_activity": [
+                {"label": "search_files", "duration": 2.0, "state": "done"},
+                {"label": "read_file", "duration": 0.4, "state": "done"},
+                {"label": "pytest tests/gateway/test_heartbeat_status.py -q", "duration": 90.0, "state": "running"},
+            ],
         },
         want_iteration_detail=True,
         now=130.0,
     )
 
-    assert text.splitlines()[0] == "⏳ Working — `29m`"
+    assert text.splitlines()[0] == "⏳ Working — 29m"
     assert "• iteration: `51/120`" in text
-    assert "• todo: `Patch heartbeat bubble with richer live details` · `2m 5s`" in text
-    assert "• tool: `terminal` · `1m 30s`" in text
-    assert "• doing: `pytest tests/gateway/test_heartbeat_status.py -q`" in text
-    assert "• last: `read_file` done in `0s` `30s` ago" in text
+    assert "• todo: `Patch heartbeat bubble with richer live details` · 2m 5s" in text
+    assert "• tool: `terminal` · 1m 30s" in text
+    assert "• last: `read_file` · done · took 0s (30s ago)" in text
+    assert "• doing:" in text
+    assert "  • `search_files` · done · took 2s" in text
+    assert "  • `read_file` · done · took 0s" in text
+    assert "  • `pytest tests/gateway/test_heartbeat_status.py -q` · running 1m 30s" in text
 
 
 def test_heartbeat_elapsed_seconds_use_human_units():
     text = format_long_running_heartbeat(90, {}, want_iteration_detail=False)
 
-    assert text.splitlines()[0] == "⏳ Working — `1m 30s`"
+    assert text.splitlines()[0] == "⏳ Working — 1m 30s"
 
 
 def test_heartbeat_omits_iteration_when_busy_detail_disabled():
@@ -67,4 +75,4 @@ def test_heartbeat_is_bounded_for_long_previews():
     )
 
     assert len(text) <= 900
-    assert len(text.splitlines()) <= 6
+    assert len(text.splitlines()) <= 9

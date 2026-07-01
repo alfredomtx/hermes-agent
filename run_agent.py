@@ -3261,15 +3261,18 @@ class AIAgent:
         elapsed = now - self._last_activity_ts
         current_tool_elapsed = None
         current_todo = None
+        recent_tool_activity = []
         try:
             from agent.activity import current_tool_elapsed as _tool_elapsed
-            from agent.activity import todo_activity_snapshot
+            from agent.activity import todo_activity_snapshot, tool_activity_history
 
             current_tool_elapsed = _tool_elapsed(self, now=now)
             current_todo = todo_activity_snapshot(getattr(self, "_todo_store", None))
+            recent_tool_activity = tool_activity_history(self, now=now)
         except Exception:
             current_tool_elapsed = None
             current_todo = None
+            recent_tool_activity = []
 
         return {
             "last_activity_ts": self._last_activity_ts,
@@ -3283,6 +3286,7 @@ class AIAgent:
                 else None
             ),
             "last_completed_tool": getattr(self, "_last_completed_tool", None),
+            "recent_tool_activity": recent_tool_activity,
             "current_todo": current_todo,
             "api_call_count": self._api_call_count,
             "max_iterations": self.max_iterations,

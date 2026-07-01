@@ -6,7 +6,7 @@ import time
 from typing import Any, Optional
 
 _MAX_LINE = 180
-_MAX_LINES = 6
+_MAX_LINES = 9
 _MAX_TOTAL = 900
 _STATUS_LABELS = {
     "in_progress": "now",
@@ -58,10 +58,6 @@ def _code_line(prefix: str, value: Any, suffix: str = "", max_len: int = _MAX_LI
     return f"{prefix}{_code_value(value, inner_max)}{suffix}"
 
 
-def _elapsed_code(seconds: Any) -> str:
-    return _code_value(_format_elapsed(seconds))
-
-
 def _duration_suffix(seconds: Any) -> str:
     if not isinstance(seconds, (int, float)):
         return ""
@@ -70,7 +66,15 @@ def _duration_suffix(seconds: Any) -> str:
             return ""
     except Exception:
         return ""
-    return f" · {_elapsed_code(float(seconds))}"
+    return f" · {_format_elapsed(float(seconds))}"
+
+
+def _state_suffix(item: dict[str, Any]) -> str:
+    state = str(item.get("state") or ("failed" if item.get("is_error") else "done"))
+    duration = _format_elapsed(item.get("duration") or 0)
+    if state == "running":
+        return f" · running {duration}"
+    return f" · {state} · took {duration}"
 
 
 def _age_suffix(completed_at: Any, *, now: Optional[float] = None) -> str:
@@ -79,8 +83,8 @@ def _age_suffix(completed_at: Any, *, now: Optional[float] = None) -> str:
     end = time.time() if now is None else now
     age = max(0.0, end - float(completed_at))
     if age < 2:
-        return " just now"
-    return f" {_elapsed_code(age)} ago"
+        return " (just now)"
+    return f" ({_format_elapsed(age)} ago)"
 
 
 def format_long_running_heartbeat(
@@ -97,7 +101,7 @@ def format_long_running_heartbeat(
     """
     activity = activity if isinstance(activity, dict) else {}
 
-    lines = [f"⏳ Working — {_elapsed_code(elapsed_seconds)}"]
+    lines = [f"⏳ Working — {_format_elapsed(elapsed_seconds)}"]
 
     if want_iteration_detail:
         api = activity.get("api_call_count")
@@ -116,12 +120,9 @@ def format_long_running_heartbeat(
         ))
 
     current_tool = _oneline(activity.get("current_tool"))
-    current_preview = _oneline(activity.get("current_tool_preview"))
     current_elapsed = activity.get("current_tool_elapsed")
     if current_tool:
         lines.append(_code_line("• tool: ", current_tool, _duration_suffix(current_elapsed)))
-        if current_preview and current_preview != current_tool:
-            lines.append(_code_line("• doing: ", current_preview))
     else:
         desc = _oneline(activity.get("last_activity_desc"))
         if desc:
@@ -133,9 +134,16 @@ def format_long_running_heartbeat(
         lines.append(_code_line(
             "• last: ",
             last.get("name"),
-            f" {state} in {_elapsed_code(last.get('duration') or 0)}"
+            f" · {state} · took {_format_elapsed(last.get('duration') or 0)}"
             f"{_age_suffix(last.get('completed_at'), now=now)}",
         ))
+
+    history = activity.get("recent_tool_activity")
+    if isinstance(history, list) and history:
+        lines.append("• doing:")
+        for item in history[-3:]:
+            if isinstance(item, dict):
+                lines.append(_code_line("  • ", item.get("label") or item.get("name") or "tool", _state_suffix(item)))
 
     # Bound vertical and total size; this bubble edits every minute.
     lines = lines[:_MAX_LINES]

@@ -20,6 +20,7 @@ from agent.redact import redact_sensitive_text
 _TOOL_PREVIEW_MAX = 140
 _TODO_CONTENT_MAX = 100
 _CONCURRENT_TOOL_PREVIEW_MAX = 80
+_ACTION_HISTORY_MAX = 3
 _SECRET_FLAG_RE = re.compile(
     r"(?ix)"
     r"(?P<prefix>(?:^|\s)"
@@ -65,6 +66,30 @@ def _redact_preview_text(text: str) -> str:
     redacted = _MYSQL_SHORT_PASSWORD_RE.sub(lambda m: f"{m.group('prefix')}***", redacted)
     redacted = _SECRET_ASSIGN_RE.sub(lambda m: f"{m.group('prefix')}***", redacted)
     return redacted
+
+
+def _normalise_duration(duration: Any) -> float:
+    try:
+        return max(0.0, float(duration or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _bounded_history(agent: Any) -> list[dict[str, Any]]:
+    history = getattr(agent, "_recent_tool_activity", None)
+    if not isinstance(history, list):
+        history = []
+        try:
+            agent._recent_tool_activity = history
+        except Exception:
+            return []
+    return history
+
+
+def _append_completed_action(agent: Any, item: dict[str, Any]) -> None:
+    history = _bounded_history(agent)
+    history.append(item)
+    del history[:-_ACTION_HISTORY_MAX]
 
 
 def tool_activity_label(tool_name: str, args: Optional[dict], *, max_len: int = _TOOL_PREVIEW_MAX) -> Optional[str]:
@@ -116,18 +141,25 @@ def mark_concurrent_tools_started(agent: Any, calls: Iterable[tuple[str, dict]])
 
 
 def mark_tool_completed(agent: Any, tool_name: str, duration: Any, *, is_error: bool = False) -> None:
-    """Stamp the last completed tool and clear active-tool metadata."""
+    """Stamp the last completed tool, append history, and clear active-tool metadata."""
+    dur = _normalise_duration(duration)
     try:
-        dur = float(duration or 0.0)
-    except (TypeError, ValueError):
-        dur = 0.0
-    try:
-        agent._last_completed_tool = {
+        completed_at = time.time()
+        completed = {
             "name": str(tool_name or "tool"),
-            "duration": max(0.0, dur),
+            "label": str(tool_name or "tool"),
+            "duration": dur,
             "is_error": bool(is_error),
-            "completed_at": time.time(),
+            "state": "failed" if is_error else "done",
+            "completed_at": completed_at,
         }
+        agent._last_completed_tool = {
+            "name": completed["name"],
+            "duration": completed["duration"],
+            "is_error": completed["is_error"],
+            "completed_at": completed_at,
+        }
+        _append_completed_action(agent, completed)
         agent._current_tool = None
         agent._current_tool_preview = None
         agent._current_tool_started_at = None
@@ -142,6 +174,7 @@ def reset_turn_activity(agent: Any) -> None:
         agent._current_tool_preview = None
         agent._current_tool_started_at = None
         agent._last_completed_tool = None
+        agent._recent_tool_activity = []
     except Exception:
         pass
 
@@ -153,6 +186,30 @@ def current_tool_elapsed(agent: Any, *, now: Optional[float] = None) -> Optional
     end = time.time() if now is None else now
     elapsed = end - float(started)
     return elapsed if elapsed >= 0 else 0.0
+
+
+def tool_activity_history(agent: Any, *, now: Optional[float] = None) -> list[dict[str, Any]]:
+    """Return up to 3 recent tool actions, including the current running one."""
+    items: list[dict[str, Any]] = []
+    for item in _bounded_history(agent)[-_ACTION_HISTORY_MAX:]:
+        if isinstance(item, dict):
+            copied = dict(item)
+            copied["label"] = _truncate(_redact_preview_text(str(copied.get("label") or copied.get("name") or "tool")), _TOOL_PREVIEW_MAX)
+            copied["duration"] = _normalise_duration(copied.get("duration"))
+            items.append(copied)
+
+    elapsed = current_tool_elapsed(agent, now=now)
+    current_label = getattr(agent, "_current_tool_preview", None) or getattr(agent, "_current_tool", None)
+    if current_label and isinstance(elapsed, (int, float)):
+        items.append({
+            "name": str(getattr(agent, "_current_tool", None) or "tool"),
+            "label": _truncate(_redact_preview_text(str(current_label)), _TOOL_PREVIEW_MAX),
+            "duration": elapsed,
+            "state": "running",
+            "is_error": False,
+        })
+
+    return items[-_ACTION_HISTORY_MAX:]
 
 
 def todo_activity_snapshot(store: Any) -> Optional[dict[str, Any]]:
