@@ -3257,12 +3257,33 @@ class AIAgent:
         Called by the gateway timeout handler to report what the agent was doing
         when it was killed, and by the periodic "still working" notifications.
         """
-        elapsed = time.time() - self._last_activity_ts
+        now = time.time()
+        elapsed = now - self._last_activity_ts
+        current_tool_elapsed = None
+        current_todo = None
+        try:
+            from agent.activity import current_tool_elapsed as _tool_elapsed
+            from agent.activity import todo_activity_snapshot
+
+            current_tool_elapsed = _tool_elapsed(self, now=now)
+            current_todo = todo_activity_snapshot(getattr(self, "_todo_store", None))
+        except Exception:
+            current_tool_elapsed = None
+            current_todo = None
+
         return {
             "last_activity_ts": self._last_activity_ts,
             "last_activity_desc": self._last_activity_desc,
             "seconds_since_activity": round(elapsed, 1),
             "current_tool": self._current_tool,
+            "current_tool_preview": getattr(self, "_current_tool_preview", None),
+            "current_tool_elapsed": (
+                round(current_tool_elapsed, 1)
+                if isinstance(current_tool_elapsed, (int, float))
+                else None
+            ),
+            "last_completed_tool": getattr(self, "_last_completed_tool", None),
+            "current_todo": current_todo,
             "api_call_count": self._api_call_count,
             "max_iterations": self.max_iterations,
             "budget_used": self.iteration_budget.used,

@@ -16440,6 +16440,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if interrupt_depth == 0:
             agent._last_activity_ts = time.time()
             agent._last_activity_desc = "starting new turn (cached)"
+            try:
+                from agent.activity import reset_turn_activity
+
+                reset_turn_activity(agent)
+            except Exception:
+                pass
             # Reset the SessionDB flush cursor so the new turn's messages are
             # fully persisted — a stale value from the previous turn would
             # cause `_flush_messages_to_session_db` to skip new rows (#44327).
@@ -20429,12 +20435,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ):
                     break
                 _elapsed_mins = int((time.time() - _notify_start) // 60)
-                # Include agent activity context if available. Default
-                # heartbeat is terse: elapsed + current tool. Verbose
-                # iteration counter is gated on busy_ack_detail so users
-                # who want it can opt in per platform.
+                # Include bounded activity context if available. Default
+                # heartbeat edits ONE bubble in place; richer detail is useful
+                # only if it stays compact and non-spammy.
                 _agent_ref = agent_holder[0]
-                _status_detail = ""
                 _want_iteration_detail = bool(
                     resolve_display_setting(
                         user_config,
@@ -20443,22 +20447,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         True,
                     )
                 )
+                _activity = {}
                 if _agent_ref and hasattr(_agent_ref, "get_activity_summary"):
                     try:
-                        _a = _agent_ref.get_activity_summary()
-                        _parts = []
-                        if _want_iteration_detail:
-                            _parts.append(
-                                f"iteration {_a['api_call_count']}/{_a['max_iterations']}"
-                            )
-                        _action = _a.get("current_tool") or _a.get("last_activity_desc")
-                        if _action:
-                            _parts.append(str(_action))
-                        if _parts:
-                            _status_detail = " — " + ", ".join(_parts)
+                        _activity = _agent_ref.get_activity_summary()
                     except Exception:
-                        pass
-                _heartbeat_text = f"⏳ Working — {_elapsed_mins} min{_status_detail}"
+                        _activity = {}
+                try:
+                    from gateway.heartbeat_status import format_long_running_heartbeat
+
+                    _heartbeat_text = format_long_running_heartbeat(
+                        _elapsed_mins,
+                        _activity,
+                        want_iteration_detail=_want_iteration_detail,
+                    )
+                except Exception:
+                    # Conservative fallback: preserve the historical one-line
+                    # heartbeat if the richer formatter ever breaks.
+                    _status_detail = ""
+                    _parts = []
+                    if _want_iteration_detail and _activity:
+                        _parts.append(
+                            f"iteration {_activity.get('api_call_count')}/{_activity.get('max_iterations')}"
+                        )
+                    _action = _activity.get("current_tool") or _activity.get("last_activity_desc")
+                    if _action:
+                        _parts.append(str(_action))
+                    if _parts:
+                        _status_detail = " — " + ", ".join(_parts)
+                    _heartbeat_text = f"⏳ Working — {_elapsed_mins} min{_status_detail}"
                 try:
                     _notify_res = None
                     if _heartbeat_msg_id:
