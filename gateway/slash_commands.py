@@ -3812,8 +3812,7 @@ class GatewaySlashCommandsMixin:
                     text = part.get("text") or part.get("content")
                     if isinstance(text, str):
                         parts.append(text)
-            if parts:
-                content = "\n".join(parts)
+            content = "\n".join(parts)
         elif isinstance(content, dict):
             try:
                 content = json.dumps(content, ensure_ascii=False)
@@ -3823,7 +3822,7 @@ class GatewaySlashCommandsMixin:
         text = str(content or "").replace("\r\n", "\n").replace("\r", "\n")
         text = re.sub(r"[ \t\f\v]+", " ", text)
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
-        return text or "(empty)"
+        return text
 
     @staticmethod
     def _forktopic_visible_time(message: dict[str, Any]) -> str:
@@ -3856,18 +3855,21 @@ class GatewaySlashCommandsMixin:
         *,
         limit: int = 5,
     ) -> list[str]:
-        visible_messages = [
-            message
-            for message in history
-            if message.get("role") in {"user", "assistant"}
-        ][-limit:]
+        visible_messages: list[tuple[dict[str, Any], str]] = []
+        for message in history:
+            if message.get("role") not in {"user", "assistant"}:
+                continue
+            text = self._text_for_forktopic_visible_message(message.get("content"))
+            if not text:
+                continue
+            visible_messages.append((message, text))
+        visible_messages = visible_messages[-limit:]
 
         messages: list[str] = []
-        for message in visible_messages:
+        for message, text in visible_messages:
             role = message.get("role")
             label = "You" if role == "user" else "Hermes"
             header = f"**{label}** · {self._forktopic_visible_time(message)}"
-            text = self._text_for_forktopic_visible_message(message.get("content"))
             messages.extend(self._split_forktopic_visible_message(header, text))
         return messages
 

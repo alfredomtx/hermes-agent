@@ -205,6 +205,56 @@ async def test_forktopic_sends_recent_context_as_separate_timestamped_messages(t
 
 
 @pytest.mark.asyncio
+async def test_forktopic_recent_context_skips_contentless_assistant_tool_turns(tmp_path, monkeypatch):
+    runner, store, adapter, clear_security, evict_agent, release_running = _runner(tmp_path, monkeypatch)
+    source = _source(thread_id="778")
+    entry = store.get_or_create_session(source)
+    base_ts = datetime(2026, 7, 1, 12, 0).timestamp()
+    visible = [
+        ("user", "actual user one", base_ts),
+        ("assistant", "actual assistant two", base_ts + 60),
+        ("user", "actual user three", base_ts + 120),
+        ("assistant", "actual assistant four", base_ts + 180),
+        ("user", "actual user five", base_ts + 240),
+    ]
+    for role, content, timestamp in visible:
+        store.append_to_transcript(
+            entry.session_id,
+            {"role": role, "content": content, "timestamp": timestamp},
+        )
+    for index in range(4):
+        store.append_to_transcript(
+            entry.session_id,
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": f"call_{index}",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": "{}"},
+                    }
+                ],
+                "timestamp": base_ts + 300 + index,
+            },
+        )
+
+    event = MessageEvent(text="/forktopic Context Fork", source=source, message_id="m1")
+    result = await runner._handle_forktopic_command(event)
+
+    assert "Forked into Telegram topic" in result
+    assert adapter.send.await_count == 6
+    sent_contents = [call.kwargs["content"] for call in adapter.send.await_args_list]
+    context_text = "\n".join(sent_contents[1:])
+    assert "(empty)" not in context_text
+    assert "actual user one" in context_text
+    assert "actual assistant two" in context_text
+    assert "actual user three" in context_text
+    assert "actual assistant four" in context_text
+    assert "actual user five" in context_text
+
+
+@pytest.mark.asyncio
 async def test_forktopic_rolls_back_created_topic_when_binding_fails(tmp_path, monkeypatch):
     runner, store, adapter, clear_security, evict_agent, release_running = _runner(tmp_path, monkeypatch)
     source = _source()
