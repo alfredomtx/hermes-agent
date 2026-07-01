@@ -46,8 +46,20 @@ def _format_elapsed(seconds: Any) -> str:
     return " ".join(parts)
 
 
+def _code_value(value: Any, max_len: Optional[int] = None) -> str:
+    text = _oneline(value).replace("`", "ˋ")
+    if max_len is not None:
+        text = _truncate(text, max_len)
+    return f"`{text}`"
+
+
+def _code_line(prefix: str, value: Any, suffix: str = "", max_len: int = _MAX_LINE) -> str:
+    inner_max = max(0, max_len - len(_oneline(prefix)) - len(_oneline(suffix)) - 2)
+    return f"{prefix}{_code_value(value, inner_max)}{suffix}"
+
+
 def _elapsed_code(seconds: Any) -> str:
-    return f"`{_format_elapsed(seconds)}`"
+    return _code_value(_format_elapsed(seconds))
 
 
 def _duration_suffix(seconds: Any) -> str:
@@ -91,34 +103,38 @@ def format_long_running_heartbeat(
         api = activity.get("api_call_count")
         max_iter = activity.get("max_iterations")
         if api is not None and max_iter is not None:
-            lines.append(_truncate(f"• `iteration:` {api}/{max_iter}"))
+            lines.append(_code_line("• iteration: ", f"{api}/{max_iter}"))
 
     todo = activity.get("current_todo")
     if isinstance(todo, dict) and todo.get("content"):
         status = _STATUS_LABELS.get(str(todo.get("status") or ""), str(todo.get("status") or "todo"))
         todo_label = "• todo:" if status == "now" else f"• todo {status}:"
-        lines.append(_truncate(
-            f"{todo_label} {todo.get('content')}{_duration_suffix(todo.get('elapsed_seconds'))}"
+        lines.append(_code_line(
+            f"{todo_label} ",
+            todo.get("content"),
+            _duration_suffix(todo.get("elapsed_seconds")),
         ))
 
     current_tool = _oneline(activity.get("current_tool"))
     current_preview = _oneline(activity.get("current_tool_preview"))
     current_elapsed = activity.get("current_tool_elapsed")
     if current_tool:
-        lines.append(_truncate(f"• `tool:` {current_tool}{_duration_suffix(current_elapsed)}"))
+        lines.append(_code_line("• tool: ", current_tool, _duration_suffix(current_elapsed)))
         if current_preview and current_preview != current_tool:
-            lines.append(_truncate(f"• `doing:` {current_preview}"))
+            lines.append(_code_line("• doing: ", current_preview))
     else:
         desc = _oneline(activity.get("last_activity_desc"))
         if desc:
-            lines.append(_truncate(f"• status: {desc}"))
+            lines.append(_code_line("• status: ", desc))
 
     last = activity.get("last_completed_tool")
     if isinstance(last, dict) and last.get("name"):
         state = "failed" if last.get("is_error") else "done"
-        lines.append(_truncate(
-            f"• `last:` {last.get('name')} {state} in {_elapsed_code(last.get('duration') or 0)}"
-            f"{_age_suffix(last.get('completed_at'), now=now)}"
+        lines.append(_code_line(
+            "• last: ",
+            last.get("name"),
+            f" {state} in {_elapsed_code(last.get('duration') or 0)}"
+            f"{_age_suffix(last.get('completed_at'), now=now)}",
         ))
 
     # Bound vertical and total size; this bubble edits every minute.
