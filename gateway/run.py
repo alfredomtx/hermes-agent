@@ -20412,11 +20412,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _notify_adapter = self.adapters.get(source.platform)
             if not _notify_adapter:
                 return
-            # Track the heartbeat message id so we can edit-in-place on
-            # platforms that support it (Telegram, Discord, Slack, etc.)
-            # instead of spamming a new "Still working" bubble every
-            # interval. Falls back to send-new when edit fails or isn't
-            # supported by the adapter.
+            # Track the heartbeat message id so we edit one bubble in place.
+            # After the first send, edit failures are logged and swallowed
+            # instead of sending replacement bubbles. One stale heartbeat is
+            # better than periodic chat spam.
             _heartbeat_msg_id: Optional[str] = None
             while True:
                 await asyncio.sleep(_NOTIFY_INTERVAL)
@@ -20495,18 +20494,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         except Exception as _ee:
                             logger.debug("Heartbeat edit failed: %s", _ee)
                             _notify_res = None
-                    if not (_notify_res and getattr(_notify_res, "success", False)):
-                        _notify_res = await _notify_adapter.send(
-                            source.chat_id,
-                            _heartbeat_text,
-                            metadata=_non_conversational_metadata(_status_thread_metadata, platform=source.platform),
-                        )
-                        if getattr(_notify_res, "success", False) and getattr(
-                            _notify_res, "message_id", None
-                        ):
-                            _heartbeat_msg_id = str(_notify_res.message_id)
-                            if _cleanup_progress:
-                                _cleanup_msg_ids.append(_heartbeat_msg_id)
+                        if not (_notify_res and getattr(_notify_res, "success", False)):
+                            logger.debug(
+                                "Heartbeat edit did not succeed; suppressing replacement bubble to avoid spam"
+                            )
+                        continue
+                    _notify_res = await _notify_adapter.send(
+                        source.chat_id,
+                        _heartbeat_text,
+                        metadata=_non_conversational_metadata(_status_thread_metadata, platform=source.platform),
+                    )
+                    if getattr(_notify_res, "success", False) and getattr(
+                        _notify_res, "message_id", None
+                    ):
+                        _heartbeat_msg_id = str(_notify_res.message_id)
+                        if _cleanup_progress:
+                            _cleanup_msg_ids.append(_heartbeat_msg_id)
                 except Exception as _ne:
                     logger.debug("Long-running notification error: %s", _ne)
 
