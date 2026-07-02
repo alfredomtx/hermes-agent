@@ -545,6 +545,12 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
             msg = str(exc).lower()
             if "no such table" in msg or "no such column" in msg:
                 return None
+            if (
+                "database is locked" in msg
+                or "database table is locked" in msg
+                or "database is busy" in msg
+            ):
+                return None
             return str(exc)
         return None
     except sqlite3.DatabaseError as exc:
