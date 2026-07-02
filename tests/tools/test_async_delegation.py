@@ -488,7 +488,7 @@ def test_batch_completion_event_carries_profile():
     assert evt.get("profile") == "dual-review"
     # End-to-end: the header builder renders the profile cell from this evt.
     from gateway.async_subagent_roster import build_async_dispatched_header
-    assert build_async_dispatched_header(evt) == "🔀 Delegate task — 2 agents · dual-review"
+    assert build_async_dispatched_header(evt) == "🔀 Delegate task — 2 agents · profile: `dual-review`"
 
 
 def test_batch_completion_event_carries_header_toolsets():
@@ -537,7 +537,7 @@ def test_batch_completion_event_carries_header_toolsets():
     from gateway.async_subagent_roster import build_async_dispatched_header
     # No top-level profile -> profile: none; per-task uniform toolsets surface.
     assert build_async_dispatched_header(evt) == \
-        "🔀 Delegate task — 2 agents · profile: none · toolsets=terminal,file"
+        "🔀 Delegate task — 2 agents · profile: `none` · toolsets=`terminal,file`"
 
 
 def test_model_dispatch_forces_background():

@@ -3768,16 +3768,16 @@ def delegate_task(
                 _ref["async_background"] = True
 
         # Header toolsets (audit signal): the dispatched header shows toolsets
-        # ONLY when explicitly passed. They can be set top-level OR per-task; the
-        # top-level `toolsets` arg covers the first case. For the per-task case,
-        # surface the EXPLICIT per-task toolsets when every task shares the same
-        # set (uniform) — that is the common "I gave all the children terminal,
-        # file" shape. When per-task toolsets DIFFER (or none were explicit),
-        # leave it None so the header stays clean (mixed sets are not a single
-        # header value). NOTE: read the EXPLICIT task field, not the resolved
-        # spec toolsets (which fall back to the profile's defaults and would
-        # wrongly read as "explicit").
-        _header_toolsets = toolsets
+        # ONLY when explicitly passed. delegate_task has no top-level `toolsets`
+        # param (the model has no toolsets arg; subagents inherit the parent's),
+        # so the ONLY explicit source is the per-task `toolsets` field. Surface
+        # it when every task shares the same set (uniform) — that is the common
+        # "I gave all the children terminal, file" shape. When per-task toolsets
+        # DIFFER (or none were explicit), leave it None so the header stays clean
+        # (mixed sets are not a single header value). NOTE: read the EXPLICIT
+        # task field, not the resolved spec toolsets (which fall back to the
+        # profile's defaults and would wrongly read as "explicit").
+        _header_toolsets = None
         if _header_toolsets is None:
             _explicit = [
                 _ti["task"].get("toolsets")
