@@ -63,18 +63,21 @@ def vg():
 
 # Reply text fixtures -------------------------------------------------------
 
-# A 4+ item list that owes a visual (T1), pure text (no MEDIA:, no image md).
-_OWED_LIST = (
-    "Here are the steps:\n"
-    "- first thing to do\n"
-    "- second thing to do\n"
-    "- third thing to do\n"
-    "- fourth thing to do\n"
-    "- fifth thing to do\n"
+# A too-wide table that owes a visual (T2), pure text (no MEDIA:, no image md).
+_OWED_TABLE = (
+    "Here is the detailed matrix that is too wide for Telegram text:\n\n"
+    "| Case | Result | Correct | Owner | Risk | Note |\n"
+    "|---|---|---|---|---|---|\n"
+    "| healthy lead | silent | yes | app | low | ok |\n"
+    "| flood event | lost | no | crm | high | the bug |\n"
+    "| retry path | sent | yes | api | med | fixed |\n"
 )
 
-# Same list but WITH a rendered PNG -> compliant, must NOT arm.
-_RENDERED = _OWED_LIST + "\nMEDIA:/tmp/card.png\n"
+# Same table but WITH an adequate rendered PNG -> compliant, must NOT arm.
+_RENDERED = _OWED_TABLE + "\nMEDIA:/tmp/vrp_table_1.png\n"
+
+# Same table but WITH a text-card -> inadequate, must arm BAD_RENDER.
+_BAD_RENDER = _OWED_TABLE + "\nMEDIA:/tmp/vr_card_1.png\n"
 
 # A trivial short reply -> exempt, must NOT arm.
 _TRIVIAL = "yes"
@@ -84,15 +87,23 @@ _TRIVIAL = "yes"
 
 
 def test_set_arms_when_visual_owed_and_not_rendered(vg):
-    vg._on_post_llm_call(session_id="s1", assistant_response=_OWED_LIST, platform="telegram")
+    vg._on_post_llm_call(session_id="s1", assistant_response=_OWED_TABLE, platform="telegram")
     with vg._ARMED_LOCK:
-        assert vg._ARMED.get("s1") == "T1"
+        assert vg._ARMED.get("s1") == "T2"
 
 
 def test_set_does_not_arm_when_rendered(vg):
     vg._on_post_llm_call(session_id="s1", assistant_response=_RENDERED, platform="telegram")
     with vg._ARMED_LOCK:
         assert "s1" not in vg._ARMED
+
+
+def test_set_arms_bad_render_when_card_used_for_t2(vg):
+    vg._on_post_llm_call(session_id="s1", assistant_response=_BAD_RENDER, platform="telegram")
+    with vg._ARMED_LOCK:
+        assert vg._ARMED.get("s1") == "BAD_RENDER"
+    out = vg._on_pre_llm_call(session_id="s1", platform="telegram")
+    assert out is not None and "text-card" in out["context"]
 
 
 def test_set_does_not_arm_on_exempt_reply(vg):
@@ -102,7 +113,7 @@ def test_set_does_not_arm_on_exempt_reply(vg):
 
 
 def test_set_ignored_on_non_telegram(vg):
-    vg._on_post_llm_call(session_id="s1", assistant_response=_OWED_LIST, platform="cli")
+    vg._on_post_llm_call(session_id="s1", assistant_response=_OWED_TABLE, platform="cli")
     with vg._ARMED_LOCK:
         assert "s1" not in vg._ARMED
 
@@ -115,8 +126,8 @@ def test_set_ignored_on_empty_response(vg):
 
 def test_set_clears_stale_flag_when_next_reply_compliant(vg):
     # Arm, then a compliant reply on the same session must disarm.
-    vg._on_post_llm_call(session_id="s1", assistant_response=_OWED_LIST, platform="telegram")
-    assert vg._ARMED.get("s1") == "T1"
+    vg._on_post_llm_call(session_id="s1", assistant_response=_OWED_TABLE, platform="telegram")
+    assert vg._ARMED.get("s1") == "T2"
     vg._on_post_llm_call(session_id="s1", assistant_response=_RENDERED, platform="telegram")
     with vg._ARMED_LOCK:
         assert "s1" not in vg._ARMED
@@ -126,11 +137,11 @@ def test_set_clears_stale_flag_when_next_reply_compliant(vg):
 
 
 def test_consume_returns_note_when_armed_then_clears(vg):
-    vg._arm("s1", "T1")
+    vg._arm("s1", "T2")
     out = vg._on_pre_llm_call(session_id="s1", platform="telegram")
     assert isinstance(out, dict) and "context" in out
-    assert "T1" in out["context"]
-    assert "visual" in out["context"].lower()
+    assert "T2" in out["context"]
+    assert "render" in out["context"].lower()
     # Flag must be cleared after one consume — no repeat nudge.
     with vg._ARMED_LOCK:
         assert "s1" not in vg._ARMED
@@ -141,7 +152,7 @@ def test_consume_returns_none_when_not_armed(vg):
 
 
 def test_consume_returns_none_on_non_telegram_even_if_armed(vg):
-    vg._arm("s1", "T1")
+    vg._arm("s1", "T2")
     assert vg._on_pre_llm_call(session_id="s1", platform="cli") is None
     # Flag should remain (it was a non-telegram turn; we never reached disarm path).
     with vg._ARMED_LOCK:
@@ -161,7 +172,7 @@ def test_consume_no_repeat_nudge_on_following_turn(vg):
 
 def test_end_to_end_set_turn_n_consume_turn_n_plus_1(vg):
     # Turn N: assistant ships an owed-but-text reply.
-    vg._on_post_llm_call(session_id="sX", assistant_response=_OWED_LIST, platform="telegram")
+    vg._on_post_llm_call(session_id="sX", assistant_response=_OWED_TABLE, platform="telegram")
     # Turn N+1 prologue: pre_llm_call injects the nudge.
     out = vg._on_pre_llm_call(session_id="sX", platform="telegram")
     assert out is not None and "context" in out
@@ -170,7 +181,7 @@ def test_end_to_end_set_turn_n_consume_turn_n_plus_1(vg):
 
 
 def test_per_session_isolation(vg):
-    vg._on_post_llm_call(session_id="a", assistant_response=_OWED_LIST, platform="telegram")
+    vg._on_post_llm_call(session_id="a", assistant_response=_OWED_TABLE, platform="telegram")
     # Different session must not see a's flag.
     assert vg._on_pre_llm_call(session_id="b", platform="telegram") is None
     # a still armed.
@@ -181,7 +192,7 @@ def test_armed_store_bounded(vg):
     # Arm more than the cap; oldest should be evicted, store never exceeds cap.
     cap = vg._MAX_SESSIONS
     for i in range(cap + 50):
-        vg._arm(f"s{i}", "T1")
+        vg._arm(f"s{i}", "T2")
     with vg._ARMED_LOCK:
         assert len(vg._ARMED) <= cap
         # The very first session should have been evicted.
@@ -194,7 +205,7 @@ def test_armed_store_bounded(vg):
 def test_set_swallows_exceptions(vg, monkeypatch):
     # Force the classifier to raise; the hook must not propagate.
     monkeypatch.setattr(vg, "_classify", lambda _t: (_ for _ in ()).throw(RuntimeError("boom")))
-    vg._on_post_llm_call(session_id="s1", assistant_response=_OWED_LIST, platform="telegram")
+    vg._on_post_llm_call(session_id="s1", assistant_response=_OWED_TABLE, platform="telegram")
     # No crash, nothing armed.
     with vg._ARMED_LOCK:
         assert "s1" not in vg._ARMED
