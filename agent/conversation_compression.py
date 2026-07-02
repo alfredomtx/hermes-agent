@@ -125,7 +125,7 @@ def _format_compaction_status_message(
     model_label: str = "",
     elapsed_seconds: float | None = None,
 ) -> str:
-    model_part = f" with {model_label}" if model_label else ""
+    model_part = f" with 🧠 {model_label}" if model_label else ""
     if state == "running":
         elapsed_part = (
             f" ({_format_elapsed_seconds(elapsed_seconds)} elapsed)"

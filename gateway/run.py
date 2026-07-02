@@ -797,7 +797,15 @@ def render_notice_line(notice) -> str:
     return str(getattr(notice, "text", "") or "").strip()
 
 
-async def _send_or_update_status_coro(adapter, chat_id, status_key, content, metadata):
+async def _send_or_update_status_coro(
+    adapter,
+    chat_id,
+    status_key,
+    content,
+    metadata,
+    *,
+    sequence: Optional[int] = None,
+):
     """Route a status message through adapter.send_or_update_status when supported.
 
     Issue #30045: adapters that implement send_or_update_status (currently
@@ -806,7 +814,13 @@ async def _send_or_update_status_coro(adapter, chat_id, status_key, content, met
     """
     sender = getattr(adapter, "send_or_update_status", None)
     if callable(sender):
-        return await sender(chat_id, status_key, content, metadata=metadata)
+        return await sender(
+            chat_id,
+            status_key,
+            content,
+            metadata=metadata,
+            sequence=sequence,
+        )
     return await adapter.send(chat_id, content, metadata=metadata)
 
 
@@ -3124,6 +3138,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.debug("could not set multiplex-active flag", exc_info=True)
         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
+        # Gateway-assigned status sequence numbers must outlive a single agent
+        # turn. Telegram keeps an adapter-lifetime high-water mark to drop stale
+        # async status edits, so the gateway counter must be runner-scoped too.
+        self._status_update_sequence_lock = threading.Lock()
+        self._status_update_sequences: Dict[tuple[str, str], int] = {}
         # Multi-profile multiplexing: adapters for NON-default profiles live
         # here, keyed by profile name then Platform. self.adapters stays the
         # default/active profile's map so the ~93 existing self.adapters[...]
@@ -3433,6 +3452,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Set after a wake (re-arm cooldown, 0.F) so we don't immediately re-go
         # dormant before the drained backlog has a chance to update the clock.
         self._scale_to_zero_cooldown_until: float = 0.0
+
+
+    def _next_status_update_sequence(self, chat_id: Any, status_key: str) -> int:
+        """Return a runner-lifetime sequence for one editable status bubble."""
+        key = (str(chat_id), str(status_key))
+        with self._status_update_sequence_lock:
+            self._status_update_sequences[key] = (
+                self._status_update_sequences.get(key, 0) + 1
+            )
+            return self._status_update_sequences[key]
 
 
     def _wire_teams_pipeline_runtime(self) -> None:
@@ -19047,8 +19076,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return
             _status_key = _gateway_status_key(event_type, prepared_message)
+            _status_sequence = self._next_status_update_sequence(
+                _status_chat_id,
+                _status_key,
+            )
             _fut = safe_schedule_threadsafe(
-                _send_or_update_status_coro(_status_adapter, _status_chat_id, _status_key, prepared_message, _status_thread_metadata),
+                _send_or_update_status_coro(
+                    _status_adapter,
+                    _status_chat_id,
+                    _status_key,
+                    prepared_message,
+                    _status_thread_metadata,
+                    sequence=_status_sequence,
+                ),
                 _loop_for_step,
                 logger=logger,
                 log_message=f"status_callback ({event_type}) scheduling error",

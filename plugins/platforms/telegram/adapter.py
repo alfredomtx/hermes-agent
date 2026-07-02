@@ -499,6 +499,12 @@ class TelegramAdapter(BasePlatformAdapter):
         # Tracks status bubbles owned by this adapter so subsequent calls with the
         # same key edit the same message instead of appending new ones (#30045).
         self._status_message_ids: Dict[tuple, str] = {}
+        # Edits for one status bubble must be ordered. Without a per-key lock,
+        # flood-control retries let an older heartbeat complete after a newer
+        # final status, overwriting the final state. Sequences make queued stale
+        # updates no-op once a newer update for the same bubble exists.
+        self._status_update_locks: Dict[tuple, asyncio.Lock] = {}
+        self._status_update_sequences: Dict[tuple, int] = {}
         # Background task that runs post-connect housekeeping (command-menu
         # registration + DM-topic setup) off the connect path so a slow Bot
         # API call (e.g. a set_my_commands stall for certain tokens) cannot
@@ -3718,6 +3724,7 @@ class TelegramAdapter(BasePlatformAdapter):
         content: str,
         *,
         metadata: Optional[Dict[str, Any]] = None,
+        sequence: Optional[int] = None,
     ) -> SendResult:
         """Send a status message, or edit the previous one with the same key.
 
@@ -3725,25 +3732,62 @@ class TelegramAdapter(BasePlatformAdapter):
         compression, etc.) used to append a fresh bubble on every call. With
         this method, the first call sends and the message id is remembered;
         subsequent calls with the same (chat_id, status_key) edit that same
-        message in place. If the edit fails (message deleted, too old, etc.)
-        we drop the cached id and send fresh.
+        message in place. Permanent edit failures (message deleted, too old, etc.)
+        drop the cached id and send fresh. Transient edit failures (flood-control,
+        connection noise) keep the cached id and do not send fresh, because a
+        fresh send would duplicate the status bubble.
         """
         key = (str(chat_id), str(status_key))
-        cached_id = self._status_message_ids.get(key)
-        if cached_id is not None:
-            result = await self.edit_message(
-                chat_id, cached_id, content, finalize=True, metadata=metadata,
+        if sequence is None:
+            self._status_update_sequences[key] = (
+                self._status_update_sequences.get(key, 0) + 1
             )
-            if result.success:
-                if result.message_id:
-                    self._status_message_ids[key] = str(result.message_id)
-                return result
-            # Edit failed — clear the cached id and fall through to a fresh send.
-            self._status_message_ids.pop(key, None)
-        result = await self.send(chat_id, content, metadata=metadata)
-        if result.success and result.message_id:
-            self._status_message_ids[key] = str(result.message_id)
-        return result
+            update_sequence = self._status_update_sequences[key]
+        else:
+            update_sequence = int(sequence)
+            if update_sequence > self._status_update_sequences.get(key, 0):
+                self._status_update_sequences[key] = update_sequence
+        lock = self._status_update_locks.setdefault(key, asyncio.Lock())
+
+        async with lock:
+            cached_id = self._status_message_ids.get(key)
+            if update_sequence < self._status_update_sequences.get(key, 0):
+                return SendResult(
+                    success=True,
+                    message_id=cached_id,
+                    raw_response={"skipped_stale_status_update": True},
+                )
+
+            if cached_id is not None:
+                result = await self.edit_message(
+                    chat_id, cached_id, content, finalize=True, metadata=metadata,
+                )
+                if result.success:
+                    if result.message_id:
+                        self._status_message_ids[key] = str(result.message_id)
+                    return result
+
+                err = str(result.error or "").lower()
+                preserve_cached_bubble = (
+                    result.retryable
+                    or result.retry_after is not None
+                    or err.startswith("flood_control:")
+                    or "flood control" in err
+                    or "retry after" in err
+                )
+                if preserve_cached_bubble:
+                    # Do not turn a transient edit failure into a new bubble.
+                    # Keep the cached id so the next status update can retry the
+                    # same message instead of appending duplicates under flood control.
+                    return result
+
+                # Permanent edit failure — clear the cached id and fall through to a fresh send.
+                self._status_message_ids.pop(key, None)
+
+            result = await self.send(chat_id, content, metadata=metadata)
+            if result.success and result.message_id:
+                self._status_message_ids[key] = str(result.message_id)
+            return result
 
     async def edit_message(
         self,
@@ -3904,7 +3948,11 @@ class TelegramAdapter(BasePlatformAdapter):
                     self.name, wait,
                 )
                 if wait > 5.0:
-                    return SendResult(success=False, error=f"flood_control:{wait}")
+                    return SendResult(
+                        success=False,
+                        error=f"flood_control:{wait}",
+                        retry_after=wait,
+                    )
                 await asyncio.sleep(wait)
                 try:
                     await self._bot.edit_message_text(
@@ -3915,10 +3963,43 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
                     return SendResult(success=True, message_id=message_id)
                 except Exception as retry_err:
+                    retry_err_str = str(retry_err).lower()
+                    retry_wait = getattr(retry_err, "retry_after", None)
                     logger.error(
                         "[%s] Edit retry failed after flood wait: %s",
                         self.name, retry_err,
                     )
+                    if (
+                        retry_wait is not None
+                        or "retry after" in retry_err_str
+                        or "flood control" in retry_err_str
+                        or retry_err_str.startswith("flood_control:")
+                    ):
+                        return SendResult(
+                            success=False,
+                            error=f"flood_control:{retry_wait if retry_wait is not None else wait}",
+                            retry_after=retry_wait if retry_wait is not None else wait,
+                        )
+                    _retry_transient_markers = (
+                        "connecterror",
+                        "connect error",
+                        "connection error",
+                        "networkerror",
+                        "network error",
+                        "timed out",
+                        "readtimeout",
+                        "writetimeout",
+                        "server disconnected",
+                        "temporarily unavailable",
+                        "temporary failure",
+                        "httpx",
+                    )
+                    if any(m in retry_err_str for m in _retry_transient_markers):
+                        return SendResult(
+                            success=False,
+                            error=str(retry_err),
+                            retryable=True,
+                        )
                     return SendResult(success=False, error=str(retry_err))
             # Transient network errors (ConnectError, timeouts, server
             # disconnects) should not permanently disable progress-message

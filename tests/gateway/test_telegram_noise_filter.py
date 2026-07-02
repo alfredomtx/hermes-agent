@@ -55,7 +55,7 @@ def test_telegram_status_suppresses_auxiliary_and_retry_noise():
 
 def test_chat_gateways_keep_compaction_lifecycle_status():
     message = (
-        "🗜️ Compacting context with claude-test: "
+        "🗜️ Compacting context with 🧠 claude-test: "
         "summarizing earlier conversation so I can continue... (10s elapsed)"
     )
 

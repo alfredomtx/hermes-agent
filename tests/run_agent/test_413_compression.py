@@ -588,10 +588,10 @@ class TestPreflightCompression:
         assert new_system_prompt == "new system prompt"
         assert events[0][0] == "lifecycle"
         assert "Compacting context" in events[0][1]
-        assert "test-compressor" in events[0][1]
+        assert "🧠 test-compressor" in events[0][1]
         assert events[1] == ("compress", "started")
         assert events[-1][0] == "lifecycle"
-        assert "Compacting context done with test-compressor in" in events[-1][1]
+        assert "Compacting context done with 🧠 test-compressor in" in events[-1][1]
 
     def test_compaction_status_formatter_includes_elapsed_and_model(self):
         from agent.conversation_compression import _format_compaction_status_message
@@ -608,10 +608,10 @@ class TestPreflightCompression:
         )
 
         assert running == (
-            "🗜️ Compacting context with claude-test: "
+            "🗜️ Compacting context with 🧠 claude-test: "
             "summarizing earlier conversation so I can continue... (1m 15s elapsed)"
         )
-        assert done == "✅ Compacting context done with claude-test in 1m 15s."
+        assert done == "✅ Compacting context done with 🧠 claude-test in 1m 15s."
 
     def test_preflight_compresses_oversized_history(self, agent):
         """When loaded history exceeds the model's context threshold, compress before API call."""
