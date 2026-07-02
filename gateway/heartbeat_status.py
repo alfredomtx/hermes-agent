@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from typing import Any, Optional
 
 _MAX_LINE = 180
@@ -81,15 +80,6 @@ def _action_duration_suffix(item: dict[str, Any]) -> str:
     return f" · took {duration}"
 
 
-def _age_suffix(completed_at: Any, *, now: Optional[float] = None) -> str:
-    if not isinstance(completed_at, (int, float)):
-        return ""
-    end = time.time() if now is None else now
-    age = max(0.0, end - float(completed_at))
-    if age < 2:
-        return " (just now)"
-    return f" ({_format_elapsed(age)} ago)"
-
 
 def format_long_running_heartbeat(
     elapsed_seconds: float,
@@ -131,16 +121,6 @@ def format_long_running_heartbeat(
         desc = _oneline(activity.get("last_activity_desc"))
         if desc:
             lines.append(_code_line("• status: ", desc))
-
-    last = activity.get("last_completed_tool")
-    if isinstance(last, dict) and last.get("name"):
-        state = "failed" if last.get("is_error") else "done"
-        lines.append(_code_line(
-            "• last: ",
-            last.get("name"),
-            f" · {state} · took {_format_elapsed(last.get('duration') or 0)}"
-            f"{_age_suffix(last.get('completed_at'), now=now)}",
-        ))
 
     history = activity.get("recent_tool_activity")
     if isinstance(history, list) and history:
