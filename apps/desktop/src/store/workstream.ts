@@ -149,6 +149,14 @@ function sameWorkstreamActivity(a: WorkstreamActivity, b: WorkstreamActivity): b
   )
 }
 
+export function liveWorkstreamSessionId(
+  sessionId: string,
+  activeSessionId: null | string,
+  selectedStoredSessionId: null | string
+): string {
+  return selectedStoredSessionId === sessionId && activeSessionId ? activeSessionId : sessionId
+}
+
 const activityAtomCache = new Map<string, ReadableAtom<WorkstreamActivity>>()
 
 export function $workstreamActivity(sessionId: string): ReadableAtom<WorkstreamActivity> {
@@ -170,7 +178,7 @@ export function $workstreamActivity(sessionId: string): ReadableAtom<WorkstreamA
       $subagentsBySession
     ],
     (activeSessionId, selectedStoredSessionId, attentionIds, workingIds, todosBySession, subagentsBySession) => {
-      const liveSessionId = selectedStoredSessionId === sessionId && activeSessionId ? activeSessionId : sessionId
+      const liveSessionId = liveWorkstreamSessionId(sessionId, activeSessionId, selectedStoredSessionId)
 
       const sessionIds = liveSessionId === sessionId ? [sessionId] : [sessionId, liveSessionId]
 
