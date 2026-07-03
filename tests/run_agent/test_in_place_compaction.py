@@ -9,6 +9,7 @@ gaps, #42228 null cwd). When the flag is False (default), rotation behaves
 exactly as before.
 """
 
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -56,6 +57,15 @@ def _seed(db, sid, title, n=8):
             role="user" if i % 2 == 0 else "assistant",
             content=f"msg {i}",
         )
+
+
+def _make_skill(root: Path, name: str, body: str) -> None:
+    skill_dir = root / name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: Test skill.\n---\n\n{body}\n",
+        encoding="utf-8",
+    )
 
 
 class TestInPlaceCompaction:
@@ -123,6 +133,40 @@ class TestInPlaceCompaction:
             assert agent._last_compaction_in_place is True
             # Live transcript actually shrank.
             assert len(compressed) == 2
+
+    def test_in_place_clears_task_id_skill_receipt_scope(self):
+        """Compression must clear task_id fallback scopes, not just session ids."""
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+        from tools.skills_tool import clear_skill_view_receipt_cache, skill_view
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            skill_root = root / "skills"
+            _make_skill(skill_root, "task-scope-skill", "TASK SCOPE FULL BODY")
+            db = SessionDB(db_path=root / "t.db")
+            sid = "20260619_121000_taskid"
+            task_scope = "tool-task-scope"
+            _seed(db, sid, "task-scope")
+            agent = _make_agent(db, sid, in_place=True)
+
+            with patch("tools.skills_tool.SKILLS_DIR", skill_root):
+                clear_skill_view_receipt_cache()
+                first = json.loads(skill_view("task-scope-skill", task_id=task_scope))
+                second = json.loads(skill_view("task-scope-skill", task_id=task_scope))
+                compress_context(
+                    agent,
+                    [{"role": "user", "content": "x"}] * 8,
+                    approx_tokens=100_000,
+                    system_message="sys",
+                    task_id=task_scope,
+                )
+                third = json.loads(skill_view("task-scope-skill", task_id=task_scope))
+
+            assert first["already_loaded"] is False
+            assert second["already_loaded"] is True
+            assert third["already_loaded"] is False
+            assert "TASK SCOPE FULL BODY" in third["content"]
 
     def test_in_place_alternation_preserved(self):
         """The compacted list must not introduce consecutive same-role messages."""

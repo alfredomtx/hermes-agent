@@ -373,6 +373,191 @@ class TestSkillView:
         assert result["name"] == "my-skill"
         assert "Step 1" in result["content"]
 
+    def test_session_repeated_main_skill_load_returns_receipt(self, tmp_path):
+        session_id = f"session-{tmp_path}"
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "repeat-skill", body="FULL UNIQUE BODY")
+            first_raw = skill_view("repeat-skill", task_id=session_id)
+            second_raw = skill_view("repeat-skill", task_id=session_id)
+
+        first = json.loads(first_raw)
+        second = json.loads(second_raw)
+        assert first["success"] is True
+        assert first.get("already_loaded") is False
+        assert "FULL UNIQUE BODY" in first["content"]
+        assert second["success"] is True
+        assert second["already_loaded"] is True
+        assert "FULL UNIQUE BODY" not in second["content"]
+        assert "already loaded in this session" in second["content"]
+        assert second["receipt"]["sha256"] == first["receipt"]["sha256"]
+        assert second["receipt"]["chars_saved"] == first["receipt"]["chars"]
+
+    def test_force_reloads_full_content_in_same_session(self, tmp_path):
+        session_id = f"session-{tmp_path}"
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "force-skill", body="FORCE FULL BODY")
+            skill_view("force-skill", task_id=session_id)
+            receipt_raw = skill_view("force-skill", task_id=session_id)
+            forced_raw = skill_view("force-skill", task_id=session_id, force=True)
+
+        receipt = json.loads(receipt_raw)
+        forced = json.loads(forced_raw)
+        assert receipt["already_loaded"] is True
+        assert forced["already_loaded"] is False
+        assert forced["force_reloaded"] is True
+        assert "FORCE FULL BODY" in forced["content"]
+
+    def test_clearing_session_receipt_cache_forces_full_reload(self, tmp_path):
+        session_id = f"session-{tmp_path}"
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "clear-skill", body="CLEAR FULL BODY")
+            skill_view("clear-skill", task_id=session_id)
+            receipt_raw = skill_view("clear-skill", task_id=session_id)
+            skills_tool_module.clear_skill_view_receipt_cache(session_id)
+            reload_raw = skill_view("clear-skill", task_id=session_id)
+
+        receipt = json.loads(receipt_raw)
+        reloaded = json.loads(reload_raw)
+        assert receipt["already_loaded"] is True
+        assert reloaded["already_loaded"] is False
+        assert "CLEAR FULL BODY" in reloaded["content"]
+
+    def test_scope_clear_waits_for_in_flight_load_before_clearing(self, monkeypatch):
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        import time
+
+        session_id = "race-scope"
+        started = threading.Event()
+        release = threading.Event()
+        calls = {"n": 0}
+
+        def fake_uncached(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                started.set()
+                assert release.wait(timeout=5)
+            return json.dumps(
+                {
+                    "success": True,
+                    "name": "race-skill",
+                    "path": "race-skill/SKILL.md",
+                    "content": "RACE FULL BODY",
+                }
+            )
+
+        skills_tool_module.clear_skill_view_receipt_cache()
+        monkeypatch.setattr(skills_tool_module, "_skill_view_uncached", fake_uncached)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first_future = executor.submit(skill_view, "race-skill", task_id=session_id)
+            assert started.wait(timeout=5)
+            clear_future = executor.submit(
+                skills_tool_module.clear_skill_view_receipt_cache,
+                session_id,
+            )
+            time.sleep(0.05)
+            release.set()
+            first = json.loads(first_future.result(timeout=5))
+            clear_future.result(timeout=5)
+
+        second = json.loads(skill_view("race-skill", task_id=session_id))
+
+        assert first["already_loaded"] is False
+        assert second["already_loaded"] is False
+        assert "RACE FULL BODY" in second["content"]
+
+    def test_concurrent_same_session_load_only_returns_one_full_body(self, tmp_path):
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+
+        session_id = f"session-{tmp_path}"
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "parallel-skill", body="PARALLEL FULL BODY")
+            barrier = threading.Barrier(2)
+
+            def load_skill():
+                barrier.wait()
+                return json.loads(skill_view("parallel-skill", task_id=session_id))
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [executor.submit(load_skill), executor.submit(load_skill)]
+                results = [future.result() for future in futures]
+
+        full_count = sum("PARALLEL FULL BODY" in result["content"] for result in results)
+        receipt_count = sum(result.get("already_loaded") is True for result in results)
+        assert full_count == 1
+        assert receipt_count == 1
+
+    def test_repeated_skill_without_session_still_returns_full_content(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "cron-skill", body="CRON FULL BODY")
+            first_raw = skill_view("cron-skill")
+            second_raw = skill_view("cron-skill")
+
+        first = json.loads(first_raw)
+        second = json.loads(second_raw)
+        assert first["success"] is True
+        assert second["success"] is True
+        assert "CRON FULL BODY" in first["content"]
+        assert "CRON FULL BODY" in second["content"]
+        assert "already_loaded" not in second
+
+    def test_preprocess_false_repeated_session_load_stays_full_content(self, tmp_path):
+        session_id = f"session-{tmp_path}"
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "slash-skill", body="SLASH FULL BODY")
+            first_raw = skill_view("slash-skill", task_id=session_id, preprocess=False)
+            second_raw = skill_view("slash-skill", task_id=session_id, preprocess=False)
+
+        first = json.loads(first_raw)
+        second = json.loads(second_raw)
+        assert first["success"] is True
+        assert second["success"] is True
+        assert "SLASH FULL BODY" in first["content"]
+        assert "SLASH FULL BODY" in second["content"]
+        assert "already_loaded" not in second
+
+    def test_session_receipt_does_not_suppress_linked_file_reads(self, tmp_path):
+        session_id = f"session-{tmp_path}"
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = _make_skill(tmp_path, "with-reference", body="MAIN BODY")
+            refs_dir = skill_dir / "references"
+            refs_dir.mkdir()
+            (refs_dir / "guide.md").write_text("REFERENCE BODY")
+            skill_view("with-reference", task_id=session_id)
+            second_raw = skill_view(
+                "with-reference",
+                file_path="references/guide.md",
+                task_id=session_id,
+            )
+
+        second = json.loads(second_raw)
+        assert second["success"] is True
+        assert second.get("already_loaded") is None
+        assert "REFERENCE BODY" in second["content"]
+
+    def test_changed_skill_content_reloads_in_same_session(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = _make_skill(tmp_path, "changing-skill", body="OLD BODY")
+            session_id = f"session-{tmp_path}"
+            first_raw = skill_view("changing-skill", task_id=session_id)
+            second_raw = skill_view("changing-skill", task_id=session_id)
+            (skill_dir / "SKILL.md").write_text(
+                "---\nname: changing-skill\ndescription: changed\n---\n\n# changing-skill\n\nNEW BODY\n",
+                encoding="utf-8",
+            )
+            third_raw = skill_view("changing-skill", task_id=session_id)
+
+        first = json.loads(first_raw)
+        second = json.loads(second_raw)
+        third = json.loads(third_raw)
+        assert second["already_loaded"] is True
+        assert third["success"] is True
+        assert third.get("already_loaded") is False
+        assert "NEW BODY" in third["content"]
+        assert third["receipt"]["sha256"] != first["receipt"]["sha256"]
+
     def test_view_skill_by_frontmatter_name_when_dir_differs(self, tmp_path):
         # The on-disk directory ("alias-dir") differs from the skill's
         # frontmatter name ("real-skill-name"). skills_list() exposes the

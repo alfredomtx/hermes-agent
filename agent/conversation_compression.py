@@ -1021,6 +1021,19 @@ def compress_context(
         _is_boundary = bool(_old_sid) or in_place
         _boundary_parent = _old_sid or agent.session_id or ""
 
+        # Skill bodies loaded before compaction may have been summarized away.
+        # Drop duplicate-load receipts so a post-compaction skill_view returns
+        # full content again instead of a stale "already loaded" stub.
+        try:
+            if _is_boundary:
+                from tools.skills_tool import clear_skill_view_receipt_cache
+
+                for receipt_scope in {_old_sid, agent.session_id, task_id}:
+                    if isinstance(receipt_scope, str) and receipt_scope.strip():
+                        clear_skill_view_receipt_cache(receipt_scope)
+        except Exception as _skill_cache_err:
+            logger.debug("skill receipt cache clear on compression failed: %s", _skill_cache_err)
+
         # Notify the context engine that a compaction boundary occurred. Plugin
         # engines (e.g. hermes-lcm) use boundary_reason="compression" to preserve
         # DAG lineage / checkpoint per-session state across the boundary instead of

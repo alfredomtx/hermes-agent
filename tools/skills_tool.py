@@ -66,8 +66,10 @@ Usage:
     content = skill_view("axolotl", "references/dataset-formats.md")
 """
 
+import hashlib
 import json
 import logging
+import threading
 
 from hermes_constants import get_hermes_home, display_hermes_home
 import os
@@ -109,6 +111,162 @@ _REMOTE_ENV_BACKENDS = frozenset(
     {"docker", "singularity", "modal", "ssh", "daytona"}
 )
 _secret_capture_callback = None
+_SKILL_VIEW_RECEIPT_CACHE_LOCK = threading.RLock()
+_SKILL_VIEW_RECEIPT_CACHE: Dict[
+    str,
+    Dict[Tuple[str, str, bool], Dict[str, Any]],
+] = {}
+_SKILL_VIEW_RECEIPT_SCOPE_LOCKS = tuple(threading.RLock() for _ in range(32))
+_SKILL_VIEW_RECEIPT_CACHE_MAX_SCOPES = 128
+_SKILL_VIEW_RECEIPT_CACHE_MAX_ENTRIES_PER_SCOPE = 128
+
+
+def _skill_view_cache_scope(
+    *,
+    session_id: str | None = None,
+    task_id: str | None = None,
+) -> Optional[str]:
+    """Return the per-session cache scope for a tool-driven skill load.
+
+    Direct programmatic callers such as cron prompt injection do not pass a
+    session/task id, so they keep receiving full content on every call. The
+    gateway/agent tool path passes a stable session id; batch/sandbox paths at
+    least pass task_id, which is a safe narrower fallback.
+    """
+
+    for candidate in (session_id, task_id):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def _scope_skill_receipt_cache(scope: str) -> Dict[Tuple[str, str, bool], Dict[str, Any]]:
+    cache = _SKILL_VIEW_RECEIPT_CACHE.get(scope)
+    if cache is None:
+        if len(_SKILL_VIEW_RECEIPT_CACHE) >= _SKILL_VIEW_RECEIPT_CACHE_MAX_SCOPES:
+            try:
+                _SKILL_VIEW_RECEIPT_CACHE.pop(next(iter(_SKILL_VIEW_RECEIPT_CACHE)))
+            except StopIteration:
+                pass
+        cache = {}
+        _SKILL_VIEW_RECEIPT_CACHE[scope] = cache
+    return cache
+
+
+def _skill_view_scope_lock(scope: str) -> threading.RLock:
+    digest = hashlib.sha256(scope.encode("utf-8")).digest()
+    index = int.from_bytes(digest[:2], "big") % len(_SKILL_VIEW_RECEIPT_SCOPE_LOCKS)
+    return _SKILL_VIEW_RECEIPT_SCOPE_LOCKS[index]
+
+
+def clear_skill_view_receipt_cache(scope: Optional[str] = None) -> None:
+    """Clear duplicate-load receipts, usually at a compression boundary."""
+
+    if scope is None:
+        for lock in _SKILL_VIEW_RECEIPT_SCOPE_LOCKS:
+            lock.acquire()
+        try:
+            with _SKILL_VIEW_RECEIPT_CACHE_LOCK:
+                _SKILL_VIEW_RECEIPT_CACHE.clear()
+        finally:
+            for lock in reversed(_SKILL_VIEW_RECEIPT_SCOPE_LOCKS):
+                lock.release()
+        return
+
+    normalized_scope = scope.strip() if isinstance(scope, str) else ""
+    if not normalized_scope:
+        return
+
+    with _skill_view_scope_lock(normalized_scope):
+        with _SKILL_VIEW_RECEIPT_CACHE_LOCK:
+            _SKILL_VIEW_RECEIPT_CACHE.pop(normalized_scope, None)
+
+
+def _skill_receipt_for(
+    *,
+    name: str,
+    path: str,
+    sha256: str,
+    chars: int,
+    scope: str,
+    loads_omitted: int = 0,
+    chars_saved: int = 0,
+) -> Dict[str, Any]:
+    receipt: Dict[str, Any] = {
+        "name": name,
+        "path": path,
+        "sha256": sha256,
+        "chars": chars,
+        "scope": scope,
+    }
+    if loads_omitted:
+        receipt["loads_omitted"] = loads_omitted
+    if chars_saved:
+        receipt["chars_saved"] = chars_saved
+    return receipt
+
+
+def _apply_skill_view_receipt_cache(
+    result: Dict[str, Any],
+    *,
+    scope: str,
+    preprocess: bool,
+    force: bool = False,
+) -> Dict[str, Any]:
+    if not result.get("success"):
+        return result
+    content = result.get("content")
+    if not isinstance(content, str):
+        return result
+
+    name = str(result.get("name") or "")
+    path = str(result.get("path") or result.get("skill_dir") or "")
+    sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    chars = len(content)
+    key = (name, path, bool(preprocess))
+    cache = _scope_skill_receipt_cache(scope)
+    existing = cache.get(key)
+
+    if not force and existing and existing.get("sha256") == sha256:
+        loads_omitted = int(existing.get("loads_omitted") or 0) + 1
+        existing["loads_omitted"] = loads_omitted
+        compact = dict(result)
+        compact["already_loaded"] = True
+        compact["receipt"] = _skill_receipt_for(
+            name=name,
+            path=path,
+            sha256=sha256,
+            chars=chars,
+            scope=scope,
+            loads_omitted=loads_omitted,
+            chars_saved=chars,
+        )
+        compact["content"] = (
+            f"[already loaded in this session: {name} "
+            f"sha256={sha256[:12]} chars={chars:,}; full skill content omitted "
+            "to avoid duplicate context. Use force=true only if you need the "
+            "exact text again.]"
+        )
+        return compact
+
+    if len(cache) >= _SKILL_VIEW_RECEIPT_CACHE_MAX_ENTRIES_PER_SCOPE:
+        try:
+            cache.pop(next(iter(cache)))
+        except StopIteration:
+            pass
+    cache[key] = {"sha256": sha256, "chars": chars, "loads_omitted": 0}
+    full = dict(result)
+    full["already_loaded"] = False
+    full["receipt"] = _skill_receipt_for(
+        name=name,
+        path=path,
+        sha256=sha256,
+        chars=chars,
+        scope=scope,
+    )
+    if force:
+        full["force_reloaded"] = True
+    return full
 
 
 def _skill_lookup_path_error(name: str) -> Optional[str]:
@@ -861,10 +1019,10 @@ def _serve_plugin_skill(
     )
 
 
-def skill_view(
+def _skill_view_uncached(
     name: str,
-    file_path: str = None,
-    task_id: str = None,
+    file_path: Optional[str] = None,
+    task_id: Optional[str] = None,
     preprocess: bool = True,
 ) -> str:
     """
@@ -1534,6 +1692,48 @@ def skill_view(
         return tool_error(str(e), success=False)
 
 
+def skill_view(
+    name: str,
+    file_path: Optional[str] = None,
+    task_id: Optional[str] = None,
+    preprocess: bool = True,
+    session_id: Optional[str] = None,
+    force: bool = False,
+) -> str:
+    """View a skill, suppressing duplicate full SKILL.md payloads per session."""
+
+    scope = _skill_view_cache_scope(session_id=session_id, task_id=task_id)
+    if not scope or file_path or not preprocess:
+        return _skill_view_uncached(
+            name,
+            file_path=file_path,
+            task_id=task_id,
+            preprocess=preprocess,
+        )
+
+    # Serialize only the same session scope. Different conversations should not
+    # block each other while reading/preprocessing a large skill.
+    with _skill_view_scope_lock(scope):
+        raw = _skill_view_uncached(
+            name,
+            file_path=file_path,
+            task_id=task_id,
+            preprocess=preprocess,
+        )
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return raw
+        if not isinstance(parsed, dict):
+            return raw
+        with _SKILL_VIEW_RECEIPT_CACHE_LOCK:
+            parsed = _apply_skill_view_receipt_cache(
+                parsed,
+                scope=scope,
+                preprocess=preprocess,
+                force=force,
+            )
+        return json.dumps(parsed, ensure_ascii=False)
 
 
 if __name__ == "__main__":
@@ -1600,7 +1800,7 @@ SKILLS_LIST_SCHEMA = {
 
 SKILL_VIEW_SCHEMA = {
     "name": "skill_view",
-    "description": "Skills allow for loading information about specific tasks and workflows, as well as scripts and templates. Load a skill's full content or access its linked files (references, templates, scripts). First call returns SKILL.md content plus a 'linked_files' dict showing available references/templates/scripts. To access those, call again with file_path parameter.",
+    "description": "Skills allow for loading information about specific tasks and workflows, as well as scripts and templates. Load a skill's full content or access its linked files (references, templates, scripts). First main SKILL.md call in a session returns full content plus a 'linked_files' dict; repeated same-session calls return a compact already_loaded receipt unless force=true. To access linked files, call again with file_path.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -1611,6 +1811,10 @@ SKILL_VIEW_SCHEMA = {
             "file_path": {
                 "type": "string",
                 "description": "OPTIONAL: Path to a linked file within the skill (e.g., 'references/api.md', 'templates/config.yaml', 'scripts/validate.py'). Omit to get the main SKILL.md content.",
+            },
+            "force": {
+                "type": "boolean",
+                "description": "If true, return the full skill content even if this skill was already loaded in the current session.",
             },
         },
         "required": ["name"],
@@ -1632,7 +1836,11 @@ def _skill_view_with_bump(args, **kw):
     telemetry failure never breaks the tool call."""
     name = args.get("name", "")
     result = skill_view(
-        name, file_path=args.get("file_path"), task_id=kw.get("task_id")
+        name,
+        file_path=args.get("file_path"),
+        task_id=kw.get("task_id"),
+        session_id=kw.get("session_id"),
+        force=args.get("force") is True,
     )
     try:
         parsed = json.loads(result)
