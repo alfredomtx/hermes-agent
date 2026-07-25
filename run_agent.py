@@ -114,6 +114,7 @@ from agent.process_bootstrap import (
     _get_proxy_for_base_url,
 )
 from agent.iteration_budget import IterationBudget
+from agent.tool_budget import ToolBudget
 
 
 from hermes_cli.env_loader import load_hermes_dotenv
@@ -415,6 +416,7 @@ class AIAgent:
         "[hermes-agent: tool call arguments were corrupted in this session and "
         "have been dropped to keep the conversation alive. See issue #15236.]"
     )
+    tool_budget: Optional[ToolBudget]
 
     @property
     def base_url(self) -> str:
@@ -500,6 +502,7 @@ class AIAgent:
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
         requested_provider: str = None,
+        tool_budget: Optional["ToolBudget"] = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -577,6 +580,7 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            tool_budget=tool_budget,
         )
 
     def _get_session_db_for_recall(self):

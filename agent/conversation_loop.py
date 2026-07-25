@@ -232,6 +232,15 @@ def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str
     )
 
 
+def _tool_budget_exhaustion_response(agent) -> str:
+    budget = getattr(agent, "tool_budget", None)
+    reason = getattr(budget, "exhaustion_reason", None) or "limit"
+    return (
+        "Tool budget exhausted "
+        f"({reason}); no further model-requested tools were executed."
+    )
+
+
 def _ra():
     """Lazy reference to ``run_agent`` so callers can patch
     ``run_agent.handle_function_call`` / ``run_agent._set_interrupt`` /
@@ -1038,6 +1047,17 @@ def run_conversation(
         )
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+        # A pre-exhausted per-agent tool budget must not cause even one
+        # provider/API call. This also covers a zero-sized configured limit.
+        _tool_budget = getattr(agent, "tool_budget", None)
+        if _tool_budget is not None and _tool_budget.exhausted:
+            _turn_exit_reason = (
+                "tool_budget_exhausted("
+                f"{_tool_budget.exhaustion_reason or 'limit'})"
+            )
+            final_response = _tool_budget_exhaustion_response(agent)
+            break
+
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)
@@ -5760,6 +5780,16 @@ def run_conversation(
                         pass
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+
+                _tool_budget = getattr(agent, "tool_budget", None)
+                if _tool_budget is not None and _tool_budget.exhausted:
+                    _turn_exit_reason = (
+                        "tool_budget_exhausted("
+                        f"{_tool_budget.exhaustion_reason or 'limit'})"
+                    )
+                    final_response = _tool_budget_exhaustion_response(agent)
+                    agent._emit_status(final_response)
+                    break
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
