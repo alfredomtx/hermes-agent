@@ -15,6 +15,7 @@ Design:
 """
 
 import json
+import time
 from typing import Dict, Any, List, Optional
 
 
@@ -55,19 +56,46 @@ class TodoStore:
 
     def __init__(self):
         self._items: List[Dict[str, str]] = []
+        # Wall-clock timing per item id, populated by status transitions.
+        # Kept separate from _items so the item shape stays {id, content,
+        # status} for format_for_injection and existing consumers. Each entry
+        # is {"started_at": float, "ended_at": float} (epoch seconds); either
+        # key may be absent until the matching transition fires.
+        self._timing: Dict[str, Dict[str, float]] = {}
 
     def write(self, todos: List[Dict[str, Any]], merge: bool = False) -> List[Dict[str, str]]:
         """
         Write todos. Returns the full current list after writing.
 
         Args:
-            todos: list of {id, content, status} dicts
+            todos: list of {id, content, status} dicts. Items may also carry
+                   "started_at"/"ended_at" (epoch seconds) — used only to
+                   restore timing on history replay (see _hydrate_todo_store);
+                   the model itself never sends these.
             merge: if False, replace the entire list. If True, update
                    existing items by id and append new ones.
         """
+        # Pull any timing carried on the incoming items. Real model calls never
+        # include these; they appear only when _hydrate_todo_store replays a
+        # prior todo result back into a fresh store. Terminal spans are adopted
+        # below; live in-progress spans restart on the new turn so idle time
+        # between gateway turns does not show up as fake work time.
+        incoming_timing = self._extract_incoming_timing(todos)
+
         if not merge:
-            # Replace mode: new list entirely
+            # Replace mode: new list entirely. If a fresh model-authored plan
+            # reuses generic ids (setup/phase-a/report) for different work,
+            # reset those clocks even if the model copied timing fields from a
+            # previous result. Terminal hydration on a fresh store is unaffected,
+            # and terminal replay can still be adopted after this clear.
+            previous_by_id = {item["id"]: item for item in self._items}
             self._items = [self._validate(t) for t in self._dedupe_by_id(todos)]
+            for current in self._items:
+                item_id = current["id"]
+                previous = previous_by_id.get(item_id)
+                if previous is not None and previous.get("content") != current.get("content"):
+                    self._timing.pop(item_id, None)
+                    incoming_timing.pop(item_id, None)
         else:
             # Merge mode: update existing items by id, append new ones
             existing = {item["id"]: item for item in self._items}
@@ -103,11 +131,138 @@ class TodoStore:
         # (list order is priority).
         if len(self._items) > MAX_TODO_ITEMS:
             self._items = self._items[:MAX_TODO_ITEMS]
+        # Stamp transitions and prune timing for dropped ids.
+        self._update_timing(incoming_timing)
         return self.read()
+
+    @staticmethod
+    def _extract_incoming_timing(todos: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
+        """Collect started_at/ended_at carried on input items (history replay)."""
+        out: Dict[str, Dict[str, float]] = {}
+        if not isinstance(todos, list):
+            return out
+        for t in todos:
+            if not isinstance(t, dict):
+                continue
+            item_id = str(t.get("id", "")).strip()
+            if not item_id:
+                continue
+            entry: Dict[str, float] = {}
+            for key in ("started_at", "ended_at"):
+                value = t.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    entry[key] = float(value)
+            if entry:
+                out[item_id] = entry
+        return out
+
+    def _update_timing(
+        self,
+        incoming_timing: Dict[str, Dict[str, float]],
+    ) -> None:
+        """Stamp wall-clock timing from status transitions; prune dropped ids.
+
+        Transitions are detected implicitly from each item's current status vs
+        the timing already recorded for it (e.g. an in_progress item with no
+        started_at is a fresh start), so no pre-mutation status snapshot is
+        needed. Wall-clock semantics: started_at is set the first time an item
+        enters in_progress; ended_at is set when it leaves in_progress for a
+        terminal status (completed/cancelled). Re-opening a finished item clears
+        ended_at so the elapsed span keeps growing. Items completed without ever
+        being in_progress get no timing (nothing to measure).
+        """
+        now = time.time()
+        live_ids = {item["id"] for item in self._items}
+
+        for item in self._items:
+            item_id = item["id"]
+            new_status = item["status"]
+            entry = self._timing.setdefault(item_id, {})
+
+            # Adopt replayed timing only for terminal spans. An in-progress item
+            # from history was not actively worked during the gap between gateway
+            # turns, so it starts a fresh live clock below.
+            replayed = incoming_timing.get(item_id)
+            if replayed and new_status in ("completed", "cancelled"):
+                for key, value in replayed.items():
+                    entry.setdefault(key, value)
+
+            if new_status == "in_progress":
+                if "started_at" not in entry:
+                    entry["started_at"] = now
+                # Re-opened after finishing: let the span keep accruing.
+                entry.pop("ended_at", None)
+            elif new_status in ("completed", "cancelled"):
+                # Only record an end when we have a measurable start and have
+                # not already stamped one (idempotent across re-sent lists).
+                if "started_at" in entry and "ended_at" not in entry:
+                    entry["ended_at"] = now
+
+            if not entry:
+                # Never store empty dicts (keeps elapsed_for() simple).
+                self._timing.pop(item_id, None)
+
+        # Drop timing for ids no longer in the list (replace mode can remove).
+        for stale_id in [tid for tid in self._timing if tid not in live_ids]:
+            self._timing.pop(stale_id, None)
+
+    def elapsed_for(self, item_id: str) -> Optional[float]:
+        """Wall-clock seconds for an item, or None if not measurable yet.
+
+        Returns the closed span (ended_at - started_at) once finished, the
+        running span (now - started_at) while in progress, or None when the
+        item never entered in_progress.
+        """
+        entry = self._timing.get(item_id)
+        if not entry or "started_at" not in entry:
+            return None
+        end = entry.get("ended_at")
+        if end is None:
+            end = time.time()
+        elapsed = end - entry["started_at"]
+        return elapsed if elapsed >= 0 else 0.0
 
     def read(self) -> List[Dict[str, str]]:
         """Return a copy of the current list."""
         return [item.copy() for item in self._items]
+
+    def read_with_timing(self) -> List[Dict[str, Any]]:
+        """Return the list with wall-clock timing fields attached.
+
+        Each item carries the usual {id, content, status} plus:
+          - elapsed_seconds: float wall-clock span, or None if unmeasured.
+          - started_at / ended_at: raw epoch stamps when present. These let
+            _hydrate_todo_store replay terminal spans into a fresh store. Live
+            in-progress items intentionally restart on hydration so idle time
+            between gateway turns is not counted as work time.
+        """
+        out: List[Dict[str, Any]] = []
+        for item in self._items:
+            entry: Dict[str, Any] = dict(item)
+            timing = self._timing.get(item["id"], {})
+            if "started_at" in timing:
+                entry["started_at"] = timing["started_at"]
+            if "ended_at" in timing:
+                entry["ended_at"] = timing["ended_at"]
+            entry["elapsed_seconds"] = self.elapsed_for(item["id"])
+            out.append(entry)
+        return out
+
+    def total_elapsed_seconds(self) -> Optional[float]:
+        """Sum of measurable per-item elapsed spans, or None if none measured.
+
+        Wall-clock per item, so overlapping/parallel spans are summed naively
+        (a deliberately simple total — it answers "how much tracked work time"
+        not "how long was the wall clock for the whole plan").
+        """
+        total = 0.0
+        measured = False
+        for item in self._items:
+            value = self.elapsed_for(item["id"])
+            if value is not None:
+                total += value
+                measured = True
+        return total if measured else None
 
     def has_items(self) -> bool:
         """Check if there are any items in the list."""
@@ -215,7 +370,11 @@ def todo_tool(
         store: the TodoStore instance from the AIAgent.
 
     Returns:
-        JSON string with the full current list and summary metadata.
+        JSON string with the full current list and summary metadata. Each item
+        includes "elapsed_seconds" (wall-clock span, or null when the item never
+        entered in_progress) and, when present, raw "started_at"/"ended_at"
+        epoch stamps so timing survives history replay. The summary includes
+        "total_elapsed_seconds".
     """
     if store is None:
         return tool_error("TodoStore not initialized")
@@ -231,9 +390,9 @@ def todo_tool(
             return tool_error(
                 f"todos must be a list, got {type(todos).__name__}"
             )
-        items = store.write(todos, merge)
-    else:
-        items = store.read()
+        store.write(todos, merge)
+    # read_with_timing also covers the read-only path (todos is None).
+    items = store.read_with_timing()
 
     # Build summary counts
     pending = sum(1 for i in items if i["status"] == "pending")
@@ -249,6 +408,7 @@ def todo_tool(
             "in_progress": in_progress,
             "completed": completed,
             "cancelled": cancelled,
+            "total_elapsed_seconds": store.total_elapsed_seconds(),
         },
     }, ensure_ascii=False)
 

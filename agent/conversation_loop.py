@@ -1984,6 +1984,28 @@ def run_conversation(
                             allow_stream=False,
                             is_github_responses=agent._is_copilot_url(),
                         )
+                    ref = getattr(agent, "_subagent_context_ref", None)
+                    if isinstance(ref, dict) and ref.get("child_session_id"):
+                        try:
+                            from agent.subagent_context_artifacts import (
+                                build_subagent_context_payload,
+                                update_subagent_context_artifact_capture,
+                            )
+
+                            payload = build_subagent_context_payload(
+                                ref=ref,
+                                canonical_messages=api_messages,
+                                provider_request=next_api_kwargs,
+                                api_call_count=api_call_count,
+                                retry_count=retry_count,
+                            )
+                            update_subagent_context_artifact_capture(
+                                str(ref["child_session_id"]),
+                                payload,
+                                session_db=getattr(agent, "_session_db", None),
+                            )
+                        except Exception:
+                            logger.debug("subagent context artifact capture failed", exc_info=True)
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner

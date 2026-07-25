@@ -2758,6 +2758,23 @@ class BasePlatformAdapter(ABC):
         from agent.display import get_tool_emoji
         emoji = get_tool_emoji(event.tool_name, default="⚙️")
 
+        if event.tool_name == "todo":
+            try:
+                from gateway.todo_progress import format_todo_progress
+
+                # Fall back to 4096 (the gateway's conventional message limit)
+                # when this adapter exposes no positive MAX_MESSAGE_LENGTH, so
+                # the card stays bounded rather than unbounded on unsplit edit
+                # paths.
+                todo_card = format_todo_progress(
+                    event.args,
+                    max_chars=int(getattr(self, "MAX_MESSAGE_LENGTH", 0) or 4096),
+                )
+            except Exception:
+                todo_card = None
+            if todo_card:
+                return todo_card
+
         if mode == "verbose":
             if event.args:
                 import json
@@ -4850,6 +4867,61 @@ class BasePlatformAdapter(ABC):
             raise
 
         await self._drain_pending_after_session_command(session_key, command_guard)
+
+    @staticmethod
+    def _resolve_intake_binding(hook_results):
+        """Return one unambiguous session binding from intake hook results."""
+        from gateway.session import SessionBinding
+
+        bindings = []
+        for result in hook_results or []:
+            candidate = result
+            if isinstance(result, dict) and "session_binding" in result:
+                candidate = result.get("session_binding")
+            if candidate is None:
+                continue
+            if isinstance(candidate, SessionBinding):
+                bindings.append(candidate)
+                continue
+            try:
+                binding = SessionBinding.from_dict(candidate)
+            except Exception:
+                binding = None
+            if binding is not None:
+                bindings.append(binding)
+
+        distinct = {(binding.namespace, binding.key) for binding in bindings}
+        if len(distinct) == 1:
+            return bindings[0]
+        if len(distinct) > 1:
+            logger.warning(
+                "%d distinct session bindings at intake (%s) — refusing all",
+                len(distinct),
+                sorted(distinct),
+            )
+        return None
+
+    def _apply_session_binding(self, event: MessageEvent) -> None:
+        """Resolve a plugin-provided session binding before session key routing."""
+        if getattr(event, "_session_binding_resolution_attempted", False):
+            return
+        setattr(event, "_session_binding_resolution_attempted", True)
+        if getattr(event.source, "session_binding", None) is not None:
+            return
+        try:
+            from hermes_cli.plugins import invoke_hook
+
+            binding = self._resolve_intake_binding(
+                invoke_hook(
+                    "pre_session_binding",
+                    event=event,
+                    gateway=getattr(self, "gateway_runner", None),
+                )
+            )
+            if binding is not None:
+                event.source.session_binding = binding
+        except Exception as exc:
+            logger.warning("[%s] Session binding resolution failed: %s", self.name, exc)
 
     async def handle_message(self, event: MessageEvent) -> None:
         """

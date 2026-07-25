@@ -29,7 +29,8 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
 )
-from typing import Any, Dict, List, Optional
+_STDLIB_THREAD_POOL_EXECUTOR = ThreadPoolExecutor
+from typing import Any, Callable, Dict, List, Optional
 
 from toolsets import TOOLSETS
 
@@ -422,7 +423,70 @@ def _get_max_async_children() -> int:
     return _get_max_concurrent_children()
 
 
-def _get_child_timeout() -> Optional[float]:
+_CHILD_TIMEOUT_UNSET = object()
+
+
+def _coerce_child_timeout(raw: Any, *, label: str) -> Any:
+    if raw is None:
+        return _CHILD_TIMEOUT_UNSET
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("%s=%r is not a valid number; ignoring", label, raw)
+        return _CHILD_TIMEOUT_UNSET
+    return None if parsed <= 0 else max(30.0, parsed)
+
+
+def _route_label(route: Dict[str, Any]) -> str:
+    return f"{route.get('provider') or 'unknown'}/{route.get('model') or 'unknown'}"
+
+
+def _child_timeout_attempt_routes(child: Any) -> List[Dict[str, Any]]:
+    current = {
+        "provider": getattr(child, "provider", None),
+        "model": getattr(child, "model", None),
+        "base_url": getattr(child, "base_url", None),
+        "api_mode": getattr(child, "api_mode", None),
+    }
+    routes = [current]
+    seen = {(
+        str(current["provider"] or "").lower(),
+        str(current["model"] or ""),
+        str(current["base_url"] or "").rstrip("/").lower(),
+    )}
+    for raw in getattr(child, "_fallback_chain", None) or []:
+        if not isinstance(raw, dict):
+            continue
+        route = {
+            "provider": str(raw.get("provider") or "").strip(),
+            "model": str(raw.get("model") or "").strip(),
+            "base_url": str(raw.get("base_url") or "").strip(),
+            "api_key": str(raw.get("api_key") or "").strip(),
+            "api_mode": str(raw.get("api_mode") or "").strip(),
+            "key_env": str(raw.get("key_env") or raw.get("api_key_env") or "").strip(),
+        }
+        identity = (
+            route["provider"].lower(), route["model"], route["base_url"].rstrip("/").lower()
+        )
+        if route["provider"] and route["model"] and identity not in seen:
+            routes.append(route)
+            seen.add(identity)
+    return routes
+
+
+def _delegation_cfg_for_timeout_fallback(base_cfg: Optional[dict], route: Dict[str, Any]) -> dict:
+    routing = {"provider", "model", "base_url", "api_key", "api_mode"}
+    cfg = {k: v for k, v in (base_cfg or {}).items() if k not in routing}
+    cfg.update({"provider": route.get("provider"), "model": route.get("model")})
+    for key in ("base_url", "api_key", "api_mode"):
+        if route.get(key):
+            cfg[key] = route[key]
+    if not cfg.get("api_key") and route.get("key_env"):
+        cfg["api_key"] = os.getenv(str(route["key_env"]), "").strip()
+    return cfg
+
+
+def _get_child_timeout(cfg: Optional[dict] = None) -> Optional[float]:
     """Read delegation.child_timeout_seconds from config.
 
     Returns the number of seconds a single child agent is allowed to run
@@ -440,7 +504,23 @@ def _get_child_timeout() -> Optional[float]:
     Set ``delegation.child_timeout_seconds`` to a positive number to opt back
     in to a hard cap (floor 30 s); ``0`` or a negative value means disabled.
     """
-    cfg = _load_config()
+    cfg = cfg if cfg is not None else _load_config()
+    cfg = cfg or {}
+    profile_name = _normalize_profile_name(cfg.get("_profile"))
+    if cfg.get("_profile_child_timeout_overridden"):
+        parsed = _coerce_child_timeout(
+            cfg.get("child_timeout_seconds"),
+            label=f"delegation.profiles.{profile_name}.child_timeout_seconds",
+        )
+        if parsed is not _CHILD_TIMEOUT_UNSET:
+            return parsed
+        parsed = _coerce_child_timeout(
+            cfg.get("_global_child_timeout_seconds"),
+            label="delegation.child_timeout_seconds",
+        )
+        if parsed is not _CHILD_TIMEOUT_UNSET:
+            return parsed
+        return DEFAULT_CHILD_TIMEOUT
     val = cfg.get("child_timeout_seconds")
     if val is not None:
         try:
@@ -520,10 +600,188 @@ def _get_orchestrator_enabled() -> bool:
     return True
 
 
-def _get_inherit_mcp_toolsets() -> bool:
+def _get_inherit_mcp_toolsets(cfg: Optional[dict] = None) -> bool:
     """Whether narrowed child toolsets should keep the parent's MCP toolsets."""
-    cfg = _load_config()
-    return is_truthy_value(cfg.get("inherit_mcp_toolsets"), default=True)
+    if cfg is None:
+        cfg = _load_config()
+    return is_truthy_value(cfg.get("inherit_mcp_toolsets"), default=False)
+
+
+def _normalize_profile_name(profile: Optional[str]) -> Optional[str]:
+    name = str(profile or "").strip()
+    return name or None
+
+
+DUAL_REVIEW_PROFILE = "dual-review"
+DUAL_REVIEWER_PROFILES = ("reviewer-codex", "reviewer-opus")
+DUAL_PLAN_PROFILE = "dual-plan"
+DUAL_PLANNER_PROFILES = ("planner-codex", "planner-opus")
+
+
+def _profile_roster(cfg: Optional[dict], key: str, fallback: tuple[str, ...]) -> tuple[str, ...]:
+    cfg = _load_config() if cfg is None else (cfg or {})
+    raw = cfg.get(key)
+    if not isinstance(raw, (list, tuple)) or not raw:
+        return fallback
+    profiles = cfg.get("profiles")
+    known = set(profiles) if isinstance(profiles, dict) else None
+    out: List[str] = []
+    for item in raw:
+        name = _normalize_profile_name(item if isinstance(item, str) else None)
+        if not name or name in out:
+            continue
+        if known is not None and name not in known:
+            logger.warning("delegation.%s names unknown profile %r; skipping it", key, name)
+            continue
+        out.append(name)
+    return tuple(out) if len(out) >= 2 else fallback
+
+
+def _get_dual_reviewer_profiles(cfg: Optional[dict] = None) -> tuple[str, ...]:
+    return _profile_roster(cfg, "dual_review_profiles", DUAL_REVIEWER_PROFILES)
+
+
+def _get_dual_planner_profiles(cfg: Optional[dict] = None) -> tuple[str, ...]:
+    return _profile_roster(cfg, "dual_plan_profiles", DUAL_PLANNER_PROFILES)
+
+
+def _is_dual_review_profile(profile: Optional[str]) -> bool:
+    return _normalize_profile_name(profile) == DUAL_REVIEW_PROFILE
+
+
+def _is_dual_plan_profile(profile: Optional[str]) -> bool:
+    return _normalize_profile_name(profile) == DUAL_PLAN_PROFILE
+
+
+def _is_single_reviewer_profile(profile: Optional[str]) -> bool:
+    return _normalize_profile_name(profile) in frozenset(_get_dual_reviewer_profiles())
+
+
+def _requires_dual_review(cfg: Optional[dict]) -> bool:
+    return is_truthy_value((cfg or {}).get("require_dual_review"), default=False)
+
+
+def _task_with_lane_context(task: Dict[str, Any], profile: str, family: str) -> Dict[str, Any]:
+    cloned = dict(task)
+    cloned["profile"] = profile
+    marker = (
+        f"{family.upper()} LANE:\n"
+        f"- This task was expanded from profile='{family}'.\n"
+        f"- Your assigned {'reviewer' if family == DUAL_REVIEW_PROFILE else 'planner'} lane is `{profile}`.\n"
+        "- If the task lists model-specific output paths, write only the path for your assigned lane.\n"
+        "- Do not write a shared artifact path unless the task explicitly says a shared write is safe."
+    )
+    context = cloned.get("context")
+    cloned["context"] = f"{context.rstrip()}\n\n{marker}" if isinstance(context, str) and context.strip() else marker
+    return cloned
+
+
+def _expand_reserved_profile_task_items(
+    task_list: List[Dict[str, Any]], top_profile: Optional[str]
+) -> List[Dict[str, Any]]:
+    expanded: List[Dict[str, Any]] = []
+    for source_index, task in enumerate(task_list):
+        profile = _normalize_profile_name(
+            task.get("profile") or top_profile if isinstance(task, dict) else top_profile
+        )
+        if isinstance(task, dict) and _is_dual_review_profile(profile):
+            lanes = [(p, True, False) for p in _get_dual_reviewer_profiles()]
+        elif isinstance(task, dict) and _is_dual_plan_profile(profile):
+            lanes = [(p, False, True) for p in _get_dual_planner_profiles()]
+        else:
+            lanes = [(None, False, False)]
+        for lane, from_review, from_plan in lanes:
+            family = DUAL_REVIEW_PROFILE if from_review else DUAL_PLAN_PROFILE
+            expanded.append({
+                "task": _task_with_lane_context(task, lane, family) if lane else task,
+                "from_dual_review": from_review,
+                "from_dual_plan": from_plan,
+                "source_index": source_index,
+                "dual_review_profile": DUAL_REVIEW_PROFILE if from_review else None,
+                "dual_plan_profile": DUAL_PLAN_PROFILE if from_plan else None,
+            })
+    return expanded
+
+
+_expand_dual_review_task_items = _expand_reserved_profile_task_items
+
+
+def _dispatched_profile(top_profile: Optional[str], items: List[Dict[str, Any]]) -> Optional[str]:
+    if _normalize_profile_name(top_profile):
+        return _normalize_profile_name(top_profile)
+    profiles = []
+    for item in items:
+        task = item.get("task") or {}
+        profiles.append(item.get("dual_review_profile") or item.get("dual_plan_profile") or task.get("profile"))
+    return profiles[0] if profiles and profiles[0] and all(p == profiles[0] for p in profiles) else None
+
+
+def _single_reviewer_profile_error(profile_name: str) -> str:
+    lanes = ", ".join(_get_dual_reviewer_profiles())
+    return (
+        f"Direct reviewer profile '{profile_name}' is disabled because delegation.require_dual_review=true. "
+        f"Use profile='dual-review' so all reviewer lanes ({lanes}) run, then aggregate their findings."
+    )
+
+
+def _merge_delegation_profile(cfg: dict, profile: Optional[str]) -> dict:
+    profile_name = _normalize_profile_name(profile)
+    base = {k: v for k, v in (cfg or {}).items() if k != "profiles"}
+    if not profile_name:
+        return base
+    profiles = (cfg or {}).get("profiles") or {}
+    if not isinstance(profiles, dict) or profile_name not in profiles:
+        known = sorted(str(k) for k in profiles) if isinstance(profiles, dict) else []
+        suffix = f" Known profiles: {', '.join(known)}." if known else " No profiles configured."
+        raise ValueError(f"Unknown delegation profile '{profile_name}'.{suffix}")
+    profile_cfg = profiles[profile_name]
+    if not isinstance(profile_cfg, dict):
+        raise ValueError(f"Delegation profile '{profile_name}' must be a mapping.")
+    merged = dict(base)
+    merged.update({k: v for k, v in profile_cfg.items() if v is not None})
+    merged["_profile"] = profile_name
+    merged["_profile_child_timeout_overridden"] = (
+        "child_timeout_seconds" in profile_cfg and profile_cfg.get("child_timeout_seconds") is not None
+    )
+    merged["_global_child_timeout_seconds"] = base.get("child_timeout_seconds")
+    return merged
+
+
+def _profile_toolsets(cfg: dict) -> Optional[List[str]]:
+    value = (cfg or {}).get("toolsets")
+    return [str(v) for v in value if str(v or "").strip()] if isinstance(value, list) else None
+
+
+def _profile_max_iterations(cfg: dict, default: int) -> int:
+    try:
+        return max(1, int((cfg or {}).get("max_iterations", default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_service_tier_config(raw: Any) -> Optional[str]:
+    value = str(raw or "").strip().lower()
+    if not value or value in {"normal", "default", "standard", "off", "none"}:
+        return None
+    if value in {"fast", "priority", "on"}:
+        return "priority"
+    logger.warning("Unknown delegation service_tier '%s', ignoring", raw)
+    return None
+
+
+def _request_overrides_for_child(model: Optional[str], cfg: dict, parent_agent) -> tuple[Optional[str], Dict[str, Any]]:
+    raw = (cfg or {}).get("service_tier")
+    if raw in (None, ""):
+        raw = getattr(parent_agent, "service_tier", None)
+    tier = _parse_service_tier_config(raw)
+    overrides = dict((cfg or {}).get("request_overrides") or {})
+    if tier:
+        try:
+            from hermes_cli.models import resolve_fast_mode_overrides
+            overrides.update(resolve_fast_mode_overrides(model) or {})
+        except Exception:
+            pass
+    return tier, overrides
 
 
 def _is_mcp_toolset_name(name: str) -> bool:
@@ -539,6 +797,19 @@ def _is_mcp_toolset_name(name: str) -> bool:
     except Exception:
         target = None
     return bool(target and str(target).startswith("mcp-"))
+
+
+def _resolve_child_toolset_name(name: str, available_toolsets: set[str]) -> Optional[str]:
+    if name in available_toolsets:
+        return name
+    try:
+        from tools.registry import registry
+        target = registry.get_toolset_alias_target(str(name))
+    except Exception:
+        target = None
+    if target and str(target).startswith("mcp-") and str(target) in available_toolsets:
+        return str(target)
+    return None
 
 
 def _expand_parent_toolsets(parent_toolsets: set) -> set:
@@ -697,6 +968,11 @@ def _build_child_system_prompt(
         "- Any issues encountered\n\n"
         "Important workspace rule: Never assume a repository lives at /workspace/... or any other container-style path unless the task/context explicitly gives that path. "
         "If no exact local path is provided, discover it first before issuing git/workdir-specific commands.\n\n"
+        "FINAL REPORT PROVENANCE REQUIREMENT: Your summary is consumed by the parent agent with no "
+        "human watching. In your final report, tag each external-state claim with '[verified: <how>]' when checked or "
+        "'[unverified]' when inferred. Never fake a '[verified: ...]' tag.\n\n"
+        "Receipt: if you run commands, write or patch files, or are an orchestrator, END your summary "
+        "with ONE fenced ```receipt block containing pure JSON per the agent-receipt schema. Record tests run, not the tool trace.\n\n"
         "Keep your final summary tight: lead with outcomes, prefer bullet "
         "points over paragraphs, and don't replay your whole process. Your "
         "response is returned to the parent agent as a summary, and overlong "
@@ -887,6 +1163,11 @@ def _build_child_progress_callback(
         # event lets UIs open/inspect the subagent's session directly.
         if session_ref and session_ref.get("session_id"):
             kw["child_session_id"] = str(session_ref["session_id"])
+        if session_ref:
+            if session_ref.get("context_available"):
+                kw["context_available"] = True
+            if session_ref.get("context_child_session_id"):
+                kw["context_child_session_id"] = str(session_ref["context_child_session_id"])
         kw["tool_count"] = _tool_count[0]
         return kw
 
@@ -917,6 +1198,10 @@ def _build_child_progress_callback(
                 except Exception as e:
                     logger.debug("Spinner print_above failed: %s", e)
             _relay("subagent.start", preview=preview or goal_label or "", **kwargs)
+            return
+
+        if event_type == "subagent.spawn_requested":
+            _relay("subagent.spawn_requested", preview=preview or goal_label or "", **kwargs)
             return
 
         if event_type == "subagent.complete":
@@ -1086,6 +1371,7 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    delegation_cfg: Optional[dict] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1119,22 +1405,29 @@ def _build_child_agent(
     parent_subagent_id = getattr(parent_agent, "_subagent_id", None)
     tui_depth = max(0, child_depth - 1)  # 0 = first-level child for the UI
 
-    delegation_cfg = _load_config()
+    delegation_cfg = delegation_cfg or _load_config()
 
     # When no explicit toolsets given, inherit from parent's enabled toolsets
     # so disabled tools (e.g. web) don't leak to subagents.
     # Note: enabled_toolsets=None means "all tools enabled" (the default),
     # so we must derive effective toolsets from the parent's loaded tools.
-    parent_enabled = getattr(parent_agent, "enabled_toolsets", None)
+    parent_enabled_raw = getattr(parent_agent, "enabled_toolsets", None)
+    parent_enabled = (
+        parent_enabled_raw
+        if isinstance(parent_enabled_raw, (list, tuple, set, frozenset))
+        else None
+    )
     if parent_enabled is not None:
         parent_toolsets = set(parent_enabled)
-    elif parent_agent and hasattr(parent_agent, "valid_tool_names"):
+    elif parent_agent and isinstance(
+        getattr(parent_agent, "valid_tool_names", None), (list, tuple, set, frozenset)
+    ):
         # enabled_toolsets is None (all tools) — derive from loaded tool names
         import model_tools
 
         parent_toolsets = {
             ts
-            for name in parent_agent.valid_tool_names
+            for name in getattr(parent_agent, "valid_tool_names", [])
             if (ts := model_tools.get_toolset_for_tool(name)) is not None
         }
     else:
@@ -1145,14 +1438,18 @@ def _build_child_agent(
         # Expand composite toolsets (e.g. hermes-cli) so that individual
         # toolset names (e.g. web, terminal) are recognised during intersection.
         expanded_parent = _expand_parent_toolsets(parent_toolsets)
-        child_toolsets = [t for t in toolsets if t in expanded_parent]
-        if _get_inherit_mcp_toolsets():
+        child_toolsets = []
+        for name in toolsets:
+            resolved = _resolve_child_toolset_name(name, expanded_parent)
+            if resolved is not None:
+                child_toolsets.append(resolved)
+        if _get_inherit_mcp_toolsets(delegation_cfg):
             child_toolsets = _preserve_parent_mcp_toolsets(
                 child_toolsets, parent_toolsets
             )
         child_toolsets = _strip_blocked_tools(child_toolsets)
     elif parent_agent and parent_enabled is not None:
-        child_toolsets = _strip_blocked_tools(parent_enabled)
+        child_toolsets = _strip_blocked_tools(list(parent_enabled))
     elif parent_toolsets:
         child_toolsets = _strip_blocked_tools(sorted(parent_toolsets))
     else:
@@ -1361,6 +1658,16 @@ def _build_child_agent(
     if isinstance(child_max_tokens, int):
         child_optional_kwargs["max_tokens"] = child_max_tokens
 
+    child_service_tier, profile_request_overrides = _request_overrides_for_child(
+        effective_model, delegation_cfg, parent_agent
+    )
+    child_request_overrides = (
+        dict(override_request_overrides or {})
+        if override_provider
+        else dict(getattr(parent_agent, "request_overrides", {}) or {})
+    )
+    child_request_overrides.update(profile_request_overrides)
+
     from agent.delegation_context import delegated_child_context
 
     with delegated_child_context():
@@ -1375,6 +1682,7 @@ def _build_child_agent(
             max_iterations=max_iterations,
 
             reasoning_config=child_reasoning,
+            service_tier=child_service_tier,
             prefill_messages=getattr(parent_agent, "prefill_messages", None),
             fallback_model=parent_fallback,
             enabled_toolsets=child_toolsets,
@@ -1395,11 +1703,7 @@ def _build_child_agent(
             provider_sort=child_provider_sort,
             provider_require_parameters=child_provider_require_parameters,
             provider_data_collection=child_provider_data_collection,
-            request_overrides=(
-                dict(override_request_overrides or {})
-                if override_provider
-                else dict(getattr(parent_agent, "request_overrides", {}) or {})
-            ),
+            request_overrides=child_request_overrides,
             openrouter_min_coding_score=child_openrouter_min_coding_score,
             tool_progress_callback=child_progress_cb,
             iteration_budget=None,  # fresh budget per subagent
@@ -1409,6 +1713,48 @@ def _build_child_agent(
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
+    if not isinstance(child_session_ref["session_id"], str):
+        child_session_ref["session_id"] = ""
+    child._delegate_progress_ref = child_session_ref
+    context_parent_sid = getattr(parent_agent, "session_id", None)
+    if not isinstance(context_parent_sid, str):
+        context_parent_sid = None
+    try:
+        from agent.subagent_context_artifacts import create_subagent_context_artifact_pointer
+
+        child_session_id = child_session_ref["session_id"]
+        if not child_session_id:
+            raise ValueError("child session id unavailable")
+        pointer = create_subagent_context_artifact_pointer(
+            child_session_id=child_session_id,
+            parent_session_id=context_parent_sid,
+            subagent_id=subagent_id,
+            role=effective_role,
+            profile=(delegation_cfg or {}).get("_profile"),
+            model=effective_model,
+            provider=effective_provider,
+            api_mode=effective_api_mode,
+            base_url=effective_base_url,
+            toolsets=child_toolsets,
+            session_db=getattr(parent_agent, "_session_db", None),
+        )
+        child._subagent_context_ref = {
+            "child_session_id": child_session_id,
+            "parent_session_id": context_parent_sid,
+            "subagent_id": subagent_id,
+            "role": effective_role,
+            "profile": (delegation_cfg or {}).get("_profile"),
+            "model": effective_model,
+            "provider": effective_provider,
+            "api_mode": effective_api_mode,
+            "base_url": effective_base_url,
+            "toolsets": list(child_toolsets),
+            "latest_artifact_path": pointer.get("latest_artifact_path"),
+        }
+        child_session_ref["context_available"] = True
+        child_session_ref["context_child_session_id"] = child_session_id
+    except Exception:
+        logger.debug("subagent context artifact pointer creation failed", exc_info=True)
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = child_depth
     # Stash the post-degrade role for introspection (leaf if the
@@ -1427,6 +1773,16 @@ def _build_child_agent(
     parent_sid = getattr(parent_agent, "session_id", None)
     if parent_sid and getattr(child, "_session_init_model_config", None) is not None:
         child._session_init_model_config["_delegate_from"] = parent_sid
+        try:
+            from tools.tier_labels import derive_tier
+
+            profile_name = (delegation_cfg or {}).get("_profile")
+            child._session_init_model_config["_profile"] = profile_name
+            child._session_init_model_config["_tier"] = derive_tier(
+                profile_name, delegation_cfg or {}
+            )
+        except Exception:
+            logger.debug("tier-label telemetry stamp failed", exc_info=True)
 
     # Share a credential pool with the child when possible so subagents can
     # rotate credentials on rate limits instead of getting pinned to one key.
@@ -1796,7 +2152,119 @@ def _run_single_child(
     goal: str,
     child=None,
     parent_agent=None,
+    *,
+    child_timeout: Any = _CHILD_TIMEOUT_UNSET,
+    child_builder: Optional[Callable[[Dict[str, Any]], Any]] = None,
+    delegation_cfg: Optional[dict] = None,
     **_kwargs,
+) -> Dict[str, Any]:
+    """Run a child, advancing its configured route only after a wall-clock timeout."""
+    if child_builder is None:
+        child_builder = getattr(child, "_delegate_timeout_builder", None)
+    if child_timeout is _CHILD_TIMEOUT_UNSET:
+        # Preserve the historical zero-argument call shape when no per-run
+        # delegation config was supplied. Besides compatibility with plugins
+        # and test patches, this still lets configured/profile runs pass their
+        # merged delegation mapping explicitly.
+        timeout = (
+            _get_child_timeout()
+            if delegation_cfg is None
+            else _get_child_timeout(delegation_cfg)
+        )
+    else:
+        timeout = child_timeout
+    routes = _child_timeout_attempt_routes(child)
+    if child_builder is None or timeout is None:
+        routes = routes[:1]
+    budget = float(timeout) * len(routes) if timeout is not None else None
+    deadline = time.monotonic() + budget if budget is not None else None
+    started = time.monotonic()
+    current = child
+    tried: List[str] = []
+    last: Optional[Dict[str, Any]] = None
+
+    for index, route in enumerate(routes):
+        label = _route_label(route)
+        tried.append(label)
+        attempt_timeout = timeout
+        if deadline is not None and timeout is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            attempt_timeout = min(float(timeout), remaining)
+        result = _run_single_child_attempt(
+            task_index, goal, current, parent_agent, child_timeout=attempt_timeout
+        )
+        result["providers_tried"] = list(tried)
+        result["attempt_count"] = len(tried)
+        if budget is not None:
+            result["timeout_budget_seconds"] = round(budget, 2)
+        if result.get("status") != "timeout":
+            if len(tried) > 1:
+                result["duration_seconds"] = round(time.monotonic() - started, 2)
+            return result
+        last = result
+        if index >= len(routes) - 1:
+            break
+        next_route = routes[index + 1]
+        next_label = _route_label(next_route)
+        logger.warning(
+            "Subagent %d timed out on %s after %.1fs - failing over to %s (attempt %d/%d)",
+            task_index, label, float(result.get("duration_seconds") or 0),
+            next_label, index + 2, len(routes),
+        )
+        callback = getattr(current, "tool_progress_callback", None)
+        if callback:
+            try:
+                callback(
+                    "subagent.failover",
+                    preview=f"Timed out on {label}; failing over to {next_label} (attempt {index + 2}/{len(routes)})",
+                    status="timeout",
+                    from_provider=route.get("provider"), from_model=route.get("model"),
+                    to_provider=next_route.get("provider"), to_model=next_route.get("model"),
+                    attempt=index + 2, total_attempts=len(routes), providers_tried=list(tried),
+                )
+            except Exception:
+                logger.debug("Progress callback failover relay failed", exc_info=True)
+        try:
+            assert child_builder is not None
+            current = child_builder(next_route)
+        except Exception as exc:
+            return {
+                "task_index": task_index, "status": "error", "summary": None,
+                "error": f"Subagent timed out on {label}, then failed to build fallback child {next_label}: {exc}",
+                "exit_reason": "error", "api_calls": int(result.get("api_calls") or 0),
+                "duration_seconds": round(time.monotonic() - started, 2),
+                "providers_tried": list(tried), "attempt_count": len(tried),
+            }
+
+    if last is not None:
+        attempts = len(tried)
+        last["error"] = (
+            f"{last.get('error') or 'Subagent timed out.'} Timed out on {', '.join(tried)} "
+            f"({attempts} {'attempt' if attempts == 1 else 'attempts'})."
+        )
+        last["providers_tried"] = list(tried)
+        last["attempt_count"] = attempts
+        if budget is not None:
+            last["timeout_budget_seconds"] = round(budget, 2)
+        last["duration_seconds"] = round(time.monotonic() - started, 2)
+        return last
+    return {
+        "task_index": task_index, "status": "error", "summary": None,
+        "error": "Subagent did not run.", "exit_reason": "error", "api_calls": 0,
+        "duration_seconds": round(time.monotonic() - started, 2),
+        "providers_tried": list(tried), "attempt_count": len(tried),
+    }
+
+
+def _run_single_child_attempt(
+    task_index: int,
+    goal: str,
+    child=None,
+    parent_agent=None,
+    *,
+    child_timeout: Optional[float],
 ) -> Dict[str, Any]:
     """
     Run a pre-built child agent. Called from within a thread.
@@ -1971,15 +2439,20 @@ def _run_single_child(
             list(file_state.known_reads(parent_task_id)) if parent_task_id else []
         )
 
-        # Run child with an optional hard timeout (off by default —
-        # result(timeout=None) blocks until the child finishes). Stuck-child
-        # protection comes from the heartbeat staleness monitor instead.
-        child_timeout = _get_child_timeout()
+        # Run child with the timeout resolved by the outer route-attempt wrapper.
+        # ``None`` blocks until completion; a positive value caps this attempt.
         # Daemon worker (tools.daemon_pool): a timed-out child is abandoned
         # below; a stdlib non-daemon worker would then block interpreter
         # exit at atexit-join time if the child never unwinds.
         from tools.daemon_pool import DaemonThreadPoolExecutor
-        _timeout_executor = DaemonThreadPoolExecutor(
+        # Keep production timeout workers daemonized. Tests and embedders may
+        # deliberately replace the module-level executor as an injection seam.
+        executor_cls = (
+            ThreadPoolExecutor
+            if ThreadPoolExecutor is not _STDLIB_THREAD_POOL_EXECUTOR
+            else DaemonThreadPoolExecutor
+        )
+        _timeout_executor = executor_cls(
             max_workers=1,
             # Install a non-interactive approval callback in the worker thread
             # so dangerous-command prompts from the subagent don't fall back to
@@ -2436,6 +2909,7 @@ def delegate_task(
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
     background: Optional[bool] = None,
+    profile: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -2464,8 +2938,9 @@ def delegate_task(
             "(`p` in /agents) or the `delegation.pause` RPC before retrying."
         )
 
-    # Normalise the top-level role once; per-task overrides re-normalise.
+    # Normalise top-level routing once; per-task values override it.
     top_role = _normalize_role(role)
+    top_profile = _normalize_profile_name(profile)
 
     # Background (async) delegation now applies to BOTH single tasks and
     # batches. A batch is dispatched as ONE async unit: the whole fan-out runs
@@ -2495,7 +2970,7 @@ def delegate_task(
 
     # Load config
     cfg = _load_config()
-    default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
+    default_max_iter = _profile_max_iterations(cfg, DEFAULT_MAX_ITERATIONS)
     # Model-supplied max_iterations is ignored — the config value is authoritative
     # so users get predictable budgets. The kwarg is retained for internal callers
     # and tests; a model-emitted value here would only shrink the budget and
@@ -2507,17 +2982,6 @@ def delegate_task(
             "using delegation.max_iterations=%s from config",
             max_iterations, default_max_iter,
         )
-    effective_max_iter = default_max_iter
-
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
@@ -2528,24 +2992,21 @@ def delegate_task(
         tasks = recovered_tasks
 
     if tasks and isinstance(tasks, list):
-        if len(tasks) > max_children:
-            return tool_error(
-                f"Too many tasks: {len(tasks)} provided, but "
-                f"max_concurrent_children is {max_children}. "
-                f"Either reduce the task count, split into multiple "
-                f"delegate_task calls, or increase "
-                f"delegation.max_concurrent_children in config.yaml."
-            )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [{"goal": goal, "context": context, "role": top_role}]
+        task_list = [{
+            "goal": goal,
+            "context": context,
+            "role": top_role,
+            "profile": top_profile,
+        }]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
 
     if not task_list:
         return tool_error("No tasks provided.")
 
-    # Validate each task has a goal
+    # Validate source tasks before profile fan-out.
     for i, task in enumerate(task_list):
         if not isinstance(task, dict):
             return tool_error(
@@ -2553,6 +3014,39 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+
+    expanded_task_items = _expand_reserved_profile_task_items(task_list, top_profile)
+    task_list = [item["task"] for item in expanded_task_items]
+    if len(task_list) > max_children:
+        return tool_error(
+            f"Too many tasks: {len(task_list)} provided, but max_concurrent_children is {max_children}. "
+            "Either reduce the task count, split into multiple delegate_task calls, or increase "
+            "delegation.max_concurrent_children in config.yaml."
+        )
+
+    task_specs: List[Dict[str, Any]] = []
+    for item in expanded_task_items:
+        task = item["task"]
+        task_profile = _normalize_profile_name(task.get("profile") or top_profile)
+        if (
+            _requires_dual_review(cfg)
+            and _is_single_reviewer_profile(task_profile)
+            and not item["from_dual_review"]
+        ):
+            return tool_error(_single_reviewer_profile_error(task_profile or ""))
+        try:
+            task_cfg = _merge_delegation_profile(cfg, task_profile)
+            task_creds = _resolve_delegation_credentials(task_cfg, parent_agent)
+        except ValueError as exc:
+            return tool_error(str(exc))
+        task_specs.append({
+            "profile": task_profile,
+            "cfg": task_cfg,
+            "creds": task_creds,
+            "toolsets": _profile_toolsets(task_cfg),
+            "max_iterations": _profile_max_iterations(task_cfg, default_max_iter),
+            "role": _normalize_role(task.get("role") or top_role),
+        })
 
     overall_start = time.monotonic()
     results = []
@@ -2601,18 +3095,16 @@ def delegate_task(
     children = []
     try:
         for i, t in enumerate(task_list):
-            # Per-task role beats top-level; normalise again so unknown
-            # per-task values warn and degrade to leaf uniformly.
-            effective_role = _normalize_role(t.get("role") or top_role)
+            spec = task_specs[i]
+            creds = spec["creds"]
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
                 context=t.get("context"),
-                # Subagents always inherit the parent's toolsets; the model
-                # cannot choose or narrow them (no model-facing toolsets arg).
-                toolsets=None,
+                # Toolsets remain operator-controlled through the profile.
+                toolsets=spec["toolsets"],
                 model=creds["model"],
-                max_iterations=effective_max_iter,
+                max_iterations=spec["max_iterations"],
                 task_count=n_tasks,
                 parent_agent=parent_agent,
                 override_provider=creds["provider"],
@@ -2623,8 +3115,33 @@ def delegate_task(
                 override_max_tokens=creds.get("max_output_tokens"),
                 override_acp_command=creds.get("command"),
                 override_acp_args=creds.get("args"),
-                role=effective_role,
+                role=spec["role"],
+                delegation_cfg=spec["cfg"],
             )
+            def _timeout_builder(route, *, _i=i, _t=t, _spec=spec):
+                fallback_cfg = _delegation_cfg_for_timeout_fallback(_spec["cfg"], route)
+                fallback_creds = _resolve_delegation_credentials(fallback_cfg, parent_agent)
+                return _build_child_agent(
+                    task_index=_i,
+                    goal=_t["goal"],
+                    context=_t.get("context"),
+                    toolsets=_spec["toolsets"],
+                    model=fallback_creds["model"],
+                    max_iterations=_spec["max_iterations"],
+                    task_count=n_tasks,
+                    parent_agent=parent_agent,
+                    override_provider=fallback_creds["provider"],
+                    override_base_url=fallback_creds["base_url"],
+                    override_api_key=fallback_creds["api_key"],
+                    override_api_mode=fallback_creds["api_mode"],
+                    override_request_overrides=fallback_creds.get("request_overrides"),
+                    override_max_tokens=fallback_creds.get("max_output_tokens"),
+                    override_acp_command=fallback_creds.get("command"),
+                    override_acp_args=fallback_creds.get("args"),
+                    role=_spec["role"],
+                    delegation_cfg=fallback_cfg,
+                )
+            child._delegate_timeout_builder = _timeout_builder
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
             # Tee the child's progress events into its live transcript log.
@@ -2656,7 +3173,13 @@ def delegate_task(
         if n_tasks == 1:
             # Single task -- run directly (no thread pool overhead)
             _i, _t, child = children[0]
-            result = _run_single_child(_i, _t["goal"], child, parent_agent)
+            result = _run_single_child(
+                _i,
+                _t["goal"],
+                child,
+                parent_agent,
+                delegation_cfg=task_specs[_i]["cfg"],
+            )
             results.append(result)
         else:
             # Batch -- run in parallel with per-task progress lines
@@ -2676,6 +3199,7 @@ def delegate_task(
                         goal=t["goal"],
                         child=child,
                         parent_agent=parent_agent,
+                        delegation_cfg=task_specs[i]["cfg"],
                     )
                     futures[future] = i
 
@@ -3046,7 +3570,7 @@ def delegate_task(
             # parent's toolsets (no model-facing toolsets arg).
             toolsets=None,
             role=top_role,
-            model=creds["model"],
+            model=task_specs[0]["creds"]["model"],
             session_key=_session_key,
             origin_ui_session_id=_origin_ui_session_id,
             origin_session_id=_wake_sid,
@@ -3371,6 +3895,36 @@ def _load_config() -> dict:
 # ---------------------------------------------------------------------------
 
 
+_COUNT_WORDS = {2: "two", 3: "three", 4: "four", 5: "five", 6: "six"}
+
+
+def _lane_phrase(lanes: tuple[str, ...]) -> tuple[str, str]:
+    if not lanes:
+        return "none", "zero"
+    count = _COUNT_WORDS.get(len(lanes), str(len(lanes)))
+    joined = ", ".join(lanes[:-1]) + f" + {lanes[-1]}" if len(lanes) > 1 else lanes[0]
+    return joined, count
+
+
+def _dual_review_lane_phrase() -> tuple[str, str]:
+    return _lane_phrase(_get_dual_reviewer_profiles())
+
+
+def _dual_plan_lane_phrase() -> tuple[str, str]:
+    return _lane_phrase(_get_dual_planner_profiles())
+
+
+def _build_profile_param_description() -> str:
+    review_lanes, review_count = _dual_review_lane_phrase()
+    plan_lanes, plan_count = _dual_plan_lane_phrase()
+    return (
+        "Optional operator-defined delegation profile from config.yaml delegation.profiles. "
+        f"dual-review expands to {review_lanes} and counts as {review_count} child tasks. "
+        f"dual-plan expands to {plan_lanes} and counts as {plan_count} child tasks. "
+        "Per-task profile overrides the top-level profile."
+    )
+
+
 def _build_top_level_description() -> str:
     """Compose the delegate_task tool description with current runtime limits.
 
@@ -3548,6 +4102,7 @@ def _build_dynamic_schema_overrides() -> dict:
     }
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
     overrides_params["properties"]["role"]["description"] = _build_role_param_description()
+    overrides_params["properties"]["profile"]["description"] = _build_profile_param_description()
 
     return {
         "description": _build_top_level_description(),
@@ -3589,6 +4144,10 @@ DELEGATE_TASK_SCHEMA = {
                     "specific you are, the better the subagent performs."
                 ),
             },
+            "profile": {
+                "type": "string",
+                "description": "(rebuilt at get_definitions() time)",
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -3598,6 +4157,10 @@ DELEGATE_TASK_SCHEMA = {
                         "context": {
                             "type": "string",
                             "description": "Task-specific context",
+                        },
+                        "profile": {
+                            "type": "string",
+                            "description": "Per-task delegation profile override, including dual-review or dual-plan.",
                         },
                         "role": {
                             "type": "string",
@@ -3689,6 +4252,7 @@ registry.register(
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),
+        profile=args.get("profile"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

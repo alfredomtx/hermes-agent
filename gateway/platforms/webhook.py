@@ -211,6 +211,11 @@ class WebhookAdapter(BasePlatformAdapter):
             script_timeout_seconds=self._script_timeout_seconds
         )
 
+        # Monotonic receipt counter. Stamped onto every event at INTAKE (before
+        # create_task) so deliveries that resolve to the same session binding
+        # can be drained in true arrival order regardless of task scheduling.
+        self._arrival_seq_counter: int = 0
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -833,6 +838,21 @@ class WebhookAdapter(BasePlatformAdapter):
             raw_message=payload,
             message_id=delivery_id,
         )
+
+        # Stamp a monotonic receipt sequence at INTAKE (before create_task) so
+        # that two deliveries resolving to the same session binding drain in
+        # true arrival order, not task-scheduling order.
+        self._arrival_seq_counter += 1
+        event.arrival_seq = self._arrival_seq_counter
+
+        # Resolve a SESSION BINDING synchronously, BEFORE create_task, via the
+        # pre_session_binding hook. This is the load-bearing ordering fix: the
+        # binding must be known before the event is scheduled so that two
+        # same-binding deliveries resolve to ONE session key and the existing
+        # _active_sessions guard serializes them FIFO (the second is queued
+        # behind the first instead of running concurrently). Plugins (e.g.
+        # gh-review-opener) own the gh-review-specific logic; core stays generic.
+        self._apply_session_binding(event)
 
         logger.info(
             "[webhook] %s event=%s route=%s prompt_len=%d delivery=%s",

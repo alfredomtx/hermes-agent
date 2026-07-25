@@ -566,6 +566,7 @@ class TestPreflightCompression:
         # displacing events[0]. The flag value is irrelevant to what this
         # test asserts, so disable it to suppress the probe.
         agent.compression_enabled = False
+        agent._last_compression_model_label = "test-compressor"
         events = []
         agent.status_callback = lambda ev, msg: events.append((ev, msg))
 
@@ -843,7 +844,30 @@ class TestPreflightCompression:
 
         assert events[0][0] == "lifecycle"
         assert "Compacting context" in events[0][1]
+        assert "🧠 test-compressor" in events[0][1]
         assert events[1] == ("compress", "started")
+        assert events[-1][0] == "lifecycle"
+        assert "Compacting context done with 🧠 test-compressor in" in events[-1][1]
+
+    def test_compaction_status_formatter_includes_elapsed_and_model(self):
+        from agent.conversation_compression import _format_compaction_status_message
+
+        running = _format_compaction_status_message(
+            "running",
+            model_label="claude-test",
+            elapsed_seconds=75,
+        )
+        done = _format_compaction_status_message(
+            "done",
+            model_label="claude-test",
+            elapsed_seconds=75,
+        )
+
+        assert running == (
+            "🗜️ Compacting context with 🧠 claude-test: "
+            "summarizing earlier conversation so I can continue... (1m 15s elapsed)"
+        )
+        assert done == "✅ Compacting context done with 🧠 claude-test in 1m 15s."
 
     def test_compress_context_abort_warning_is_never_suppressed(self, agent):
         """Failure warnings stay visible even when a quiet engine suppresses
@@ -1799,3 +1823,89 @@ class TestOverflowWithCompactionDisabled:
         mock_compress.assert_called_once()
         assert result["completed"] is True
         assert result.get("compaction_disabled") is not True
+
+
+def test_context_overflow_stops_after_nonshrinking_compression(agent, capsys):
+    """A same-count, larger compression result must not restart recovery.
+
+    A provider-reported lower context limit used to count as compression
+    progress even when the attempted pass returned an equal/larger request.
+    That re-entered the context-error loop with the same impossible payload.
+    """
+    err_400 = Exception(
+        "Error code: 400 - This endpoint's maximum context length is 128000 tokens. "
+        "However, you requested about 270460 tokens."
+    )
+    setattr(err_400, "status_code", 400)
+    agent.client.chat.completions.create.side_effect = err_400
+
+    prefill = [
+        {"role": "user", "content": "previous question"},
+        {"role": "assistant", "content": "previous answer"},
+    ]
+
+    def _non_shrinking_compression(messages, *_args, **_kwargs):
+        return (
+            [
+                {
+                    **message,
+                    "content": f"{message.get('content', '')} " + ("expanded " * 400),
+                }
+                for message in messages
+            ],
+            "compressed prompt",
+        )
+
+    with (
+        patch.object(agent, "_compress_context", side_effect=_non_shrinking_compression) as mock_compress,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("hello", conversation_history=prefill)
+
+    mock_compress.assert_called_once()
+    assert result["failed"] is True
+    assert result["compression_exhausted"] is True
+    output = capsys.readouterr().out
+    assert "/new" in output
+    assert "/compress" not in output
+
+
+def test_context_overflow_retries_after_same_count_token_reduction(agent):
+    """A same-count compression with materially fewer request tokens retries."""
+    err_400 = Exception(
+        "Error code: 400 - This endpoint's maximum context length is 128000 tokens. "
+        "However, you requested about 270460 tokens."
+    )
+    setattr(err_400, "status_code", 400)
+    agent.client.chat.completions.create.side_effect = [
+        err_400,
+        _mock_response(content="Recovered after compression", finish_reason="stop"),
+    ]
+
+    prefill = [
+        {"role": "user", "content": "previous question " + ("detail " * 200)},
+        {"role": "assistant", "content": "previous answer " + ("detail " * 200)},
+    ]
+
+    def _shrinking_compression(messages, *_args, **_kwargs):
+        return (
+            [
+                {**message, "content": "summary"}
+                for message in messages
+            ],
+            "compressed prompt",
+        )
+
+    with (
+        patch.object(agent, "_compress_context", side_effect=_shrinking_compression) as mock_compress,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("hello", conversation_history=prefill)
+
+    mock_compress.assert_called_once()
+    assert result["completed"] is True
+    assert result["final_response"] == "Recovered after compression"
