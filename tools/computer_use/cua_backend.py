@@ -308,7 +308,12 @@ def _linux_x11_active_window_id() -> Optional[int]:
 
 def _is_real_app_window(w: Dict[str, Any]) -> bool:
     """Return False for desktop/shell helper windows that capture as empty."""
-    title = w.get("title", "")
+    # Linux/X11 helper rows often have no application name. Do not classify a
+    # real, named application as a shell helper merely because its title starts
+    # with a generic desktop/shell prefix.
+    if str(w.get("app_name", "")).strip():
+        return True
+    title = str(w.get("title", ""))
     return not any(
         title.startswith(p) or title.lower().startswith(p.lower())
         for p in _NON_APP_WINDOW_TITLE_PREFIXES
@@ -335,11 +340,11 @@ def _select_capture_target(
     """
     candidates = [w for w in windows if not w["off_screen"]]
     pool = candidates
-    if not exact_target and not app_requested and sys.platform == "linux":
+    if not exact_target and not app_requested:
         real_apps = [w for w in candidates if _is_real_app_window(w)]
         if real_apps:
             pool = real_apps
-        if pool and _z_index_uninformative(pool):
+        if sys.platform == "linux" and pool and _z_index_uninformative(pool):
             active_id = _linux_x11_active_window_id()
             if active_id is not None:
                 for w in pool:
