@@ -2754,6 +2754,22 @@ def load_pool(provider: str) -> CredentialPool:
         for payload in raw_entries
     )
     entries = [PooledCredential.from_dict(provider, payload) for payload in raw_entries]
+
+    # ``read_credential_pool`` may have returned rows from the global-root
+    # fallback when this profile has no local rows for the provider.  Keep that
+    # path strictly read-only: normalize the rows in memory, but do not seed
+    # ambient singleton credentials or persist a profile copy of the global
+    # pool.  Otherwise a profile load can turn an unrelated Claude Code
+    # keychain credential (or a legacy OAT normalization) into a new local
+    # auth.json, defeating the fallback's shadowing contract.
+    active_pool = _load_auth_store().get("credential_pool")
+    active_entries = active_pool.get(provider) if isinstance(active_pool, dict) else None
+    reading_global_fallback = bool(raw_entries) and not (
+        isinstance(active_entries, list) and active_entries
+    )
+    if reading_global_fallback:
+        return CredentialPool(provider, entries)
+
     raw_needs_auth_normalization = any(
         isinstance(payload, dict)
         and _normalize_pool_auth_type(
@@ -2763,13 +2779,6 @@ def load_pool(provider: str) -> CredentialPool:
         ) != payload.get("auth_type", AUTH_TYPE_API_KEY)
         for payload in raw_entries
     )
-    if raw_needs_auth_normalization:
-        # A profile may be reading this provider from the global-root fallback.
-        # Keep that fallback read-only: only the store that owns these rows may
-        # rewrite them. Loading the default/root profile will heal global rows.
-        active_pool = _load_auth_store().get("credential_pool")
-        active_entries = active_pool.get(provider) if isinstance(active_pool, dict) else None
-        raw_needs_auth_normalization = bool(active_entries)
 
     if provider.startswith(CUSTOM_POOL_PREFIX):
         # Custom endpoint pool — seed from custom_providers config and model config
