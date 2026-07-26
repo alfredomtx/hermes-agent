@@ -2004,28 +2004,6 @@ def run_conversation(
                             allow_stream=False,
                             is_github_responses=agent._is_copilot_url(),
                         )
-                    ref = getattr(agent, "_subagent_context_ref", None)
-                    if isinstance(ref, dict) and ref.get("child_session_id"):
-                        try:
-                            from agent.subagent_context_artifacts import (
-                                build_subagent_context_payload,
-                                update_subagent_context_artifact_capture,
-                            )
-
-                            payload = build_subagent_context_payload(
-                                ref=ref,
-                                canonical_messages=api_messages,
-                                provider_request=next_api_kwargs,
-                                api_call_count=api_call_count,
-                                retry_count=retry_count,
-                            )
-                            update_subagent_context_artifact_capture(
-                                str(ref["child_session_id"]),
-                                payload,
-                                session_db=getattr(agent, "_session_db", None),
-                            )
-                        except Exception:
-                            logger.debug("subagent context artifact capture failed", exc_info=True)
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
@@ -4481,7 +4459,11 @@ def run_conversation(
                     new_tokens = estimate_messages_tokens_rough(messages)
                     approx_tokens = new_tokens  # update for downstream logging
 
-                    if len(messages) < original_len or (new_tokens > 0 and new_tokens < original_tokens * 0.95) or (new_ctx and new_ctx < old_ctx):
+                    # A lower provider-reported context limit is not itself
+                    # compression progress. If the returned transcript is
+                    # equal/larger, stop after this first ineffective pass
+                    # instead of retrying the same overflow payload.
+                    if len(messages) < original_len or (new_tokens > 0 and new_tokens < original_tokens * 0.95):
                         if len(messages) < original_len:
                             agent._buffer_status(COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE.format(before=original_len, after=len(messages)))
                         elif new_tokens > 0 and new_tokens < original_tokens * 0.95:
@@ -4493,7 +4475,7 @@ def run_conversation(
                         # Can't compress further and already at minimum tier
                         agent._flush_status_buffer()
                         agent._vprint(f"{agent.log_prefix}❌ Context length exceeded and cannot compress further.", force=True)
-                        agent._vprint(f"{agent.log_prefix}   💡 The conversation has accumulated too much content. Try /new to start fresh, or /compress to manually trigger compression.", force=True)
+                        agent._vprint(f"{agent.log_prefix}   💡 The conversation has accumulated too much content. Try /new to start fresh.", force=True)
                         logger.error(f"{agent.log_prefix}Context length exceeded: {new_tokens:,} tokens. Cannot compress further.")
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Context length exceeded ({new_tokens:,} tokens). Cannot compress further."

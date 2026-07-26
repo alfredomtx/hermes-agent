@@ -1678,8 +1678,6 @@ def _container_systemd_operational() -> bool:
 def supports_systemd_services() -> bool:
     if not is_linux() or is_termux():
         return False
-    if shutil.which("systemctl") is None:
-        return False
     if is_wsl():
         return _wsl_systemd_operational()
     if is_container():

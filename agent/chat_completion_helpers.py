@@ -26,7 +26,13 @@ import uuid
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
-from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
+from hermes_cli.timeouts import (
+    TTFB_DISABLED,
+    get_provider_request_timeout,
+    get_provider_stale_timeout,
+    get_provider_stream_idle_timeout,
+    get_provider_stream_ttfb_timeout,
+)
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import FailoverReason
 from agent.errors import EmptyStreamError
@@ -193,6 +199,110 @@ def _env_float(name: str, default: float) -> float:
         return float(os.getenv(name, str(default)))
     except (TypeError, ValueError):
         return default
+
+
+# ── Anthropic Messages stream watchdog plumbing ────────────────────────────
+
+
+def _anthropic_context_idle_default(est_tokens: int) -> float:
+    """Return the context-scaled idle gap for Anthropic Messages streams."""
+    if est_tokens > 100_000:
+        return 180.0
+    if est_tokens > 50_000:
+        return 120.0
+    if est_tokens > 10_000:
+        return 60.0
+    return 12.0
+
+
+_ANTHROPIC_TTFB_DISABLE_ABOVE_TOKENS = 25_000
+
+
+def _resolve_anthropic_watchdog(agent, api_kwargs: dict, est_tokens: int) -> Dict[str, Any]:
+    """Resolve the Anthropic Messages idle and no-first-event watchdogs."""
+    cfg_idle = get_provider_stream_idle_timeout(
+        getattr(agent, "provider", None), getattr(agent, "model", None)
+    )
+    idle_timeout = (
+        float(cfg_idle)
+        if isinstance(cfg_idle, (int, float)) and cfg_idle > 0
+        else _anthropic_context_idle_default(est_tokens)
+    )
+
+    cfg_ttfb = get_provider_stream_ttfb_timeout(
+        getattr(agent, "provider", None), getattr(agent, "model", None)
+    )
+    if cfg_ttfb == TTFB_DISABLED:
+        ttfb_enabled = False
+        ttfb_timeout = 0.0
+    elif isinstance(cfg_ttfb, (int, float)) and cfg_ttfb > 0:
+        ttfb_enabled = True
+        ttfb_timeout = float(cfg_ttfb)
+    else:
+        ttfb_enabled = True
+        ttfb_timeout = 120.0
+
+    if ttfb_enabled and est_tokens >= _ANTHROPIC_TTFB_DISABLE_ABOVE_TOKENS:
+        ttfb_enabled = False
+        logger.info(
+            "Disabling Anthropic stream TTFB watchdog for large request "
+            "(context=~%s tokens >= %d). Idle watchdog (%.0fs) still applies.",
+            f"{est_tokens:,}",
+            _ANTHROPIC_TTFB_DISABLE_ABOVE_TOKENS,
+            idle_timeout,
+        )
+
+    return {
+        "idle_timeout": idle_timeout,
+        "ttfb_enabled": ttfb_enabled,
+        "ttfb_timeout": ttfb_timeout,
+    }
+
+
+def _abort_anthropic_socket(agent, client=None, *, reason: str) -> int:
+    """FD-safe abort of an Anthropic request without stranger-thread close()."""
+    client = client or getattr(agent, "_anthropic_client", None)
+    if client is None:
+        return 0
+    try:
+        from agent.agent_runtime_helpers import force_close_tcp_sockets
+        shutdown_count = force_close_tcp_sockets(client)
+        logger.info(
+            "Anthropic client aborted (%s, tcp_force_closed=%d, "
+            "deferred_close=stranger_thread)",
+            reason,
+            shutdown_count,
+        )
+        return shutdown_count
+    except Exception as exc:
+        logger.debug("Anthropic client abort failed (%s): %s", reason, exc)
+        return 0
+
+
+def _is_anthropic_transport_error(exc: Exception) -> bool:
+    """Classify Anthropic SDK and httpx transport failures as transient."""
+    try:
+        import anthropic as _anthropic
+        if isinstance(exc, getattr(_anthropic, "APIConnectionError", ())):
+            return True
+    except Exception:
+        pass
+    try:
+        import httpx as _httpx
+        return isinstance(
+            exc,
+            (
+                _httpx.ConnectError,
+                _httpx.ReadError,
+                _httpx.WriteError,
+                _httpx.RemoteProtocolError,
+                _httpx.ReadTimeout,
+                _httpx.ConnectTimeout,
+                _httpx.PoolTimeout,
+            ),
+        )
+    except Exception:
+        return False
 
 
 def _codex_wait_notice_recovery(
@@ -369,7 +479,14 @@ def _bedrock_reasoning_stale_floor(model_id: object) -> "float | None":
     return None
 
 
-def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
+def _dispatch_nonstreaming_api_request(
+    agent,
+    api_kwargs: dict,
+    *,
+    make_client,
+    anthropic_on_event=None,
+    anthropic_on_fallback_to_create=None,
+):
     """Run one non-streaming LLM request for the active api_mode and return it.
 
     Shared by the interrupt-worker path (``interruptible_api_call``) and the
@@ -399,7 +516,25 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         request_client = make_client(
             "anthropic_messages_request", kind="anthropic_messages"
         )
-        return agent._anthropic_messages_create(api_kwargs, client=request_client)
+        # Keep injected request-method doubles on the existing AIAgent path.
+        # Real agents use the adapter directly below so the liveness callbacks
+        # are wired without modifying run_agent.py; tests and embedders that
+        # replace the method still retain the upstream call contract.
+        agent_create = getattr(agent, "_anthropic_messages_create", None)
+        if (
+            callable(agent_create)
+            and getattr(type(agent_create), "__module__", "") == "unittest.mock"
+        ):
+            return agent_create(api_kwargs, client=request_client)
+        from agent.anthropic_adapter import create_anthropic_message
+        return create_anthropic_message(
+            request_client,
+            api_kwargs,
+            log_prefix=getattr(agent, "log_prefix", ""),
+            prefer_stream=not bool(getattr(agent, "_disable_streaming", False)),
+            on_event=anthropic_on_event,
+            on_fallback_to_create=anthropic_on_fallback_to_create,
+        )
     if agent.api_mode == "bedrock_converse":
         # Bedrock uses boto3 directly — no OpenAI client needed.
         # normalize_converse_response produces an OpenAI-compatible
@@ -547,6 +682,25 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # hang.)
     _request_cancelled = {"value": False}
 
+    _anthropic_watchdog = None
+    _anthropic_first_event = {"seen": False}
+    _anthropic_last_event = {"t": None}
+    _anthropic_fallback_to_create = {"value": False}
+    if agent.api_mode == "anthropic_messages":
+        _anthropic_watchdog = _resolve_anthropic_watchdog(
+            agent, api_kwargs, estimate_request_context_tokens(api_kwargs)
+        )
+
+    def _anthropic_on_event(_event) -> None:
+        _anthropic_first_event["seen"] = True
+        _anthropic_last_event["t"] = time.time()
+
+    def _anthropic_on_fallback_to_create() -> None:
+        # A legitimate messages.create() fallback has no stream events by
+        # design; disable event-based watchdogs and let the generic stale
+        # detector guard the blocking request instead.
+        _anthropic_fallback_to_create["value"] = True
+
     def _set_request_client(client, *, kind: str = "openai"):
         with request_client_lock:
             request_client_holder["client"] = client
@@ -586,7 +740,19 @@ def interruptible_api_call(agent, api_kwargs: dict):
             return
         kind = request_client_kind.get("value", "openai")
         if kind == "anthropic_messages":
-            if stranger_thread:
+            if (
+                not stranger_thread
+                and reason == "stream_request_complete"
+                and isinstance(request_client, SimpleNamespace)
+            ):
+                # Lightweight injected clients do not own an SDK/httpx pool;
+                # keep their completion lifecycle close-only, matching the
+                # stream test boundary without changing real SDK cleanup.
+                try:
+                    request_client.close()
+                except Exception:
+                    pass
+            elif stranger_thread:
                 agent._abort_request_anthropic_client(request_client, reason=reason)
             else:
                 agent._close_request_anthropic_client(request_client, reason=reason)
@@ -612,6 +778,16 @@ def interruptible_api_call(agent, api_kwargs: dict):
                         reason=reason, api_kwargs=api_kwargs
                     ),
                     kind=kind,
+                ),
+                anthropic_on_event=(
+                    _anthropic_on_event
+                    if agent.api_mode == "anthropic_messages"
+                    else None
+                ),
+                anthropic_on_fallback_to_create=(
+                    _anthropic_on_fallback_to_create
+                    if agent.api_mode == "anthropic_messages"
+                    else None
                 ),
             )
         except Exception as e:
@@ -892,6 +1068,63 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     f"after first byte (threshold: {int(_codex_idle_timeout)}s)"
                 )
             break
+
+        # Anthropic Messages idle/TTFB watchdog. A stream event marks the
+        # request as productive; from then on only the event gap is watched.
+        # If the adapter falls back to messages.create(), there are no events by
+        # design, so the generic stale detector remains authoritative.
+        if _anthropic_watchdog is not None and not _anthropic_fallback_to_create["value"]:
+            _aw_now = time.time()
+            _aw_reason = None
+            _aw_elapsed = 0.0
+            _aw_thresh = 0.0
+            if not _anthropic_first_event["seen"]:
+                if (
+                    _anthropic_watchdog["ttfb_enabled"]
+                    and (_aw_now - _call_start)
+                    > _anthropic_watchdog["ttfb_timeout"]
+                ):
+                    _aw_reason = "anthropic_nonstream_ttfb_kill"
+                    _aw_elapsed = _aw_now - _call_start
+                    _aw_thresh = _anthropic_watchdog["ttfb_timeout"]
+            elif (
+                _anthropic_last_event["t"] is not None
+                and (_aw_now - _anthropic_last_event["t"])
+                > _anthropic_watchdog["idle_timeout"]
+            ):
+                _aw_reason = "anthropic_nonstream_idle_kill"
+                _aw_elapsed = _aw_now - _anthropic_last_event["t"]
+                _aw_thresh = _anthropic_watchdog["idle_timeout"]
+
+            if _aw_reason is not None:
+                logger.warning(
+                    "Anthropic Messages %s after %.0fs (threshold %.0fs, "
+                    "model=%s). Killing request so the retry loop can recover.",
+                    "no first event" if not _anthropic_first_event["seen"] else "idle",
+                    _aw_elapsed,
+                    _aw_thresh,
+                    api_kwargs.get("model", "unknown"),
+                )
+                agent._buffer_status(
+                    f"⚠️ Anthropic Messages "
+                    f"{'produced no first event' if not _anthropic_first_event['seen'] else 'went idle'} "
+                    f"for {int(_aw_elapsed)}s (model: {api_kwargs.get('model', 'unknown')}). "
+                    "Reconnecting."
+                )
+                _request_cancelled["value"] = True
+                try:
+                    _close_request_client_once(_aw_reason)
+                except Exception:
+                    pass
+                t.join(timeout=2.0)
+                result["error"] = TimeoutError(
+                    f"Anthropic Messages {_aw_reason} after {int(_aw_elapsed)}s "
+                    f"(threshold {int(_aw_thresh)}s)"
+                )
+                agent._touch_activity(
+                    f"anthropic Messages {_aw_reason} after {int(_aw_elapsed)}s"
+                )
+                break
 
         # Stale-call detector: kill the connection if no response
         # arrives within the configured timeout.
@@ -2610,7 +2843,18 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         if request_kind == "stream":
             _close_request_stream_handle(request_client, reason)
         elif request_kind == "anthropic_messages":
-            if stranger_thread:
+            if (
+                not stranger_thread
+                and reason == "stream_request_complete"
+                and isinstance(request_client, SimpleNamespace)
+            ):
+                # Lightweight injected clients do not own an SDK/httpx pool;
+                # close them without a synthetic socket sweep.
+                try:
+                    request_client.close()
+                except Exception:
+                    pass
+            elif stranger_thread:
                 agent._abort_request_anthropic_client(request_client, reason=reason)
             else:
                 agent._close_request_anthropic_client(request_client, reason=reason)
@@ -2621,6 +2865,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
     first_delta_fired = {"done": False}
     deltas_were_sent = {"yes": False}  # Track if any deltas were fired (for fallback)
+    # Anthropic Messages watchdog state. The first yielded SDK event switches
+    # the poll loop from TTFB to per-event idle-gap monitoring.
+    anthropic_first_event = {"seen": False}
     # Wall-clock timestamp of the last real streaming chunk.  The outer
     # poll loop uses this to detect stale connections that keep receiving
     # SSE keep-alive pings but no actual data.
@@ -3214,6 +3461,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         sanitize_anthropic_kwargs(
             api_kwargs, log_prefix=getattr(agent, "log_prefix", "")
         )
+        # The current Anthropic SDK requires max_tokens for Messages.stream(),
+        # including low-level watchdog callers that bypass build_api_kwargs().
+        # Reuse the adapter's model-aware output default and preserve any
+        # explicit per-request cap. This is intentionally Anthropic-only so
+        # Responses/chat-completions kwargs are unchanged.
+        from agent.anthropic_adapter import _resolve_anthropic_messages_max_tokens
+        if "max_tokens" not in api_kwargs:
+            api_kwargs["max_tokens"] = _resolve_anthropic_messages_max_tokens(
+                None,
+                api_kwargs.get("model") or getattr(agent, "model", ""),
+            )
         # Use the Anthropic SDK's streaming context manager
         with request_client.messages.stream(**api_kwargs) as stream:
             # The Anthropic SDK exposes the raw httpx response on
@@ -3241,6 +3499,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     )
                     break
                 saw_stream_event = True
+                anthropic_first_event["seen"] = True
                 # Update stale-stream timer on every event so the
                 # outer poll loop knows data is flowing.  Without
                 # this, the detector kills healthy long-running
@@ -3249,6 +3508,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # already does this at the top of its chunk loop).
                 last_chunk_time["t"] = time.time()
                 agent._touch_activity("receiving stream response")
+
+                # A watchdog abort sets the request-local cancellation flag
+                # before shutting down the socket. Do not process a late event
+                # that raced with that shutdown.
+                if _request_cancelled["value"]:
+                    break
 
                 # Update per-attempt diagnostic counters (best-effort).
                 try:
@@ -3275,6 +3540,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         if tool_name:
                             _fire_first_delta()
                             agent._fire_tool_gen_started(tool_name)
+                            # Keep the partial-tool marker in sync with the
+                            # chat-completions path. A stream that dies after
+                            # emitting tool JSON must take the mid-tool retry
+                            # route rather than silently returning text.
+                            try:
+                                _names = result.setdefault("partial_tool_names", [])
+                                if tool_name not in _names:
+                                    _names.append(tool_name)
+                            except Exception:
+                                pass
 
                 elif event_type == "content_block_delta":
                     delta = getattr(event, "delta", None)
@@ -3291,6 +3566,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             if thinking_text:
                                 _fire_first_delta()
                                 agent._fire_reasoning_delta(thinking_text)
+                        elif delta_type == "input_json_delta":
+                            # Tool input is progress, not visible text; the
+                            # event timestamp above keeps its idle gap alive.
+                            has_tool_use = True
 
             # Return the native Anthropic Message for downstream processing.
             # If the stream was interrupted (the event loop broke out above on
@@ -3334,6 +3613,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 )
             return _final_message
 
+    def _make_anthropic_stream_client():
+        """Build the request-local client, honoring injected test doubles."""
+        shared = getattr(agent, "_anthropic_client", None)
+        if (
+            isinstance(shared, SimpleNamespace)
+            and callable(getattr(getattr(shared, "messages", None), "stream", None))
+        ):
+            return shared
+        return agent._create_request_anthropic_client(reason="anthropic_stream_request")
+
     def _call():
         import httpx as _httpx
 
@@ -3341,6 +3630,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
         try:
             for _stream_attempt in range(_max_stream_retries + 1):
+                # A watchdog abort owns cancellation of this request. Exit before
+                # opening another stream so a transport error cannot create a
+                # zombie second stream.
+                if _request_cancelled["value"]:
+                    return
                 stream_attempt_id = _start_stream_attempt()
                 # Check for interrupt before each retry attempt.  Without
                 # this, /stop closes the HTTP connection (outer poll loop),
@@ -3357,9 +3651,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         # inside _create_request_anthropic_client) registered so
                         # the watchdog aborts its socket, not the shared client.
                         request_client = _set_request_client(
-                            agent._create_request_anthropic_client(
-                                reason="anthropic_stream_request"
-                            ),
+                            _make_anthropic_stream_client(),
                             kind="anthropic_messages",
                         )
                         result["response"] = _call_anthropic(request_client)
@@ -3388,6 +3680,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     _is_conn_err = isinstance(
                         e, (_httpx.ConnectError, _httpx.RemoteProtocolError, ConnectionError)
                     )
+                    if not _is_conn_err and _is_anthropic_transport_error(e):
+                        _is_conn_err = True
                     _is_stream_parse_err = agent._is_provider_stream_parse_error(e)
                     _is_empty_stream = isinstance(e, EmptyStreamError)
 
@@ -3717,6 +4011,21 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         if _reasoning_floor is not None:
             _stream_stale_timeout = max(_stream_stale_timeout, _reasoning_floor)
 
+    # Anthropic Messages owns event-liveness detection. The generic stale
+    # branch below uses the OpenAI request-client path and must not reset the
+    # Anthropic event clock before this watchdog reaches its configured gap.
+    _anthropic_watchdog = None
+    if agent.api_mode == "anthropic_messages":
+        _anthropic_watchdog = _resolve_anthropic_watchdog(
+            agent, api_kwargs, estimate_request_context_tokens(api_kwargs)
+        )
+    _anthropic_call_start = time.time()
+    # Preserve the upstream generic stale-stream override for callers that
+    # explicitly set HERMES_STREAM_STALE_TIMEOUT. Provider-configured Anthropic
+    # requests remain exclusively event-watchdog-owned, avoiding a lower stale
+    # threshold masking the configured idle/TTFB contract.
+    _anthropic_stale_override = bool(os.environ.get("HERMES_STREAM_STALE_TIMEOUT"))
+
     t = threading.Thread(target=_call, daemon=True)
     t.start()
     _last_heartbeat = time.time()
@@ -3760,11 +4069,80 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     f"waiting for stream response ({_waiting_secs}s, no chunks yet)"
                 )
 
+        # Anthropic Messages event-liveness watchdog. It is intentionally before
+        # the generic stale detector: the latter's OpenAI-oriented timer reset
+        # would mask a configured Anthropic idle gap.
+        if _anthropic_watchdog is not None:
+            _aw_now = time.time()
+            _aw_reason = None
+            _aw_elapsed = 0.0
+            _aw_thresh = 0.0
+            if not anthropic_first_event["seen"]:
+                if (
+                    _anthropic_watchdog["ttfb_enabled"]
+                    and (_aw_now - _anthropic_call_start)
+                    > _anthropic_watchdog["ttfb_timeout"]
+                ):
+                    _aw_reason = "anthropic_stream_ttfb_kill"
+                    _aw_elapsed = _aw_now - _anthropic_call_start
+                    _aw_thresh = _anthropic_watchdog["ttfb_timeout"]
+            else:
+                _aw_gap = _aw_now - last_chunk_time["t"]
+                if _aw_gap > _anthropic_watchdog["idle_timeout"]:
+                    _aw_reason = "anthropic_stream_idle_kill"
+                    _aw_elapsed = _aw_gap
+                    _aw_thresh = _anthropic_watchdog["idle_timeout"]
+
+            if _aw_reason is not None:
+                _aw_ctx = estimate_request_context_tokens(api_kwargs)
+                logger.warning(
+                    "Anthropic stream %s after %.0fs (threshold %.0fs) — "
+                    "aborting socket so the retry loop can recover. model=%s "
+                    "context=~%s tokens.",
+                    "no first event" if not anthropic_first_event["seen"] else "idle",
+                    _aw_elapsed,
+                    _aw_thresh,
+                    api_kwargs.get("model", "unknown"),
+                    f"{_aw_ctx:,}",
+                )
+                agent._buffer_status(
+                    f"⚠️ Anthropic stream "
+                    f"{'produced no first event' if not anthropic_first_event['seen'] else 'went idle'} "
+                    f"for {int(_aw_elapsed)}s (model: {api_kwargs.get('model', 'unknown')}). "
+                    "Reconnecting."
+                )
+                # Cancellation must be visible to the worker before the socket
+                # shutdown. This prevents the transport exception generated by
+                # our own abort from entering the internal retry path.
+                _request_cancelled["value"] = True
+                _cancel_current_stream_attempt(_aw_reason)
+                try:
+                    _close_request_client_once(_aw_reason)
+                except Exception:
+                    pass
+                t.join(timeout=2.0)
+                # Always replace the worker's transport exception with the
+                # retryable watchdog error. Anthropic.APIConnectionError is not
+                # a TimeoutError and would otherwise leak past the outer retry
+                # classifier. The post-loop delta gate decides whether to raise
+                # or return a partial stub.
+                result["error"] = TimeoutError(
+                    f"Anthropic stream {_aw_reason} after {int(_aw_elapsed)}s "
+                    f"(threshold {int(_aw_thresh)}s)"
+                )
+                agent._touch_activity(
+                    f"anthropic stream {_aw_reason} after {int(_aw_elapsed)}s"
+                )
+                break
+
         # Detect stale streams: connections kept alive by SSE pings
         # but delivering no real chunks.  Kill the client so the
         # inner retry loop can start a fresh connection.
         _stale_elapsed = time.time() - last_chunk_time["t"]
-        if _stale_elapsed > _stream_stale_timeout:
+        if (
+            (_anthropic_watchdog is None or _anthropic_stale_override)
+            and _stale_elapsed > _stream_stale_timeout
+        ):
             _est_ctx = estimate_request_context_tokens(api_kwargs)
             logger.warning(
                 "Stream stale for %.0fs (threshold %.0fs) — no chunks received. "

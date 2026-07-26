@@ -1163,11 +1163,6 @@ def _build_child_progress_callback(
         # event lets UIs open/inspect the subagent's session directly.
         if session_ref and session_ref.get("session_id"):
             kw["child_session_id"] = str(session_ref["session_id"])
-        if session_ref:
-            if session_ref.get("context_available"):
-                kw["context_available"] = True
-            if session_ref.get("context_child_session_id"):
-                kw["context_child_session_id"] = str(session_ref["context_child_session_id"])
         kw["tool_count"] = _tool_count[0]
         return kw
 
@@ -1243,6 +1238,18 @@ def _build_child_progress_callback(
             return
 
         if event == DelegateEvent.TASK_TOOL_COMPLETED:
+            # Keep the child completion visible to the parent gateway/TUI.  The
+            # callback is intentionally relay-only here: the child tool count
+            # is incremented on TASK_TOOL_STARTED, while completion metadata
+            # belongs to the consumer that owns the rendered progress row.
+            _relay(
+                "subagent.tool_completed",
+                tool_name,
+                preview,
+                args,
+                duration=kwargs.get("duration"),
+                is_error=bool(kwargs.get("is_error", False)),
+            )
             return
 
         if event == DelegateEvent.TASK_PROGRESS:
@@ -1716,45 +1723,6 @@ def _build_child_agent(
     if not isinstance(child_session_ref["session_id"], str):
         child_session_ref["session_id"] = ""
     child._delegate_progress_ref = child_session_ref
-    context_parent_sid = getattr(parent_agent, "session_id", None)
-    if not isinstance(context_parent_sid, str):
-        context_parent_sid = None
-    try:
-        from agent.subagent_context_artifacts import create_subagent_context_artifact_pointer
-
-        child_session_id = child_session_ref["session_id"]
-        if not child_session_id:
-            raise ValueError("child session id unavailable")
-        pointer = create_subagent_context_artifact_pointer(
-            child_session_id=child_session_id,
-            parent_session_id=context_parent_sid,
-            subagent_id=subagent_id,
-            role=effective_role,
-            profile=(delegation_cfg or {}).get("_profile"),
-            model=effective_model,
-            provider=effective_provider,
-            api_mode=effective_api_mode,
-            base_url=effective_base_url,
-            toolsets=child_toolsets,
-            session_db=getattr(parent_agent, "_session_db", None),
-        )
-        child._subagent_context_ref = {
-            "child_session_id": child_session_id,
-            "parent_session_id": context_parent_sid,
-            "subagent_id": subagent_id,
-            "role": effective_role,
-            "profile": (delegation_cfg or {}).get("_profile"),
-            "model": effective_model,
-            "provider": effective_provider,
-            "api_mode": effective_api_mode,
-            "base_url": effective_base_url,
-            "toolsets": list(child_toolsets),
-            "latest_artifact_path": pointer.get("latest_artifact_path"),
-        }
-        child_session_ref["context_available"] = True
-        child_session_ref["context_child_session_id"] = child_session_id
-    except Exception:
-        logger.debug("subagent context artifact pointer creation failed", exc_info=True)
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = child_depth
     # Stash the post-degrade role for introspection (leaf if the

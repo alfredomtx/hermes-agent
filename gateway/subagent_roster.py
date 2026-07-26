@@ -347,8 +347,6 @@ class SubagentRosterState:
         started_at: float = 0.0,
         model: Optional[str] = None,
         reasoning: Any = None,
-        context_available: bool = False,
-        context_child_session_id: Optional[str] = None,
     ) -> None:
         if not sid:
             return
@@ -360,8 +358,6 @@ class SubagentRosterState:
             "started_at": float(started_at or 0.0),
             "model": model or "",
             "reasoning": reasoning,
-            "context_available": bool(context_available),
-            "context_child_session_id": str(context_child_session_id or ""),
         }
         # A re-run/restart of the same sid clears any prior terminal state.
         self.terminal.pop(sid, None)
@@ -386,8 +382,6 @@ class SubagentRosterState:
                 "started_at": float(started_at or 0.0),
                 "model": "",
                 "reasoning": None,
-                "context_available": False,
-                "context_child_session_id": "",
             }
         try:
             _tools = int(tools or 0)
@@ -421,8 +415,6 @@ class SubagentRosterState:
             started_at = raw[4] if len(raw) > 4 else 0.0
             model = raw[5] if len(raw) > 5 else None
             reasoning = raw[6] if len(raw) > 6 else None
-            context_available = raw[7] if len(raw) > 7 else False
-            context_child_session_id = raw[8] if len(raw) > 8 else ""
             self.start(
                 sid,
                 goal,
@@ -430,8 +422,6 @@ class SubagentRosterState:
                 started_at,
                 model,
                 reasoning,
-                context_available=context_available,
-                context_child_session_id=context_child_session_id,
             )
         elif kind == "__roster_complete__":
             sid = raw[1] if len(raw) > 1 else ""
@@ -466,9 +456,6 @@ class SubagentRosterState:
                     "model": model,
                     "reasoning": reasoning,
                 }
-                if m.get("context_available"):
-                    row["context_available"] = True
-                    row["context_child_session_id"] = str(m.get("context_child_session_id") or "")
                 rows.append(row)
             else:
                 rec = active_by_id.get(sid) or {}
@@ -482,9 +469,6 @@ class SubagentRosterState:
                     "model": model,
                     "reasoning": reasoning,
                 }
-                if m.get("context_available"):
-                    row["context_available"] = True
-                    row["context_child_session_id"] = str(m.get("context_child_session_id") or "")
                 rows.append(row)
         return rows
 

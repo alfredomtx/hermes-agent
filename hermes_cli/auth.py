@@ -2041,11 +2041,21 @@ def resolve_provider(
             )
         return _oauth_active
 
-    # AWS Bedrock — detect via boto3 credential chain (IAM roles, SSO, env vars).
-    # This runs after API-key providers so explicit keys always win.
+    # AWS Bedrock — only explicit Bedrock credential environment sources may
+    # satisfy the generic auto path.  Ambient ~/.aws profiles and SDK-resolved
+    # instance credentials are intentionally not enough to select Bedrock for a
+    # fresh Hermes home; an explicit model.provider=bedrock still uses the full
+    # AWS SDK credential chain in runtime_provider.
     try:
-        from agent.bedrock_adapter import has_aws_credentials
-        if has_aws_credentials():
+        from agent.bedrock_adapter import resolve_aws_auth_env_var
+
+        _bedrock_auth_source = resolve_aws_auth_env_var()
+        if _bedrock_auth_source in {
+            "AWS_BEARER_TOKEN_BEDROCK",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+        }:
             return "bedrock"
     except ImportError:
         pass  # boto3 not installed — skip Bedrock auto-detection

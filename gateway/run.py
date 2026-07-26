@@ -876,7 +876,12 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
         return text
 
     text = _redact_gateway_user_facing_secrets(text)
-    if _TELEGRAM_NOISY_STATUS_RE.search(text):
+    # Routine compression statuses are classified from the source templates,
+    # not from copied platform wording. Keep the broad noise matcher for
+    # legacy/auxiliary chatter, but also route source-classified routine lines
+    # through the same default-off/explicit-opt-in gate (including the current
+    # colon-form COMPACTION_STATUS).
+    if _TELEGRAM_NOISY_STATUS_RE.search(text) or _COMPRESSION_PROGRESS_STATUS_RE.search(text):
         # Opt-in #52995: `compression.progress_notices: true` lets ROUTINE
         # compression progress statuses through to chat platforms. The
         # membership check is derived from the #69550 template constants, so
@@ -3592,6 +3597,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _draining: bool = False
     _external_drain_active: bool = False
     _restart_requested: bool = False
+    _restart_generation: int = 0
     _restart_task_started: bool = False
     _restart_detached: bool = False
     _restart_via_service: bool = False
@@ -3708,6 +3714,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # request -> poll -> proceed loop.
         self._external_drain_active = False
         self._restart_requested = False
+        self._restart_generation = 0
         # Set by shutdown_signal_handler when a SIGTERM/SIGINT arrived
         # WITHOUT a planned-stop / takeover marker — i.e. an unexpected
         # external signal (container/s6 SIGTERM on `docker restart` or
@@ -4428,8 +4435,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter._platform_lock_takeover_allowed = bool(
             self._platform_lock_takeover_on_start
         )
+        timeout = self._platform_connect_timeout_secs(platform)
         try:
-            return await self._connect_adapter_with_timeout(adapter, platform)
+            if timeout <= 0:
+                return bool(await adapter.connect(is_reconnect=False))
+            # Initial connects stay in this startup task so a restart requested
+            # by connect() is observed on the very next line in start().
+            # Reconnects retain the detached timeout path above.
+            result = await asyncio.wait_for(
+                adapter.connect(is_reconnect=False), timeout
+            )
+            return bool(result)
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                f"{platform.value} connect timed out after {timeout:g}s"
+            )
         finally:
             adapter._platform_lock_takeover_allowed = False
 
@@ -6375,11 +6395,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # still small enough to never threaten memory.
     _BUSY_QUEUE_MAX_PENDING = 32
 
+    def _resolve_busy_adapter(self, source):
+        """Resolve a busy-path adapter without assuming a full runner object.
+
+        Reduced runners used by webhook/FIFO tests expose only ``adapters``;
+        production runners may additionally provide the source-aware resolver.
+        Keep the fallback here so synthetic ingress still follows the same
+        busy-session semantics without raising ``AttributeError``.
+        """
+        resolver = getattr(self, "_adapter_for_source", None)
+        if callable(resolver):
+            try:
+                return resolver(source)
+            except Exception:
+                pass
+        adapters = getattr(self, "adapters", None)
+        if isinstance(adapters, dict):
+            adapter = adapters.get(getattr(source, "platform", None))
+            if adapter is not None:
+                return adapter
+            platform_value = getattr(getattr(source, "platform", None), "value", None)
+            if platform_value is not None:
+                return adapters.get(platform_value)
+        return None
+
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
-        adapter = self._adapter_for_source(event.source)
+        adapter = self._resolve_busy_adapter(event.source)
         if not adapter:
             return
-        # #28503 — Previously this called ``merge_pending_message_event``
         # with the default ``merge_text=False``, which silently OVERWROTE
         # the single pending slot when consecutive text messages arrived
         # in ``busy_input_mode: queue``. Route through the FIFO
@@ -6415,6 +6458,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._enqueue_fifo(session_key, event, adapter)
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+        def _resolve_busy_adapter(source):
+            resolver = getattr(self, "_adapter_for_source", None)
+            if callable(resolver):
+                try:
+                    return resolver(source)
+                except Exception:
+                    pass
+            adapters = getattr(self, "adapters", None) or {}
+            platform = getattr(source, "platform", None)
+            return adapters.get(platform) or adapters.get(getattr(platform, "value", platform))
+
+        def _has_active_subagents(running_agent) -> bool:
+            checker = getattr(self, "_agent_has_active_subagents", None)
+            if not callable(checker):
+                checker = GatewayRunner._agent_has_active_subagents
+            try:
+                return bool(checker(running_agent))
+            except Exception:
+                return False
+
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
         # creating a session.  The busy path must enforce the same check;
@@ -6433,7 +6496,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
-            adapter = self._adapter_for_source(event.source)
+            adapter = _resolve_busy_adapter(event.source)
             if not adapter:
                 return True
 
@@ -6515,7 +6578,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "Approval response via plain text: session=%s verb=%s args=%r",
                         session_key, _verb, _normalized_args,
                     )
-                    _adapter = self._adapter_for_source(event.source)
+                    _adapter = _resolve_busy_adapter(event.source)
                     if _adapter and _reply:
                         _text, _eph_ttl = _adapter._unwrap_ephemeral(_reply)
                         if _text:
@@ -6535,7 +6598,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
         # Normal busy case (agent actively running a task)
-        adapter = self._adapter_for_source(event.source)
+        adapter = _resolve_busy_adapter(event.source)
         if not adapter:
             return False  # let default path handle it
 
@@ -6552,6 +6615,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # cascade after the current turn finishes.
         if getattr(event, "internal", False):
             return False
+
+        # Synthetic webhook deliveries carry an arrival sequence and must be
+        # handled as FIFO follow-ups.  They are not conversational steering
+        # input: regardless of the configured busy mode, queue them as their
+        # own next turn and never steer or interrupt the active agent.
+        if (
+            getattr(event.source, "platform", None) == Platform.WEBHOOK
+            and getattr(event.source, "chat_type", None) == "webhook"
+            and getattr(event, "arrival_seq", None) is not None
+        ):
+            self._queue_or_replace_pending_event(session_key, event)
+            return True
 
         running_agent = self._running_agents.get(session_key)
 
@@ -6578,7 +6653,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # operator still has a way to force-cancel everything.
         demoted_for_subagents = (
             effective_mode == "interrupt"
-            and self._agent_has_active_subagents(running_agent)
+            and _has_active_subagents(running_agent)
         )
         if demoted_for_subagents:
             logger.info(
@@ -6589,7 +6664,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             effective_mode = "queue"
         demoted_for_compression = (
             effective_mode == "interrupt"
-            and await self._session_has_compression_in_flight(session_key)
+            and bool(
+                await self._session_has_compression_in_flight(session_key)
+                if callable(getattr(self, "_session_has_compression_in_flight", None))
+                else False
+            )
         )
         if demoted_for_compression:
             logger.info(
@@ -6697,7 +6776,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # read just to discover that no ack will be sent.
         _BUSY_ACK_COOLDOWN = 30
         now = time.time()
-        last_ack = self._busy_ack_ts.get(session_key, 0)
+        busy_ack_ts = getattr(self, "_busy_ack_ts", None)
+        if not isinstance(busy_ack_ts, dict):
+            busy_ack_ts = {}
+            self._busy_ack_ts = busy_ack_ts
+        last_ack = busy_ack_ts.get(session_key, 0)
         if now - last_ack < _BUSY_ACK_COOLDOWN:
             return True  # interrupt sent (if not queue), ack already delivered recently
 
@@ -6725,7 +6808,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("Busy steer ack suppressed for session %s", session_key)
                 return True
 
-        self._busy_ack_ts[session_key] = now
+        busy_ack_ts[session_key] = now
 
         # Build a status-rich acknowledgment. Mobile chat defaults keep this
         # terse; detailed iteration/tool state is still available in logs and
@@ -7697,6 +7780,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if self._restart_task_started:
             return False
         self._restart_requested = True
+        self._restart_generation = getattr(self, "_restart_generation", 0) + 1
         self._restart_detached = detached
         self._restart_via_service = via_service
         self._restart_task_started = True
@@ -8078,16 +8162,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self,
         adapter: Optional[BasePlatformAdapter] = None,
         platform: Optional[Platform] = None,
+        *,
+        restart_generation: Optional[int] = None,
     ) -> bool:
         """Clean up and exit startup when restart/shutdown begins mid-startup."""
-        if not self._startup_should_abort():
+        generation_changed = (
+            restart_generation is not None
+            and getattr(self, "_restart_generation", 0) != restart_generation
+        )
+        if not self._startup_should_abort() and not generation_changed:
             return False
         if adapter is not None and platform is not None:
-            try:
-                await adapter.cancel_background_tasks()
-            except Exception as e:
-                logger.debug("✗ %s background-task cancel error: %s", platform.value, e)
-            await self._safe_adapter_disconnect(adapter, platform)
+            await self._bounded_adapter_teardown(adapter, platform)
         stop_task = self._stop_task
         current_task = asyncio.current_task()
         if stop_task is not None and stop_task is not current_task:
@@ -8495,6 +8581,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         enabled_platform_count = 0
         startup_nonretryable_errors: list[str] = []
         startup_retryable_errors: list[str] = []
+        startup_restart_generation = getattr(self, "_restart_generation", 0)
         
         # Initialize and connect each configured platform
         _multiplex_on = bool(getattr(self.config, "multiplex_profiles", False))
@@ -8561,7 +8648,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 success = await self._connect_initial_adapter_with_timeout(
                     adapter, platform
                 )
-                if await self._abort_startup_if_shutdown_requested(adapter, platform):
+                if await self._abort_startup_if_shutdown_requested(
+                    adapter,
+                    platform,
+                    restart_generation=startup_restart_generation,
+                ):
                     return True
                 if success:
                     self.adapters[platform] = adapter
@@ -11074,6 +11165,229 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         return switched
 
+    @staticmethod
+    def _text_for_forktopic_visible_message(content: Any) -> str:
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, str):
+                    parts.append(part)
+                elif isinstance(part, dict):
+                    text = part.get("text") or part.get("content")
+                    if isinstance(text, str):
+                        parts.append(text)
+            content = "\n".join(parts)
+        elif isinstance(content, dict):
+            try:
+                content = json.dumps(content, ensure_ascii=False)
+            except (TypeError, ValueError):
+                content = str(content)
+        text = str(content or "").replace("\r\n", "\n").replace("\r", "\n")
+        text = re.sub(r"[ \t\f\v]+", " ", text)
+        return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+    @staticmethod
+    def _forktopic_visible_time(message: dict[str, Any]) -> str:
+        timestamp = message.get("timestamp")
+        if timestamp is None:
+            return "time unknown"
+        try:
+            dt = timestamp if hasattr(timestamp, "timestamp") else datetime.fromtimestamp(float(timestamp))
+            return dt.strftime("%Y-%m-%d %H:%M")
+        except (TypeError, ValueError, OSError):
+            return "time unknown"
+
+    @staticmethod
+    def _split_forktopic_visible_message(header: str, text: str, *, limit: int = 3800) -> list[str]:
+        available = max(500, limit - len(header) - 16)
+        chunks = [text[index:index + available] for index in range(0, len(text), available)] or [""]
+        if len(chunks) == 1:
+            return [f"{header}\n{text}"]
+        return [f"{header} ({index}/{len(chunks)})\n{chunk}" for index, chunk in enumerate(chunks, start=1)]
+
+    def _format_forktopic_recent_context_messages(
+        self, history: list[dict[str, Any]], *, limit: int = 5
+    ) -> list[str]:
+        visible_messages = []
+        for message in history:
+            if message.get("role") not in {"user", "assistant"}:
+                continue
+            text = self._text_for_forktopic_visible_message(message.get("content"))
+            if text:
+                visible_messages.append((message, text))
+        messages = []
+        for message, text in visible_messages[-limit:]:
+            label = "You" if message.get("role") == "user" else "Hermes"
+            header = f"**{label}** · {self._forktopic_visible_time(message)}"
+            messages.extend(self._split_forktopic_visible_message(header, text))
+        return messages
+
+    async def _forktopic_db_call(self, method: str, *args, **kwargs):
+        """Call either the live AsyncSessionDB facade or a test's sync DB."""
+        result = getattr(self._session_db, method)(*args, **kwargs)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    async def _handle_forktopic_command(self, event: MessageEvent) -> str:
+        """Handle /forktopic [name] — fork the current Telegram topic."""
+        import uuid as _uuid
+
+        source = event.source
+        if source.platform != Platform.TELEGRAM:
+            return "This command is only available on Telegram."
+        session_db = getattr(self, "_session_db", None)
+        if not session_db:
+            return "Session database unavailable."
+        if not source.chat_id:
+            return "No Telegram chat is associated with this session."
+
+        adapter = (getattr(self, "adapters", {}) or {}).get(Platform.TELEGRAM)
+        create_topic = getattr(adapter, "create_forum_topic", None) if adapter else None
+        if not callable(create_topic):
+            return "Telegram topic creation is unavailable."
+        session_store = getattr(self, "session_store", None)
+        if session_store is None:
+            return "Topic was not forked: session store unavailable"
+
+        current_entry = session_store.get_or_create_session(source)
+        parent_session_id = current_entry.session_id
+        history = session_store.load_transcript(parent_session_id)
+        if not history:
+            return "No conversation to fork."
+
+        raw_name = event.get_command_args().strip()
+        if raw_name:
+            topic_title = raw_name
+        else:
+            try:
+                current_title = await self._forktopic_db_call("get_session_title", parent_session_id)
+            except Exception:
+                current_title = None
+            topic_title = f"{current_title} fork" if current_title else "Hermes fork"
+        topic_title = re.sub(r"\s+", " ", topic_title).strip()[:128] or "Hermes fork"
+
+        try:
+            new_thread_id = await create_topic(str(source.chat_id), topic_title)
+        except Exception as exc:
+            logger.warning("forktopic: create_forum_topic failed", exc_info=True)
+            return f"Topic was not forked: {exc}"
+        if not new_thread_id:
+            return "Topic was not forked: Telegram did not return a thread id"
+        new_thread_id = str(new_thread_id)
+
+        now = datetime.now()
+        new_session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{_uuid.uuid4().hex[:6]}"
+        msg_count = len([message for message in history if message.get("role") == "user"])
+        seed_text = f"Forked conversation: {topic_title}\n\nForked from session `{parent_session_id}`."
+        context_seed_messages = self._format_forktopic_recent_context_messages(history)
+        dest_source = dataclasses.replace(
+            source,
+            chat_type="dm" if source.chat_type == "dm" else "forum",
+            thread_id=new_thread_id,
+        )
+        dest_session_key = self._session_key_for_source(dest_source)
+        temp_dest_session_id = None
+        try:
+            config = getattr(self, "config", None)
+            model_name = (config.get("model", {}) or {}).get("default") if isinstance(config, dict) else None
+            await self._forktopic_db_call(
+                "create_session",
+                session_id=new_session_id,
+                source="telegram",
+                model=model_name,
+                model_config={
+                    "_branched_from": parent_session_id,
+                    "_forktopic_from": parent_session_id,
+                    "_forktopic_chat_id": str(source.chat_id),
+                    "_forktopic_thread_id": new_thread_id,
+                },
+                parent_session_id=parent_session_id,
+            )
+            await self._forktopic_db_call("replace_messages", new_session_id, history)
+            try:
+                await self._forktopic_db_call("set_session_title", new_session_id, topic_title)
+            except Exception:
+                pass
+
+            temp_dest_entry = session_store.get_or_create_session(dest_source)
+            temp_dest_session_id = temp_dest_entry.session_id
+            new_entry = session_store.switch_session(dest_session_key, new_session_id)
+            if not new_entry:
+                raise RuntimeError("session store switch failed")
+            is_topic_lane = getattr(self, "_is_telegram_topic_lane", None)
+            record_topic_binding = getattr(self, "_record_telegram_topic_binding", None)
+            if callable(is_topic_lane) and is_topic_lane(dest_source):
+                if not callable(record_topic_binding):
+                    raise RuntimeError("Telegram topic binding helper unavailable")
+                record_topic_binding(dest_source, new_entry)
+            clear_security = getattr(self, "_clear_session_boundary_security_state", None)
+            if callable(clear_security):
+                clear_security(dest_session_key)
+            evict_agent = getattr(self, "_evict_cached_agent", None)
+            if callable(evict_agent):
+                evict_agent(dest_session_key)
+            release_running = getattr(self, "_release_running_agent_state", None)
+            if callable(release_running):
+                release_running(dest_session_key)
+            if temp_dest_session_id and temp_dest_session_id != new_session_id:
+                try:
+                    await self._forktopic_db_call(
+                        "delete_session_if_empty",
+                        temp_dest_session_id,
+                        getattr(session_store, "sessions_dir", None),
+                    )
+                except Exception:
+                    logger.debug("forktopic: temp destination cleanup failed", exc_info=True)
+        except Exception as exc:
+            logger.error("forktopic: failed to bind new topic", exc_info=True)
+            delete_topic = getattr(adapter, "delete_forum_topic", None)
+            if callable(delete_topic):
+                try:
+                    await delete_topic(str(source.chat_id), new_thread_id)
+                except Exception:
+                    logger.debug("forktopic: rollback delete failed", exc_info=True)
+            try:
+                for cleanup_session_id in {new_session_id, temp_dest_session_id}:
+                    if cleanup_session_id:
+                        await self._forktopic_db_call(
+                            "delete_session", cleanup_session_id,
+                            getattr(session_store, "sessions_dir", None),
+                        )
+                with session_store._lock:
+                    session_store._entries.pop(dest_session_key, None)
+                    session_store._save()
+            except Exception:
+                logger.debug("forktopic: session rollback cleanup failed", exc_info=True)
+            return f"Topic was not forked: {exc}"
+
+        send_error = None
+        try:
+            metadata = {"thread_id": new_thread_id}
+            thread_metadata = getattr(self, "_thread_metadata_for_source", None)
+            if callable(thread_metadata):
+                metadata = thread_metadata(dest_source) or metadata
+            for index, content in enumerate([seed_text, *context_seed_messages], start=1):
+                send_result = await adapter.send(
+                    chat_id=str(source.chat_id), content=content, metadata=metadata
+                )
+                if getattr(send_result, "success", True) is False:
+                    send_error = f"message {index}: {getattr(send_result, 'error', 'send returned success=False')}"
+                    break
+        except Exception as exc:
+            logger.warning("forktopic: failed to send seed message", exc_info=True)
+            send_error = str(exc)
+
+        if send_error:
+            return (
+                f"Forked into Telegram topic **{topic_title}**, but seed delivery failed: {send_error}. "
+                f"Fork: `{new_session_id}`"
+            )
+        return (
+            f"Forked into Telegram topic **{topic_title}** with {msg_count} user message(s). "
+            f"Fork: `{new_session_id}`"
+        )
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -12241,6 +12555,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "branch":
             return await self._handle_branch_command(event)
+
+        if canonical == "forktopic":
+            return await self._handle_forktopic_command(event)
 
         if canonical == "rollback":
             return await self._handle_rollback_command(event)
@@ -16196,11 +16513,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not response and result and result.get("error"):
                 response = f"Error: {result['error']}"
 
-            # Extract media files from the response
+            # Extract media files from the response.  Validate each caller-provided
+            # path canonically, but preserve its original spelling for the adapter:
+            # a symlinked temp root (for example /tmp -> /private/tmp) is valid,
+            # and type-specific senders/tests rely on that identity.
             if response:
-                media_files, response = adapter.extract_media(response)
+                raw_media_files, response = adapter.extract_media(response)
                 from gateway.platforms.base import BasePlatformAdapter
-                media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+                media_files = []
+                for media_path, is_voice in raw_media_files or []:
+                    raw_path = str(media_path)
+                    if BasePlatformAdapter.validate_media_delivery_path(raw_path):
+                        media_files.append((raw_path, bool(is_voice)))
+                    else:
+                        logger.warning("Skipping unsafe MEDIA directive path")
                 images, text_content = adapter.extract_images(response)
 
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
@@ -21058,6 +21384,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         last_was_terminal_block = [False]
         last_subagent_id = [None]
         _todo_merge_flags: List[bool] = []
+        _todo_card_new_plan_flags: List[bool] = []
 
         # ── Discord voice "verbal ack before tool calls" ────────────────
         # When the bot is in a voice channel with the continuous mixer
@@ -21221,6 +21548,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         progress_queue.put(("__tool_start__", "__subagent__", card))
                 return
 
+            # Live subagent roster is independent of subagent tool-progress mode.
+            # The worker callback only enqueues immutable lifecycle sentinels;
+            # the consumer below owns all roster state and platform I/O.
+            if subagent_roster_enabled and event_type in {
+                "subagent.start",
+                "subagent.complete",
+            }:
+                _sid = str(kwargs.get("subagent_id") or "")
+                if not _sid:
+                    return
+                if event_type == "subagent.start":
+                    progress_queue.put(
+                        (
+                            "__roster_start__",
+                            _sid,
+                            kwargs.get("goal") or preview or "",
+                            int(kwargs.get("task_index", 0) or 0),
+                            time.time(),
+                        )
+                    )
+                else:
+                    progress_queue.put(
+                        (
+                            "__roster_complete__",
+                            _sid,
+                            str(kwargs.get("status") or "completed").lower(),
+                            float(kwargs.get("duration_seconds") or 0.0),
+                        )
+                    )
+                return
+
             # First-touch onboarding: the first time a tool takes longer than
             # _LONG_TOOL_THRESHOLD_S during a run that's streaming every tool
             # (progress_mode == "all"), append a one-time hint suggesting
@@ -21254,6 +21612,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         logger.debug("tool-progress onboarding hint failed: %s", hint_err)
 
                 if tool_name == "todo":
+                    # Persistent plan cards are rendered from the authoritative
+                    # completion result and edited in place across turns.
+                    if todo_progress_enabled:
+                        _new_plan = (
+                            _todo_card_new_plan_flags.pop(0)
+                            if _todo_card_new_plan_flags
+                            else False
+                        )
+                        result_payload = kwargs.get("result")
+                        todo_card = None
+                        finished = False
+                        if result_payload is not None:
+                            try:
+                                from gateway.todo_progress import (
+                                    extract_todo_items,
+                                    format_todo_progress,
+                                )
+                                from gateway.todo_card import todo_list_finished
+
+                                todo_card = format_todo_progress(
+                                    {"merge": False},
+                                    result=result_payload,
+                                )
+                                finished = todo_list_finished(
+                                    extract_todo_items(result_payload)
+                                )
+                            except Exception:
+                                todo_card = None
+                        if todo_card:
+                            last_was_terminal_block[0] = False
+                            progress_queue.put(
+                                ("__todo_card__", todo_card, finished, _new_plan)
+                            )
+                        return
                     if progress_mode == "off":
                         return
                     merge_flag = _todo_merge_flags.pop(0) if _todo_merge_flags else False
@@ -21311,6 +21703,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if tool_name == "delegate_task" and delegate_task_args_enabled:
                 for card in _format_delegate_task_args_progress(args):
                     progress_queue.put(("__tool_start__", tool_name, card))
+                return
+            # Persistent todo plan card is independent of ordinary tool progress.
+            # Suppress the shared-bubble start row and remember whether this
+            # write starts a fresh plan so the completion FIFO stays aligned.
+            if tool_name == "todo" and todo_progress_enabled:
+                _args = args or {}
+                _is_write = isinstance(_args.get("todos"), list)
+                _new_plan = _is_write and not bool(_args.get("merge", False))
+                _todo_card_new_plan_flags.append(_new_plan)
                 return
             if progress_mode == "off":
                 return
@@ -21487,6 +21888,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         msg = f"{tool_name}..."
                     last_was_terminal_block[0] = False
                 elif _verb:
+                    last_was_terminal_block[0] = False
                     if verb_drops_preview(tool_name):
                         msg = f"{emoji} {_verb}"
                     else:
@@ -21639,6 +22041,103 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         break
                 return
 
+            from gateway.subagent_roster import (
+                ROSTER_EDIT_INTERVAL,
+                SubagentRosterState,
+                format_subagent_roster,
+                is_flood_error,
+                resolve_roster_interval,
+            )
+            from tools.delegate_tool import list_active_subagents
+
+            roster = SubagentRosterState()
+            roster_msg_id = None
+            _last_roster_edit_ts = 0.0
+            _last_roster_text = None
+            roster_seed_failed = False
+            _roster_interval = resolve_roster_interval(user_config, platform_key)
+
+            def _render_roster(collapsed: bool):
+                try:
+                    active = {
+                        str(record.get("subagent_id")): record
+                        for record in list_active_subagents()
+                        if str(record.get("subagent_id")) in roster.meta
+                    }
+                except Exception:
+                    active = {}
+                return format_subagent_roster(
+                    roster.fold(active, time.time()),
+                    collapsed=collapsed,
+                )
+
+            async def _publish_roster(
+                *, force: bool, collapsed: bool = False, allow_seed: bool = True
+            ) -> None:
+                nonlocal roster_msg_id, _last_roster_edit_ts
+                nonlocal _last_roster_text, roster_seed_failed
+                if not _run_still_current():
+                    return
+                text = _render_roster(collapsed)
+                if not text:
+                    return
+                now = time.monotonic()
+                if not force and (now - _last_roster_edit_ts) < _roster_interval:
+                    return
+                if not force and text == _last_roster_text:
+                    return
+                if roster_msg_id is None:
+                    if not allow_seed or roster_seed_failed:
+                        return
+                    try:
+                        result = await adapter.send(
+                            chat_id=source.chat_id,
+                            content=text,
+                            reply_to=_progress_reply_to,
+                            metadata=_progress_metadata,
+                        )
+                    except Exception:
+                        roster_seed_failed = True
+                        return
+                    if getattr(result, "success", False) and getattr(result, "message_id", None):
+                        roster_msg_id = str(result.message_id)
+                        if _cleanup_progress:
+                            _cleanup_msg_ids.append(roster_msg_id)
+                    else:
+                        if not is_flood_error(result):
+                            roster_seed_failed = True
+                        _last_roster_edit_ts = now
+                        return
+                else:
+                    kwargs: Dict[str, Any] = {
+                        "chat_id": source.chat_id,
+                        "message_id": roster_msg_id,
+                        "content": text,
+                    }
+                    if getattr(adapter, "REQUIRES_EDIT_FINALIZE", False):
+                        kwargs["finalize"] = True
+                    if _edit_accepts_metadata:
+                        kwargs["metadata"] = _progress_metadata
+                    try:
+                        result = await adapter.edit_message(**kwargs)
+                    except Exception:
+                        return
+                    if not getattr(result, "success", False):
+                        return
+                _last_roster_edit_ts = now
+                _last_roster_text = text
+
+            async def _maybe_tick_roster() -> None:
+                if roster_msg_id is None and not roster.has_records():
+                    return
+                await _publish_roster(force=False)
+
+            def _apply_roster_event(raw) -> None:
+                try:
+                    roster.apply_event(raw)
+                except Exception as roster_error:
+                    logger.debug("roster apply_event failed: %s", roster_error)
+
             progress_lines = []      # Accumulated tool lines for the CURRENT editable bubble
             progress_msg_id = None   # ID of the current progress message to edit
             pending_tool_line_indexes: Dict[str, List[int]] = {}
@@ -21678,6 +22177,60 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 except (TypeError, ValueError):
                     _edit_accepts_metadata = False
+
+            # Persistent cross-turn todo card state is owned by the runner but
+            # written only by this consumer coroutine. Partial test runners may
+            # not initialize it, so create the bounded OrderedDict lazily.
+            from collections import OrderedDict
+            from gateway.todo_card import (
+                TODO_CARD_EDIT_INTERVAL,
+                publish_todo_card,
+            )
+            _todo_card_state = getattr(self, "_todo_card_state", None)
+            if not isinstance(_todo_card_state, dict):
+                _todo_card_state = OrderedDict()
+                self._todo_card_state = _todo_card_state
+            if not hasattr(self, "_todo_card_state_max"):
+                self._todo_card_state_max = 512
+            _todo_card_last_edit = [0.0]
+            _todo_card_pending = [None]
+            _todo_thread_sig = str(_progress_thread_id or "")
+
+            async def _flush_todo_card(text, finished, new_plan) -> None:
+                if not _run_still_current():
+                    return
+                try:
+                    await publish_todo_card(
+                        adapter=adapter,
+                        store=_todo_card_state,
+                        session_key=session_key or session_id or "",
+                        card_text=text,
+                        finished=finished,
+                        new_plan=new_plan,
+                        chat_id=source.chat_id,
+                        metadata=_progress_metadata,
+                        reply_to=_progress_reply_to,
+                        edit_accepts_metadata=_edit_accepts_metadata,
+                        thread_sig=_todo_thread_sig,
+                    )
+                    cap = int(getattr(self, "_todo_card_state_max", 512) or 512)
+                    while len(_todo_card_state) > cap:
+                        _todo_card_state.popitem(last=False)
+                except Exception as _todo_err:
+                    logger.debug("todo plan card publish failed: %s", _todo_err)
+                _todo_card_last_edit[0] = time.monotonic()
+
+            async def _maybe_flush_todo_card(*, force: bool = False) -> None:
+                if _todo_card_pending[0] is None:
+                    return
+                if (
+                    not force
+                    and (time.monotonic() - _todo_card_last_edit[0]) < TODO_CARD_EDIT_INTERVAL
+                ):
+                    return
+                pending = _todo_card_pending[0]
+                _todo_card_pending[0] = None
+                await _flush_todo_card(*pending)
 
             async def _edit_progress_message(message_id: str, content: str):
                 kwargs = {
@@ -21840,13 +22393,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if not result.success:
                         if getattr(result, "retryable", False):
                             logger.debug(
-                                "[%s] Transient overflow edit failure — keeping can_edit=True",
+                                "[%s] Transient overflow edit failure — retrying same bubble",
                                 adapter.name,
                             )
-                            return True
-                        can_edit = False
-                        # Fall back to the existing non-edit behavior below.
-                        return False
+                            # Retry the split edit against the SAME message id
+                            # before returning to the queue loop. Without this,
+                            # a fast agent can finish with no later event to
+                            # trigger the split, leaving the overflow unsplit.
+                            await asyncio.sleep(0)
+                            result = await _edit_progress_message(progress_msg_id, first_text)
+                            if result.success:
+                                pass
+                            else:
+                                return True
+                        else:
+                            can_edit = False
+                            # Fall back to the existing non-edit behavior below.
+                            return False
                 else:
                     result = await _send_progress_text(first_text)
                     if result.success and result.message_id:
@@ -21937,6 +22500,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 last_progress_msg[0] = None
                 repeat_count[0] = 0
 
+            _terminal_flush_done = [False]
+
+            async def _flush_terminal_progress() -> None:
+                """Flush every terminal progress surface once before turn return."""
+                nonlocal progress_msg_id
+                if _terminal_flush_done[0]:
+                    return
+                _terminal_flush_done[0] = True
+
+                # Keep the existing ordinary progress bubble drain behavior for
+                # callers that use the terminal sentinel instead of cancellation.
+                if can_edit and progress_lines:
+                    await _roll_progress_overflow_if_needed()
+                if can_edit and progress_lines:
+                    full_text = _progress_text(progress_lines)
+                    try:
+                        if progress_msg_id:
+                            await _edit_progress_message(progress_msg_id, full_text)
+                        else:
+                            result = await _send_progress_text(full_text)
+                            if result.success and result.message_id:
+                                progress_msg_id = result.message_id
+                    except Exception:
+                        pass
+
+                # Force both independent edited-in-place surfaces past their
+                # throttles at the turn boundary.  Roster lifecycle sentinels
+                # are FIFO ahead of the terminal sentinel, so the collapsed
+                # frame includes every child even when no idle tick ran.
+                try:
+                    if roster.has_records():
+                        await _publish_roster(force=True, collapsed=True)
+                except Exception:
+                    pass
+                try:
+                    await _maybe_flush_todo_card(force=True)
+                except Exception:
+                    pass
+
             while True:
                 try:
                     if not _run_still_current():
@@ -21966,7 +22568,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception:
                         pass
 
-                    # Handle structured lifecycle progress and legacy strings.
+                    # A terminal sentinel is enqueued after the executor has
+                    # finished, so FIFO guarantees all lifecycle events already
+                    # sit ahead of it.  Flush them and return without relying on
+                    # task cancellation to run the final-state path.
+                    if isinstance(raw, tuple) and raw and raw[0] == "__terminal__":
+                        await _flush_terminal_progress()
+                        return
+
+                    # Roster owns a separate edited-in-place bubble.
+                    if isinstance(raw, tuple) and raw and raw[0] in {
+                        "__roster_start__",
+                        "__roster_complete__",
+                    }:
+                        _apply_roster_event(raw)
+                        await _maybe_tick_roster()
+                        continue
                     if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                         _, base_msg, count = raw
                         if progress_lines:
@@ -22018,6 +22635,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             index = len(progress_lines) - 1
                         msg = progress_lines[index]
                         force_progress_edit = True
+                    elif isinstance(raw, tuple) and len(raw) == 4 and raw[0] == "__todo_card__":
+                        _, todo_card, finished, new_plan = raw
+                        if (time.monotonic() - _todo_card_last_edit[0]) < TODO_CARD_EDIT_INTERVAL:
+                            _todo_card_pending[0] = (todo_card, finished, new_plan)
+                            continue
+                        _todo_card_pending[0] = None
+                        await _flush_todo_card(todo_card, finished, new_plan)
+                        continue
                     elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__todo_complete__":
                         _, todo_tool_name, todo_card = raw
                         index = _replace_pending_tool_line(todo_tool_name, todo_card)
@@ -22139,13 +22764,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await adapter.send_typing(source.chat_id, metadata=_progress_metadata)
 
                 except queue.Empty:
+                    try:
+                        await _maybe_tick_roster()
+                    except Exception:
+                        pass
+                    try:
+                        await _maybe_flush_todo_card()
+                    except Exception:
+                        pass
                     await asyncio.sleep(0.3)
                 except asyncio.CancelledError:
                     # Drain remaining queued messages
                     while not progress_queue.empty():
                         try:
                             raw = progress_queue.get_nowait()
-                            if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
+                            if isinstance(raw, tuple) and raw and raw[0] in {
+                                "__roster_start__",
+                                "__roster_complete__",
+                            }:
+                                _apply_roster_event(raw)
+                            elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                                 _, base_msg, count = raw
                                 if progress_lines:
                                     progress_lines[-1] = f"{base_msg} (×{count + 1})"
@@ -22188,6 +22826,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     duration,
                                     bool(is_error),
                                 )
+                            elif isinstance(raw, tuple) and len(raw) == 4 and raw[0] == "__todo_card__":
+                                _, todo_card, finished, new_plan = raw
+                                _todo_card_pending[0] = (todo_card, finished, new_plan)
                             elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__todo_complete__":
                                 _, todo_tool_name, todo_card = raw
                                 if _replace_pending_tool_line(todo_tool_name, todo_card) is None:
@@ -22201,21 +22842,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 await _roll_progress_overflow_if_needed()
                         except Exception:
                             break
-                    # Final edit with all remaining tools.  Cancellation can
-                    # race the initial send, so seed a message when no ID exists.
-                    if can_edit and progress_lines:
-                        await _roll_progress_overflow_if_needed()
-                    if can_edit and progress_lines:
-                        full_text = _progress_text(progress_lines)
-                        try:
-                            if progress_msg_id:
-                                await _edit_progress_message(progress_msg_id, full_text)
-                            else:
-                                result = await _send_progress_text(full_text)
-                                if result.success and result.message_id:
-                                    progress_msg_id = result.message_id
-                        except Exception:
-                            pass
+                    await _flush_terminal_progress()
                     return
                 except Exception as e:
                     logger.error("Progress message error: %s", e)
@@ -23879,11 +24506,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 source.chat_id,
                                 _heartbeat_msg_id,
                                 _heartbeat_text,
+                                finalize=True,
                             )
                         except Exception as _ee:
                             logger.debug("Heartbeat edit failed: %s", _ee)
-                            _notify_res = None
-                    if not (_notify_res and getattr(_notify_res, "success", False)):
+                        # Once a heartbeat exists, never replace it after an edit
+                        # failure.  The identity is deliberately retained so a
+                        # later tick can retry the same bubble without producing
+                        # a trail of duplicate "Working" messages.
+                        if not (_notify_res and getattr(_notify_res, "success", False)):
+                            continue
+                    else:
                         _notify_res = await _notify_adapter.send(
                             source.chat_id,
                             _heartbeat_text,
@@ -24447,9 +25080,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
-            # Stop progress sender, interrupt monitor, and notification task
+            # Ask the progress consumer to process a FIFO terminal sentinel
+            # before cancelling it.  This makes terminal todo/roster state
+            # deterministic even when the executor returns before the consumer
+            # gets its first idle tick; the consumer's one-shot latch prevents a
+            # second terminal flush if cancellation races this handoff.
             if progress_task:
-                progress_task.cancel()
+                if progress_queue is not None and not progress_task.done():
+                    progress_queue.put(("__terminal__",))
+                    try:
+                        await asyncio.wait_for(progress_task, timeout=5.0)
+                    except asyncio.TimeoutError:
+                        progress_task.cancel()
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        logger.debug("Progress terminal flush failed", exc_info=True)
+                elif not progress_task.done():
+                    progress_task.cancel()
+                progress_task = None
             if log_task:
                 log_task.cancel()
             interrupt_monitor.cancel()

@@ -145,13 +145,6 @@ class TestFoldSubagentRoster:
         rows = s.fold({}, now=200.0)
         assert rows[0]["glyph"] == "✓" and rows[0]["tools"] == 12
 
-    def test_start_sentinel_preserves_context_metadata_when_present(self):
-        s = self._state()
-        s.apply_event(("__roster_start__", "a", "goal a", 0, 100.0, "m", None, True, "child-session"))
-        rows = s.fold({}, now=200.0)
-        assert rows[0]["context_available"] is True
-        assert rows[0]["context_child_session_id"] == "child-session"
-
     def test_complete_sentinel_without_tool_count_is_zero(self):
         # Older producers / replayed queues omit the tool tail; must not crash.
         s = self._state()

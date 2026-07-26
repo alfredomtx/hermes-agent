@@ -83,6 +83,17 @@ gateway:
     branched_one:          "⑂ تم التفريع إلى **{title}** (نُسخت {count} رسالة)\nالأصل: `{parent}`\nالفرع: `{new}`\nاستخدم `/resume` للعودة إلى الأصل."
     branched_many:         "⑂ تم التفريع إلى **{title}** (نُسخت {count} رسالة)\nالأصل: `{parent}`\nالفرع: `{new}`\nاستخدم `/resume` للعودة إلى الأصل."
 
+  forktopic:
+    telegram_only:         "⚠️ لا يعمل `/forktopic` إلا من Telegram."
+    no_chat:               "⚠️ لا يمكن إنشاء موضوع دون معرّف دردشة Telegram."
+    adapter_missing:       "⚠️ لا يستطيع محوّل Telegram إنشاء مواضيع المنتدى في هذه البوابة."
+    create_topic_failed:   "⚠️ فشل إنشاء موضوع Telegram: {error}"
+    bind_failed:           "⚠️ لم يتم تفريع الموضوع: {error}"
+    seed_message:          "⑂ **محادثة مُفرّعة: {title}**\n\nنُسخت {count} رسالة مستخدم من جلسة الأصل. تابع هذا الفرع هنا.\n\nالأصل: `{parent}`\nالتفريع: `{new}`"
+    created_one:           "⑂ تم التفريع إلى موضوع Telegram **{title}** (نُسخت {count} رسالة)\nالخيط: `{thread}`\nالأصل: `{parent}`\nالتفريع: `{new}`\n{url}"
+    created_many:          "⑂ تم التفريع إلى موضوع Telegram **{title}** (نُسخت {count} رسائل)\nالخيط: `{thread}`\nالأصل: `{parent}`\nالتفريع: `{new}`\n{url}"
+    created_seed_send_failed: "⚠️ تم تفريع الموضوع **{title}**، لكن فشل إرسال الرسالة التمهيدية: {error}\nالخيط: `{thread}`\nالأصل: `{parent}`\nالتفريع: `{new}`\n{url}"
+
   commands:
     usage:                 "الاستخدام: `/commands [page]`"
     skill_header:          "⚡ **أوامر المهارات**:"

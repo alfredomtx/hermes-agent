@@ -4123,51 +4123,6 @@ class TestFallbackModelInheritance(unittest.TestCase):
 
 
 
-def test_build_child_agent_creates_context_pointer_before_spawn_event(tmp_path):
-    from hermes_state import SessionDB
-    from agent.subagent_context_artifacts import get_subagent_context_artifact
-
-    db = SessionDB(db_path=tmp_path / "state.db")
-    events = []
-    parent = _make_mock_parent()
-    parent.session_id = "parent-context-test"
-    parent._session_db = db
-    parent.tool_progress_callback = lambda event_type, tool_name=None, preview=None, args=None, **kwargs: events.append((event_type, kwargs))
-
-    try:
-        with patch("run_agent.AIAgent") as MockAgent:
-            mock_child = MagicMock()
-            mock_child.session_id = "child-context-test"
-            MockAgent.return_value = mock_child
-
-            child = _build_child_agent(
-                task_index=0,
-                goal="inspect real context",
-                context=None,
-                toolsets=None,
-                model=None,
-                max_iterations=50,
-                task_count=1,
-                parent_agent=parent,
-                delegation_cfg={"_profile": "coder"},
-            )
-
-        assert getattr(child, "_subagent_context_ref")["child_session_id"] == "child-context-test"
-        pointer = get_subagent_context_artifact("child-context-test", session_db=db)
-        assert pointer["ok"] is True
-        assert pointer["pointer"]["parent_session_id"] == "parent-context-test"
-
-        spawn_events = [event for event in events if event[0] == "subagent.spawn_requested"]
-        assert spawn_events, events
-        spawn_kwargs = spawn_events[0][1]
-        assert spawn_kwargs["context_available"] is True
-        assert spawn_kwargs["context_child_session_id"] == "child-context-test"
-        assert "latest_artifact_path" not in spawn_kwargs
-        assert "provider_request" not in spawn_kwargs
-    finally:
-        db.close()
-
-
 def test_dispatched_profile_uses_uniform_per_task_profile():
     from tools.delegate_tool import _dispatched_profile
 

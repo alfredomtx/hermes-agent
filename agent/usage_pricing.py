@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, Literal, Optional
@@ -980,6 +980,197 @@ def _normalize_bedrock_model_name(model: str) -> str:
     return name
 
 
+# Explicitly gated corrections used by the offline spend attribution shim.
+# Keeping this union here preserves the upstream pricing path by default while
+# giving spend_core one canonical implementation for its company-OAuth and
+# model-family corrections.
+CODEX_PRICING_STANDARD: Dict[str, tuple[float, float, Optional[float], float]] = {
+    "gpt-5.6": (5.00, 0.50, 6.25, 30.00),
+    "gpt-5.6-sol": (5.00, 0.50, 6.25, 30.00),
+    "gpt-5.6-terra": (2.50, 0.25, 3.125, 15.00),
+    "gpt-5.6-luna": (1.00, 0.10, 1.25, 6.00),
+    "gpt-5.5": (5.00, 0.50, None, 30.00),
+    "gpt-5.4": (2.50, 0.25, None, 15.00),
+    "gpt-5.4-mini": (0.75, 0.075, None, 4.50),
+    "gpt-5.4-nano": (0.20, 0.02, None, 1.25),
+    "gpt-5": (5.00, 0.50, None, 30.00),
+}
+CODEX_PRICING_PRIORITY: Dict[str, tuple[float, float, Optional[float], float]] = {
+    "gpt-5.6": (10.00, 1.00, 12.50, 60.00),
+    "gpt-5.6-sol": (10.00, 1.00, 12.50, 60.00),
+    "gpt-5.6-terra": (5.00, 0.50, 6.25, 30.00),
+    "gpt-5.6-luna": (2.00, 0.20, 2.50, 12.00),
+    "gpt-5.5": (12.50, 1.25, None, 75.00),
+    "gpt-5.4": (5.00, 0.50, None, 30.00),
+    "gpt-5.4-mini": (1.50, 0.15, None, 9.00),
+    "gpt-5.4-nano": (0.50, 0.05, None, 3.125),
+    "gpt-5": (12.50, 1.25, None, 75.00),
+}
+
+
+def codex_cost(
+    model: str,
+    usage: CanonicalUsage,
+    *,
+    tier: str = "priority",
+) -> tuple[Optional[float], Optional[str]]:
+    """Return real OpenAI API pricing for a company-OAuth Codex row.
+
+    The float expression intentionally matches the spend shim's historical
+    arithmetic so frozen spend totals retain their established last digits.
+    """
+    table = (
+        CODEX_PRICING_PRIORITY
+        if (tier or "priority").strip().lower() == "priority"
+        else CODEX_PRICING_STANDARD
+    )
+    key = (model or "").strip().lower()
+    rates = table.get(key)
+    if rates is None:
+        return None, None
+    c_in, c_cached, c_write, c_out = rates
+    inp = usage.input_tokens or 0
+    out = usage.output_tokens or 0
+    cache_read = usage.cache_read_tokens or 0
+    cache_write = usage.cache_write_tokens or 0
+    amount = (
+        inp * c_in / 1e6
+        + cache_read * c_cached / 1e6
+        + (cache_write * c_write / 1e6 if c_write is not None else 0)
+        + out * c_out / 1e6
+    )
+    return amount, key
+
+
+_BEDROCK_REGION_PREFIX = re.compile(r"^(us|eu|apac|us-gov)\.")
+_BEDROCK_PROVIDER_PREFIX = re.compile(r"^(anthropic|amazon|meta|mistral|cohere)\.")
+_BEDROCK_VERSION_SUFFIX = re.compile(r"-v\d+:\d+$")
+_BEDROCK_VERSION_SUFFIX_BARE = re.compile(r"-v\d+$")
+_BEDROCK_DATE_SUFFIX = re.compile(r"-\d{8}$")
+
+
+def _strip_bedrock_decorations(model: str) -> str:
+    """Strip Bedrock region/provider/version decorations for family fallback."""
+    name = model or ""
+    name = _BEDROCK_REGION_PREFIX.sub("", name)
+    name = _BEDROCK_PROVIDER_PREFIX.sub("", name)
+    name = _BEDROCK_VERSION_SUFFIX.sub("", name)
+    name = _BEDROCK_VERSION_SUFFIX_BARE.sub("", name)
+    return _BEDROCK_DATE_SUFFIX.sub("", name)
+
+
+@dataclass(frozen=True)
+class CorrectionsConfig:
+    """Explicit cost-correction gate; disabled preserves upstream behavior."""
+
+    enabled: bool = False
+    codex_tier: str = "priority"
+    bedrock_cross_region_factor: Decimal = Decimal("1")
+
+
+_NO_CORRECTIONS = CorrectionsConfig(enabled=False)
+
+
+def _scale_corrected_result(
+    result: CostResult, factor: Decimal, note: str
+) -> CostResult:
+    if factor == Decimal("1") or result.amount_usd is None:
+        return result
+    amount = result.amount_usd * factor
+    return replace(
+        result,
+        amount_usd=amount,
+        label=f"~${amount:.2f}",
+        notes=result.notes + (note,),
+    )
+
+
+def apply_corrections(
+    base: CostResult,
+    model: str,
+    usage: CanonicalUsage,
+    *,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
+    cfg: CorrectionsConfig,
+) -> CostResult:
+    """Apply spend_core's corrections without changing the base API path."""
+    provider_name = (provider or "").strip().lower()
+    model_lower = (model or "").strip().lower()
+    is_bedrock = provider_name == "bedrock" or base_url_host_matches(
+        base_url or "", "amazonaws.com"
+    )
+
+    if base.status == "included" and provider_name == "openai-codex":
+        amount, _key = codex_cost(model, usage, tier=cfg.codex_tier)
+        if amount is not None:
+            return replace(
+                base,
+                amount_usd=Decimal(str(amount)),
+                status="estimated",
+                source="official_docs_snapshot",
+                label=f"~${amount:.2f}",
+                pricing_version=(
+                    "openai-api-2026-07-14 "
+                    f"(company OAuth real API price, tier={cfg.codex_tier})"
+                ),
+            )
+
+    elif base.status in ("estimated", "actual", "included"):
+        if is_bedrock:
+            return _scale_corrected_result(
+                base, cfg.bedrock_cross_region_factor, "bedrock-cross-region-uplift"
+            )
+        return base
+
+    if provider_name == "bedrock" or model_lower.startswith(("us.", "eu.", "apac.")):
+        normalized = _strip_bedrock_decorations(model)
+        if normalized and normalized != model:
+            retried = estimate_usage_cost(
+                normalized,
+                usage,
+                provider="anthropic",
+                corrections=_NO_CORRECTIONS,
+            )
+            if retried.status in ("estimated", "actual"):
+                return _scale_corrected_result(
+                    retried,
+                    cfg.bedrock_cross_region_factor if is_bedrock else Decimal("1"),
+                    "bedrock-family-fallback",
+                )
+
+    if model_lower.startswith(("gpt-", "o1", "o3", "o4")):
+        amount, _key = codex_cost(model, usage, tier=cfg.codex_tier)
+        if amount is not None:
+            return replace(
+                base,
+                amount_usd=Decimal(str(amount)),
+                status="estimated",
+                source="official_docs_snapshot",
+                label=f"~${amount:.2f}",
+                pricing_version=(
+                    "openai-api-2026-07-14 "
+                    f"(company OAuth real API price, tier={cfg.codex_tier})"
+                ),
+            )
+    if "claude" in model_lower or "anthropic" in model_lower:
+        normalized = _strip_bedrock_decorations(model) or model
+        retried = estimate_usage_cost(
+            normalized,
+            usage,
+            provider="anthropic",
+            corrections=_NO_CORRECTIONS,
+        )
+        if retried.status in ("estimated", "actual"):
+            return _scale_corrected_result(
+                retried,
+                cfg.bedrock_cross_region_factor if is_bedrock else Decimal("1"),
+                "claude-family-fallback",
+            )
+
+    return base
+
+
 def _normalize_anthropic_model_name(model: str) -> str:
     """Normalize Anthropic model name variants to canonical form.
 
@@ -1199,7 +1390,7 @@ def normalize_usage(
     )
 
 
-def estimate_usage_cost(
+def _estimate_usage_cost_base(
     model_name: str,
     usage: CanonicalUsage,
     *,
@@ -1275,6 +1466,41 @@ def estimate_usage_cost(
         fetched_at=entry.fetched_at,
         pricing_version=entry.pricing_version,
         notes=tuple(notes),
+    )
+
+
+def estimate_usage_cost(
+    model_name: str,
+    usage: CanonicalUsage,
+    *,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    corrections: Optional[CorrectionsConfig] = None,
+) -> CostResult:
+    """Estimate usage cost, optionally applying an explicit correction gate.
+
+    ``corrections=None`` remains the original upstream behavior. The offline
+    spend shim passes an enabled ``CorrectionsConfig`` explicitly so it does
+    not depend on ambient config or alter other pricing callers.
+    """
+    base = _estimate_usage_cost_base(
+        model_name,
+        usage,
+        provider=provider,
+        base_url=base_url,
+        api_key=api_key,
+    )
+    cfg = corrections if corrections is not None else _NO_CORRECTIONS
+    if not cfg.enabled:
+        return base
+    return apply_corrections(
+        base,
+        model_name,
+        usage,
+        provider=provider,
+        base_url=base_url,
+        cfg=cfg,
     )
 
 

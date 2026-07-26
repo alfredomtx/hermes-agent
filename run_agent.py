@@ -3657,13 +3657,90 @@ class AIAgent:
 
         Called by the gateway timeout handler to report what the agent was doing
         when it was killed, and by the periodic "still working" notifications.
+
+        Keep this gateway-facing snapshot self-contained.  The richer activity
+        helper module is desktop-only, while the gateway already has the live
+        activity fields on the agent itself.
         """
-        elapsed = time.time() - self._last_activity_ts
+        now = time.time()
+        elapsed = now - self._last_activity_ts
+
+        current_tool = getattr(self, "_current_tool", None)
+        current_tool_preview = getattr(self, "_current_tool_preview", None)
+        started_at = getattr(self, "_current_tool_started_at", None)
+        current_tool_elapsed = None
+        if isinstance(started_at, (int, float)):
+            current_tool_elapsed = max(0.0, now - started_at)
+
+        recent_tool_activity = getattr(self, "_recent_tool_activity", None)
+        if not isinstance(recent_tool_activity, list):
+            recent_tool_activity = []
+        else:
+            recent_tool_activity = list(recent_tool_activity[-3:])
+        current_label = current_tool_preview or current_tool
+        if current_label and current_tool_elapsed is not None:
+            recent_tool_activity = (
+                recent_tool_activity
+                + [
+                    {
+                        "name": str(current_tool or "tool"),
+                        "label": str(current_label),
+                        "duration": current_tool_elapsed,
+                        "state": "running",
+                        "is_error": False,
+                    }
+                ]
+            )[-3:]
+
+        current_todo = None
+        todo_store = getattr(self, "_todo_store", None)
+        if todo_store is not None:
+            try:
+                items = (
+                    todo_store.read_with_timing()
+                    if hasattr(todo_store, "read_with_timing")
+                    else todo_store.read()
+                )
+                selected = next(
+                    (
+                        item
+                        for item in items
+                        if isinstance(item, dict) and item.get("status") == "in_progress"
+                    ),
+                    None,
+                )
+                if selected is None:
+                    selected = next(
+                        (
+                            item
+                            for item in items
+                            if isinstance(item, dict) and item.get("status") == "pending"
+                        ),
+                        None,
+                    )
+                if selected is not None:
+                    current_todo = {
+                        "content": selected.get("content") or selected.get("id") or "todo",
+                        "status": selected.get("status") or "pending",
+                        "elapsed_seconds": selected.get("elapsed_seconds"),
+                    }
+            except Exception:
+                current_todo = None
+
         return {
             "last_activity_ts": self._last_activity_ts,
             "last_activity_desc": self._last_activity_desc,
             "seconds_since_activity": round(elapsed, 1),
-            "current_tool": self._current_tool,
+            "current_tool": current_tool,
+            "current_tool_preview": current_tool_preview,
+            "current_tool_elapsed": (
+                round(current_tool_elapsed, 1)
+                if isinstance(current_tool_elapsed, (int, float))
+                else None
+            ),
+            "last_completed_tool": getattr(self, "_last_completed_tool", None),
+            "recent_tool_activity": recent_tool_activity,
+            "current_todo": current_todo,
             "api_call_count": self._api_call_count,
             "max_iterations": self.max_iterations,
             "budget_used": self.iteration_budget.used,

@@ -1888,6 +1888,8 @@ class TelegramAdapter(BasePlatformAdapter):
         message_id: str,
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
+        *,
+        markup_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Optional[SendResult]:
         """Edit an existing message in place as a rich message (Bot API 10.1).
 
@@ -1916,6 +1918,8 @@ class TelegramAdapter(BasePlatformAdapter):
             reply_to_mode=self._reply_to_mode,
         )
         payload.update({k: v for k, v in thread_kwargs.items() if v is not None})
+        if markup_kwargs:
+            payload.update(markup_kwargs)
         if getattr(self, "_disable_link_previews", False):
             payload["link_preview_options"] = {"is_disabled": True}
         try:
@@ -4304,21 +4308,36 @@ class TelegramAdapter(BasePlatformAdapter):
     @staticmethod
     def _inline_keyboard_from_buttons(buttons):
         """Build a Telegram inline keyboard from generic button mappings."""
-        if not buttons:
+        if not buttons or InlineKeyboardMarkup is None or InlineKeyboardButton is None:
             return None
 
-        row = []
-        for button in buttons:
-            if not isinstance(button, dict):
+        rows = [buttons] if isinstance(buttons[0], dict) else buttons
+        keyboard = []
+        for row in rows:
+            if not isinstance(row, list):
                 continue
-            text = button.get("text")
-            callback_data = button.get("callback_data")
-            if not text or not callback_data:
-                continue
-            row.append(
-                InlineKeyboardButton(text=text, callback_data=callback_data)
-            )
-        return InlineKeyboardMarkup([row]) if row else None
+            built_row = []
+            for button in row:
+                if not isinstance(button, dict):
+                    continue
+                text = button.get("text")
+                callback_data = button.get("callback_data")
+                url = button.get("url")
+                if not text:
+                    continue
+                if callback_data:
+                    built_row.append(
+                        InlineKeyboardButton(
+                            text=str(text), callback_data=str(callback_data)
+                        )
+                    )
+                elif url:
+                    built_row.append(
+                        InlineKeyboardButton(text=str(text), url=str(url))
+                    )
+            if built_row:
+                keyboard.append(built_row)
+        return InlineKeyboardMarkup(keyboard) if keyboard else None
 
     async def send(
         self,
@@ -4778,9 +4797,19 @@ class TelegramAdapter(BasePlatformAdapter):
         # table that exceeds the MarkdownV2 limit must not be split into legacy
         # chunks.  Falls back to the legacy edit path (overflow split included)
         # on capability/permanent rejection.
-        if finalize and buttons is None and self._rich_eligible(content):
+        _buttons_provided = buttons is not None
+        _markup_kw: Dict[str, Any] = (
+            {"reply_markup": self._inline_keyboard_from_buttons(buttons)}
+            if _buttons_provided
+            else {}
+        )
+        if finalize and self._rich_eligible(content):
             rich_result = await self._try_edit_rich(
-                chat_id, message_id, content, metadata=metadata,
+                chat_id,
+                message_id,
+                content,
+                metadata=metadata,
+                markup_kwargs=_markup_kw,
             )
             if rich_result is not None:
                 return rich_result
@@ -9636,6 +9665,12 @@ class TelegramAdapter(BasePlatformAdapter):
             _chat_id_str if thread_id_str else None,
         )
 
+        # Shared-topic context backfill. When this message opens a NEW session
+        # window in a SHARED topic/group, pull recent activity from OTHER
+        # Hermes sessions bound to the same topic out of state.db and hand it
+        # to the run.py channel_context fold. DMs and established sessions skip.
+        _channel_context = self._compute_topic_backfill_context(source)
+
         return MessageEvent(
             text=message.text or "",
             message_type=msg_type,
@@ -9647,8 +9682,93 @@ class TelegramAdapter(BasePlatformAdapter):
             reply_to_text=reply_to_text,
             auto_skill=topic_skill,
             channel_prompt=_channel_prompt,
+            channel_context=_channel_context,
             timestamp=message.date,
         )
+
+    def _compute_topic_backfill_context(self, source) -> Optional[str]:
+        """Return a shared-topic backfill block for a new-session message.
+
+        Gated on shared multi-user session (skips DMs), ``topic_backfill``
+        enabled in gateway config, and a NEW-session window detected via the
+        session store (an empty/absent transcript for this topic's session
+        key). Established sessions skip so the block is injected only once.
+
+        Never raises — a backfill failure must not break message handling.
+        """
+        try:
+            from gateway.session import is_shared_multi_user_session
+
+            group_per_user = self.config.extra.get("group_sessions_per_user", True)
+            thread_per_user = self.config.extra.get("thread_sessions_per_user", False)
+            if not is_shared_multi_user_session(
+                source,
+                group_sessions_per_user=group_per_user,
+                thread_sessions_per_user=thread_per_user,
+            ):
+                return None
+
+            try:
+                from gateway.config import load_gateway_config
+
+                _gw_cfg = load_gateway_config()
+                cfg = getattr(_gw_cfg, "topic_backfill", None)
+            except Exception:
+                cfg = None
+            if cfg is None or not getattr(cfg, "enabled", False):
+                return None
+
+            # Read-only new-session detection. Calling get_or_create_session here
+            # would mutate updated_at and make the later run.py new-session check
+            # miss the first-turn boundary.
+            store = getattr(self, "_session_store", None)
+            if store is None:
+                return None
+            try:
+                session_key = store._generate_session_key(source)
+            except Exception:
+                return None
+
+            entry = None
+            try:
+                with store._lock:
+                    store._ensure_loaded_locked()
+                    entry = store._entries.get(session_key)
+            except Exception:
+                entry = None
+
+            current_session_id = getattr(entry, "session_id", None) if entry else None
+            if entry is not None:
+                try:
+                    transcript = store.load_transcript(current_session_id)
+                except Exception:
+                    transcript = []
+                real_turns = [
+                    m for m in (transcript or [])
+                    if isinstance(m, dict)
+                    and m.get("role") in ("user", "assistant")
+                    and not m.get("observed")
+                ]
+                if real_turns:
+                    return None
+
+            from gateway.topic_backfill import build_topic_backfill
+
+            return build_topic_backfill(
+                platform="telegram",
+                chat_id=str(source.chat_id),
+                thread_id=source.thread_id,
+                exclude_session_id=current_session_id,
+                max_messages=getattr(cfg, "max_messages", 15),
+                max_age_hours=getattr(cfg, "max_age_hours", 24),
+            )
+        except Exception as e:
+            logger.debug(
+                "[%s] topic backfill skipped: %s",
+                getattr(self, "name", "telegram"),
+                e,
+            )
+            return None
 
     # ── Message reactions (processing lifecycle) ──────────────────────────
 

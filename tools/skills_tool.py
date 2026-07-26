@@ -66,13 +66,16 @@ Usage:
     content = skill_view("axolotl", "references/dataset-formats.md")
 """
 
+import hashlib
 import json
 import logging
+import threading
 import time
 
 from hermes_constants import get_hermes_home, display_hermes_home
 import os
 import re
+from collections import OrderedDict
 from enum import Enum
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Dict, Any, List, Optional, Set, Tuple
@@ -86,6 +89,122 @@ from agent.skill_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+_SKILL_VIEW_MAIN_MARKER = "<main>"
+_SKILL_VIEW_DEDUPE_MAX_SESSIONS = 128
+_SKILL_VIEW_DEDUPE_MAX_IDENTITIES_PER_SESSION = 256
+
+_skill_view_dedupe_lock = threading.RLock()
+_skill_view_dedupe: OrderedDict[
+    str, OrderedDict[tuple[str, str], str]
+] = OrderedDict()
+_skill_view_dedupe_counters = {
+    "skill_view_dedupe_hits": 0,
+    "skill_view_chars_avoided": 0,
+    "skill_view_approx_tokens_avoided": 0,
+}
+
+
+def _skill_view_identity(
+    canonical_name: str,
+    linked_file: str | None,
+) -> tuple[str, str]:
+    return canonical_name, linked_file or _SKILL_VIEW_MAIN_MARKER
+
+
+def _skill_view_dedupe_before_payload(
+    *,
+    session_id: str | None,
+    canonical_name: str,
+    linked_file: str | None,
+    rendered_content: str,
+) -> tuple[bool, str]:
+    try:
+        content_hash = hashlib.sha256(rendered_content.encode("utf-8")).hexdigest()
+    except Exception as exc:
+        logger.warning(
+            "Skill-view dedupe hashing failed open for skill=%s error=%s",
+            canonical_name,
+            type(exc).__name__,
+        )
+        return False, ""
+
+    if not isinstance(session_id, str) or not session_id.strip():
+        return False, content_hash
+
+    identity = _skill_view_identity(canonical_name, linked_file)
+    try:
+        with _skill_view_dedupe_lock:
+            session = _skill_view_dedupe.setdefault(session_id, OrderedDict())
+            _skill_view_dedupe.move_to_end(session_id)
+            unchanged = session.get(identity) == content_hash
+            session[identity] = content_hash
+            session.move_to_end(identity)
+
+            while len(session) > _SKILL_VIEW_DEDUPE_MAX_IDENTITIES_PER_SESSION:
+                session.popitem(last=False)
+            while len(_skill_view_dedupe) > _SKILL_VIEW_DEDUPE_MAX_SESSIONS:
+                _skill_view_dedupe.popitem(last=False)
+
+            if unchanged:
+                chars = len(rendered_content)
+                approx_tokens = (chars + 3) // 4
+                _skill_view_dedupe_counters["skill_view_dedupe_hits"] += 1
+                _skill_view_dedupe_counters["skill_view_chars_avoided"] += chars
+                _skill_view_dedupe_counters[
+                    "skill_view_approx_tokens_avoided"
+                ] += approx_tokens
+                logger.info(
+                    "skill_view.dedupe_hit skill=%s linked_file=%s "
+                    "chars_avoided=%d approx_tokens_avoided=%d",
+                    canonical_name,
+                    linked_file or _SKILL_VIEW_MAIN_MARKER,
+                    chars,
+                    approx_tokens,
+                )
+            return unchanged, content_hash
+    except Exception as exc:
+        logger.warning(
+            "Skill-view dedupe failed open for session=%s skill=%s error=%s",
+            session_id,
+            canonical_name,
+            type(exc).__name__,
+        )
+        return False, content_hash
+
+
+def clear_skill_view_dedupe_session(session_id: str | None) -> None:
+    if not isinstance(session_id, str) or not session_id:
+        return
+    try:
+        with _skill_view_dedupe_lock:
+            _skill_view_dedupe.pop(session_id, None)
+    except Exception as exc:
+        logger.warning(
+            "Skill-view dedupe clear failed open for session=%s error=%s",
+            session_id,
+            type(exc).__name__,
+        )
+
+
+def _skill_view_unchanged_receipt(
+    *,
+    canonical_name: str,
+    linked_file: str | None,
+    content_hash: str,
+) -> str:
+    payload = {
+        "success": True,
+        "name": canonical_name,
+        "content_hash": content_hash,
+        "unchanged": True,
+        "message": "Unchanged skill content was already returned in this session.",
+    }
+    if linked_file:
+        payload["file"] = linked_file
+    return json.dumps(payload, ensure_ascii=False)
+
 
 # Per-session skill discovery cache.  _find_all_skills() re-reads every
 # SKILL.md on every call; with hundreds of skills this is wasteful.
@@ -861,6 +980,7 @@ def _serve_plugin_skill(
     *,
     preprocess: bool = True,
     session_id: str | None = None,
+    dedupe_session_id: str | None = None,
 ) -> str:
     """Read a plugin-provided skill, apply guards, return JSON."""
     from hermes_cli.plugins import _get_disabled_plugins, get_plugin_manager
@@ -945,11 +1065,26 @@ def _serve_plugin_skill(
                 "Could not preprocess plugin skill %s:%s", namespace, bare, exc_info=True
             )
 
+    final_content = f"{banner}{rendered_content}" if banner else rendered_content
+    unchanged, content_hash = _skill_view_dedupe_before_payload(
+        session_id=dedupe_session_id,
+        canonical_name=f"{namespace}:{bare}",
+        linked_file=None,
+        rendered_content=final_content,
+    )
+    if unchanged:
+        return _skill_view_unchanged_receipt(
+            canonical_name=f"{namespace}:{bare}",
+            linked_file=None,
+            content_hash=content_hash,
+        )
+
     return json.dumps(
         {
             "success": True,
             "name": f"{namespace}:{bare}",
-            "content": f"{banner}{rendered_content}" if banner else rendered_content,
+            "content": final_content,
+            "content_hash": content_hash,
             "description": description,
             "linked_files": None,
             "readiness_status": SkillReadinessStatus.AVAILABLE.value,
@@ -963,6 +1098,7 @@ def skill_view(
     file_path: str = None,
     task_id: str = None,
     preprocess: bool = True,
+    session_id: str | None = None,
 ) -> str:
     """
     View the content of a skill or a specific file within a skill directory.
@@ -1042,6 +1178,7 @@ def skill_view(
                     bare,
                     preprocess=preprocess,
                     session_id=task_id,
+                    dedupe_session_id=session_id,
                 )
 
             # Plugin exists but this specific skill is missing?
@@ -1305,6 +1442,7 @@ def skill_view(
                 )
 
             target_file = skill_dir / file_path
+            linked_file = str(PurePosixPath(file_path))
 
             # Security: Verify resolved path is still within skill directory
             traversal_error = validate_within_dir(target_file, skill_dir)
@@ -1368,12 +1506,29 @@ def skill_view(
                 content = target_file.read_text(encoding="utf-8")
             except UnicodeDecodeError:
                 # Binary file - return info about it instead
+                binary_content = (
+                    f"[Binary file: {target_file.name}, size: "
+                    f"{target_file.stat().st_size} bytes]"
+                )
+                unchanged, content_hash = _skill_view_dedupe_before_payload(
+                    session_id=session_id,
+                    canonical_name=str(resolved_name),
+                    linked_file=linked_file,
+                    rendered_content=binary_content,
+                )
+                if unchanged:
+                    return _skill_view_unchanged_receipt(
+                        canonical_name=str(resolved_name),
+                        linked_file=linked_file,
+                        content_hash=content_hash,
+                    )
                 return json.dumps(
                     {
                         "success": True,
                         "name": name,
                         "file": file_path,
-                        "content": f"[Binary file: {target_file.name}, size: {target_file.stat().st_size} bytes]",
+                        "content": binary_content,
+                        "content_hash": content_hash,
                         "is_binary": True,
                     },
                     ensure_ascii=False,
@@ -1390,12 +1545,26 @@ def skill_view(
                     exc_info=True,
                 )
 
+            unchanged, content_hash = _skill_view_dedupe_before_payload(
+                session_id=session_id,
+                canonical_name=str(resolved_name),
+                linked_file=linked_file,
+                rendered_content=content,
+            )
+            if unchanged:
+                return _skill_view_unchanged_receipt(
+                    canonical_name=str(resolved_name),
+                    linked_file=linked_file,
+                    content_hash=content_hash,
+                )
+
             return json.dumps(
                 {
                     "success": True,
                     "name": name,
                     "file": file_path,
                     "content": content,
+                    "content_hash": content_hash,
                     "file_type": target_file.suffix,
                 },
                 ensure_ascii=False,
@@ -1561,6 +1730,20 @@ def skill_view(
                     "Could not preprocess skill content for %s", skill_name, exc_info=True
                 )
 
+        canonical_name = str(skill_name)
+        unchanged, content_hash = _skill_view_dedupe_before_payload(
+            session_id=session_id,
+            canonical_name=canonical_name,
+            linked_file=None,
+            rendered_content=rendered_content,
+        )
+        if unchanged:
+            return _skill_view_unchanged_receipt(
+                canonical_name=canonical_name,
+                linked_file=None,
+                content_hash=content_hash,
+            )
+
         result = {
             "success": True,
             "name": skill_name,
@@ -1568,6 +1751,7 @@ def skill_view(
             "tags": tags,
             "related_skills": related_skills,
             "content": rendered_content,
+            "content_hash": content_hash,
             "path": rel_path,
             "skill_dir": str(skill_dir) if skill_dir else None,
             "linked_files": linked_files if linked_files else None,
@@ -1730,7 +1914,10 @@ def _skill_view_with_bump(args, **kw):
     telemetry failure never breaks the tool call."""
     name = args.get("name", "")
     result = skill_view(
-        name, file_path=args.get("file_path"), task_id=kw.get("task_id")
+        name,
+        file_path=args.get("file_path"),
+        task_id=kw.get("task_id"),
+        session_id=kw.get("session_id"),
     )
     try:
         parsed = json.loads(result)

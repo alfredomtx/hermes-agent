@@ -88,6 +88,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="<platform>", cli_only=True),
     CommandDef("branch", "Branch the current session (explore a different path)", "Session",
                aliases=("fork",), args_hint="[name]"),
+    CommandDef("forktopic", "Fork this Telegram topic into a new seeded topic", "Session",
+               gateway_only=True, args_hint="[name]"),
     CommandDef("compress", "Compress conversation context (add 'here [N]' to keep recent N turns; --preview shows what would happen)", "Session",
                aliases=("compact",), args_hint="[here [N] | focus topic | --preview|--dry-run]"),
     CommandDef("rollback", "List or restore filesystem checkpoints", "Session",
@@ -1158,6 +1160,12 @@ _SLACK_RESERVED_COMMANDS = frozenset({
 # native slot, the alias spelling stays reachable via /hermes reset).
 _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 
+# Keep high-value canonical commands in the native manifest as well.  The
+# registry can reach Slack's 50-command cap when optional/plugin commands are
+# present; /version is part of the Telegram/Slack command contract and must
+# not be silently displaced by a later registry entry.
+_SLACK_PRIORITY_CANONICALS = ("version",)
+
 # Canonical commands intentionally NOT given a native Slack slash slot. Slack
 # caps apps at 50 slash commands and the registry is at that ceiling; rather
 # than let the clamp silently drop whichever command sorts last (and break
@@ -1172,7 +1180,8 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     displacing existing native Slack slash commands at the 50-command cap.
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
 #   - egress: Docker-only proxy status; reachable as /hermes egress on Slack.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress"})
+#   - update: the self-update surface; reached via /hermes update on Slack.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "update"})
 
 
 def _sanitize_slack_name(raw: str) -> str:
@@ -1245,6 +1254,18 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
         cmd = _alias_to_cmd.get(alias)
         if cmd is not None:
             _add(alias, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")
+
+    # Priority pass for canonical names.  Keep this separate from aliases so
+    # the cap cannot trade a required canonical command for an alias spelling.
+    _canonical_to_cmd = {
+        cmd.name: cmd
+        for cmd in COMMAND_REGISTRY
+        if _is_gateway_available(cmd, overrides)
+    }
+    for canonical in _SLACK_PRIORITY_CANONICALS:
+        cmd = _canonical_to_cmd.get(canonical)
+        if cmd is not None:
+            _add(cmd.name, cmd.description, cmd.args_hint or "")
 
     # First pass: canonical names (so they win slots if we hit the cap).
     for cmd in COMMAND_REGISTRY:

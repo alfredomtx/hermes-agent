@@ -867,6 +867,12 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
                 # corruption. A tokenizer-capable SessionDB serves it fine;
                 # a tokenizer-less one self-heals by dropping the triggers.
                 return None
+            if (
+                "database is locked" in msg
+                or "database table is locked" in msg
+                or "database is busy" in msg
+            ):
+                return None
             return str(exc)
         return None
     except sqlite3.DatabaseError as exc:
@@ -5227,6 +5233,50 @@ class SessionDB:
             row = cursor.fetchone()
         return dict(row) if row else None
 
+    def list_child_sessions(self, parent_session_id: str) -> List[Dict[str, Any]]:
+        """List delegation (subagent) child sessions of a parent, oldest first.
+
+        Powers the Desktop Observatory historical timeline's child lanes: each
+        delegated subagent is persisted as its own session row with real
+        ``started_at`` / ``ended_at`` / ``tool_call_count``, so a finished run
+        can be reconstructed from storage instead of the ephemeral live store.
+
+        IMPORTANT: ``parent_session_id`` is not subagent-exclusive — branch
+        forks and compression/handoff continuations also set it. Filtering
+        ``source = 'subagent'`` is required so the timeline never renders
+        unrelated conversations as delegation lanes.
+
+        ``status`` is derived from ``ended_at`` (authoritative), not
+        ``end_reason`` — most finished subagent rows have an empty
+        ``end_reason``.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, title, started_at, ended_at, tool_call_count, "
+                "message_count, model, end_reason "
+                "FROM sessions "
+                "WHERE parent_session_id = ? AND source = 'subagent' "
+                "ORDER BY started_at ASC, id ASC",
+                (parent_session_id,),
+            ).fetchall()
+
+        children: List[Dict[str, Any]] = []
+        for row in rows:
+            ended_at = row["ended_at"]
+            children.append(
+                {
+                    "id": row["id"],
+                    "title": row["title"],
+                    "started_at": row["started_at"],
+                    "ended_at": ended_at,
+                    "tool_call_count": row["tool_call_count"] or 0,
+                    "message_count": row["message_count"] or 0,
+                    "model": row["model"],
+                    "status": "completed" if ended_at is not None else "running",
+                }
+            )
+        return children
+
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
         """Resolve an exact or uniquely prefixed session ID to the full ID.
 
@@ -9217,16 +9267,6 @@ class SessionDB:
 
         deleted = self._execute_write(_do)
         if deleted:
-            try:
-                from agent.subagent_context_artifacts import (
-                    delete_subagent_context_artifacts_for_sessions,
-                )
-
-                delete_subagent_context_artifacts_for_sessions(
-                    [session_id, *removed_delegate_ids], session_db=self
-                )
-            except Exception:
-                pass
             for delegate_id in removed_delegate_ids:
                 self._remove_session_files(sessions_dir, delegate_id)
             self._remove_session_files(sessions_dir, session_id)

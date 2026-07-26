@@ -978,7 +978,14 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
         logger.debug("Keychain: no entry found for 'Claude Code-credentials'")
         return None
 
-    raw = result.stdout.strip()
+    raw = result.stdout
+    # Mocked subprocess results may expose a non-text ``stdout`` sentinel
+    # (for example, ``MagicMock``). Treat that as an absent keychain payload;
+    # real JSON strings/bytes still go through strict parsing below.
+    if not isinstance(raw, (str, bytes, bytearray)):
+        logger.debug("Keychain: security command returned no text payload")
+        return None
+    raw = raw.strip()
     if not raw:
         return None
 
