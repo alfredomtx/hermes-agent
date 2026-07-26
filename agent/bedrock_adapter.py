@@ -36,6 +36,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+_BEDROCK_CONTEXT_1M_BETA = "context-1m-2025-08-07"
+
 # ---------------------------------------------------------------------------
 # Ensure boto3/botocore are installed before any code in this module runs.
 # Upstream removed boto3 from [all] extras (PRs #24220, #24515); lazy_deps
@@ -59,6 +61,63 @@ _bedrock_control_client_cache: Dict[str, Any] = {}
 
 
 _MIN_BOTO3_VERSION = (1, 34, 59)
+
+_BEDROCK_DEFAULT_READ_TIMEOUT = 600.0
+_BEDROCK_DEFAULT_CONNECT_TIMEOUT = 10.0
+_BEDROCK_DEFAULT_RETRIES_MAX_ATTEMPTS = 3
+_BEDROCK_DEFAULT_RETRIES_MODE = "adaptive"
+
+
+def _positive_float(raw: Any, default: float) -> float:
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def _positive_int(raw: Any, default: int) -> int:
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def _bedrock_config_section() -> Dict[str, Any]:
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly()
+    except Exception:
+        return {}
+    bedrock = cfg.get("bedrock", {}) if isinstance(cfg, dict) else {}
+    return bedrock if isinstance(bedrock, dict) else {}
+
+
+def _build_botocore_config():
+    """Build the shared timeout/retry policy for Bedrock SDK clients."""
+    from botocore.config import Config
+
+    cfg = _bedrock_config_section()
+    retries_mode = str(
+        cfg.get("retries_mode") or _BEDROCK_DEFAULT_RETRIES_MODE
+    ).strip() or _BEDROCK_DEFAULT_RETRIES_MODE
+    return Config(
+        read_timeout=_positive_float(
+            cfg.get("read_timeout"), _BEDROCK_DEFAULT_READ_TIMEOUT
+        ),
+        connect_timeout=_positive_float(
+            cfg.get("connect_timeout"), _BEDROCK_DEFAULT_CONNECT_TIMEOUT
+        ),
+        retries={
+            "max_attempts": _positive_int(
+                cfg.get("retries_max_attempts"),
+                _BEDROCK_DEFAULT_RETRIES_MAX_ATTEMPTS,
+            ),
+            "mode": retries_mode,
+        },
+    )
 
 
 def _require_boto3():
@@ -96,7 +155,9 @@ def _get_bedrock_runtime_client(region: str):
     if region not in _bedrock_runtime_client_cache:
         boto3 = _require_boto3()
         _bedrock_runtime_client_cache[region] = boto3.client(
-            "bedrock-runtime", region_name=region,
+            "bedrock-runtime",
+            region_name=region,
+            config=_build_botocore_config(),
         )
     return _bedrock_runtime_client_cache[region]
 
@@ -106,7 +167,9 @@ def _get_bedrock_control_client(region: str):
     if region not in _bedrock_control_client_cache:
         boto3 = _require_boto3()
         _bedrock_control_client_cache[region] = boto3.client(
-            "bedrock", region_name=region,
+            "bedrock",
+            region_name=region,
+            config=_build_botocore_config(),
         )
     return _bedrock_control_client_cache[region]
 
@@ -1015,6 +1078,15 @@ def stream_converse_with_callbacks(
 # High-level API: call Bedrock Converse
 # ---------------------------------------------------------------------------
 
+
+def _requires_context_1m_beta(model_id: str) -> bool:
+    """Whether Bedrock Converse needs Claude's long-context request field."""
+    return (
+        is_anthropic_bedrock_model(model_id)
+        and get_bedrock_context_length(model_id) > 200_000
+    )
+
+
 def build_converse_kwargs(
     model: str,
     messages: List[Dict],
@@ -1082,6 +1154,12 @@ def build_converse_kwargs(
         content = converse_messages[-2].get("content")
         if isinstance(content, list) and content:
             content.append({"cachePoint": {"type": "default"}})
+
+    if _requires_context_1m_beta(model):
+        fields = kwargs.setdefault("additionalModelRequestFields", {})
+        betas = fields.setdefault("anthropic_beta", [])
+        if _BEDROCK_CONTEXT_1M_BETA not in betas:
+            betas.append(_BEDROCK_CONTEXT_1M_BETA)
 
     if guardrail_config:
         kwargs["guardrailConfig"] = guardrail_config

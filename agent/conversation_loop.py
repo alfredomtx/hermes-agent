@@ -232,6 +232,15 @@ def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str
     )
 
 
+def _tool_budget_exhaustion_response(agent) -> str:
+    budget = getattr(agent, "tool_budget", None)
+    reason = getattr(budget, "exhaustion_reason", None) or "limit"
+    return (
+        "Tool budget exhausted "
+        f"({reason}); no further model-requested tools were executed."
+    )
+
+
 def _ra():
     """Lazy reference to ``run_agent`` so callers can patch
     ``run_agent.handle_function_call`` / ``run_agent._set_interrupt`` /
@@ -1038,6 +1047,17 @@ def run_conversation(
         )
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+        # A pre-exhausted per-agent tool budget must not cause even one
+        # provider/API call. This also covers a zero-sized configured limit.
+        _tool_budget = getattr(agent, "tool_budget", None)
+        if _tool_budget is not None and _tool_budget.exhausted:
+            _turn_exit_reason = (
+                "tool_budget_exhausted("
+                f"{_tool_budget.exhaustion_reason or 'limit'})"
+            )
+            final_response = _tool_budget_exhaustion_response(agent)
+            break
+
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)
@@ -1984,6 +2004,28 @@ def run_conversation(
                             allow_stream=False,
                             is_github_responses=agent._is_copilot_url(),
                         )
+                    ref = getattr(agent, "_subagent_context_ref", None)
+                    if isinstance(ref, dict) and ref.get("child_session_id"):
+                        try:
+                            from agent.subagent_context_artifacts import (
+                                build_subagent_context_payload,
+                                update_subagent_context_artifact_capture,
+                            )
+
+                            payload = build_subagent_context_payload(
+                                ref=ref,
+                                canonical_messages=api_messages,
+                                provider_request=next_api_kwargs,
+                                api_call_count=api_call_count,
+                                retry_count=retry_count,
+                            )
+                            update_subagent_context_artifact_capture(
+                                str(ref["child_session_id"]),
+                                payload,
+                                session_db=getattr(agent, "_session_db", None),
+                            )
+                        except Exception:
+                            logger.debug("subagent context artifact capture failed", exc_info=True)
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
@@ -5738,6 +5780,16 @@ def run_conversation(
                         pass
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+
+                _tool_budget = getattr(agent, "tool_budget", None)
+                if _tool_budget is not None and _tool_budget.exhausted:
+                    _turn_exit_reason = (
+                        "tool_budget_exhausted("
+                        f"{_tool_budget.exhaustion_reason or 'limit'})"
+                    )
+                    final_response = _tool_budget_exhaustion_response(agent)
+                    agent._emit_status(final_response)
+                    break
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision

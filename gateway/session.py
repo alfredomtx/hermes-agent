@@ -13,6 +13,7 @@ import hashlib
 import logging
 import os
 import json
+import re
 import threading
 import uuid
 from pathlib import Path
@@ -145,6 +146,61 @@ def _is_session_key_unsafe(value: object) -> bool:
     return len(s) >= 2 and s[0].isalpha() and s[1] == ":"
 
 
+# ---------------------------------------------------------------------------
+# Session binding — constrained logical keys for adapters/plugins that need
+# several physical deliveries (for example GitHub webhooks and a Telegram
+# topic) to share one ordered conversation.
+# ---------------------------------------------------------------------------
+_RESERVED_BINDING_NAMESPACES = frozenset(
+    {p.value for p in Platform} | {"dm", "group", "channel", "thread"}
+)
+_BINDING_NS_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_BINDING_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,200}$")
+
+
+@dataclass(frozen=True)
+class SessionBinding:
+    """Validated namespace + opaque key for a logical session binding."""
+
+    namespace: str
+    key: str
+
+    def __post_init__(self) -> None:
+        ns = str(self.namespace or "")
+        key = str(self.key or "")
+        if not _BINDING_NS_RE.match(ns):
+            raise ValueError(
+                f"SessionBinding.namespace invalid: {ns!r} "
+                "(lowercase alnum/-/_ , <=64 chars, no colons)"
+            )
+        if not _BINDING_KEY_RE.match(key):
+            raise ValueError(
+                f"SessionBinding.key invalid: {key!r} "
+                "(lowercase alnum/-/_ , <=201 chars, no colons)"
+            )
+        if ns in _RESERVED_BINDING_NAMESPACES:
+            raise ValueError(
+                f"SessionBinding.namespace {ns!r} is reserved "
+                "(collides with a platform/chat-type session key shape)"
+            )
+
+    def to_dict(self) -> Dict[str, str]:
+        return {"namespace": self.namespace, "key": self.key}
+
+    @classmethod
+    def from_dict(cls, data: Any) -> Optional["SessionBinding"]:
+        if not isinstance(data, dict):
+            return None
+        namespace, key = data.get("namespace"), data.get("key")
+        if not isinstance(namespace, str) or not isinstance(key, str):
+            return None
+        try:
+            return cls(namespace=namespace, key=key)
+        except ValueError:
+            # Old persisted data must not make session loading fail.
+            return None
+
+
 @dataclass
 class SessionSource:
     """
@@ -203,6 +259,9 @@ class SessionSource:
     # deliberately excluded from ``to_dict``/``from_dict`` so a peer can never
     # forge it across the wire or have it restored from persistence.
     delivered_via_upstream_relay: bool = False
+    # Explicit logical binding; when present it overrides physical platform/chat
+    # derivation in build_session_key().
+    session_binding: Optional[SessionBinding] = None
 
     def __post_init__(self) -> None:
         # D-Q2.5 dual-field reconciliation: `scope_id` is canonical, `guild_id`
@@ -264,6 +323,8 @@ class SessionSource:
             d["message_id"] = self.message_id
         if self.profile:
             d["profile"] = self.profile
+        if self.session_binding is not None:
+            d["session_binding"] = self.session_binding.to_dict()
         if self.auto_thread_created:
             d["auto_thread_created"] = True
         if self.auto_thread_initial_name:
@@ -289,6 +350,7 @@ class SessionSource:
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
             profile=data.get("profile"),
+            session_binding=SessionBinding.from_dict(data.get("session_binding")),
             auto_thread_created=bool(data.get("auto_thread_created", False)),
             auto_thread_initial_name=data.get("auto_thread_initial_name"),
         )
@@ -1065,6 +1127,9 @@ def build_session_key(
       - Without identifiers, messages fall back to one session per platform/chat_type.
     """
     ns = _session_key_namespace(profile)
+    binding = getattr(source, "session_binding", None)
+    if binding is not None:
+        return f"{ns}:{binding.namespace}:{binding.key}"
     platform = source.platform.value
     slack_scope_id = (
         str(source.scope_id)

@@ -9217,6 +9217,16 @@ class SessionDB:
 
         deleted = self._execute_write(_do)
         if deleted:
+            try:
+                from agent.subagent_context_artifacts import (
+                    delete_subagent_context_artifacts_for_sessions,
+                )
+
+                delete_subagent_context_artifacts_for_sessions(
+                    [session_id, *removed_delegate_ids], session_db=self
+                )
+            except Exception:
+                pass
             for delegate_id in removed_delegate_ids:
                 self._remove_session_files(sessions_dir, delegate_id)
             self._remove_session_files(sessions_dir, session_id)

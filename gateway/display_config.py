@@ -58,6 +58,11 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     # live, just cleaned up after success so the chat doesn't fill up with
     # stale breadcrumbs. Failed runs leave bubbles in place as breadcrumbs.
     "cleanup_progress": False,
+    "tool_completion_durations": False,
+    "subagent_tool_progress": "off",
+    "subagent_roster": "off",
+    "subagent_roster_interval": 10.0,
+    "todo_progress": "off",
     # Live working-state status on platforms whose typing indicator renders
     # text (Slack's assistant status line). Values:
     #   "full" / true  -> verb + argument preview ("is running pytest…")
@@ -281,10 +286,24 @@ def _normalise(setting: str, value: Any) -> Any:
                 return "generic"
             return val in {"true", "1", "yes", "on", "raw", "verbose"}
         return bool(value)
-    if setting == "cleanup_progress":
+    if setting in {"cleanup_progress", "tool_completion_durations"}:
         if isinstance(value, str):
             return value.lower() in {"true", "1", "yes", "on"}
         return bool(value)
+    if setting == "subagent_tool_progress":
+        if value is True:
+            return "full"
+        if value is False:
+            return "off"
+        val = str(value).strip().lower()
+        return val if val in {"off", "batched", "full"} else "off"
+    if setting in {"subagent_roster", "todo_progress"}:
+        if value is True:
+            return "on"
+        if value is False:
+            return "off"
+        val = str(value).strip().lower()
+        return "on" if val in {"on", "true", "1", "yes"} else "off"
     if setting == "live_status":
         # Tri-state: "full" (verb + preview), "verb" (verb only), "off".
         if value is True:
@@ -308,4 +327,9 @@ def _normalise(setting: str, value: Any) -> Any:
             return int(value)
         except (TypeError, ValueError):
             return 0
+    if setting == "subagent_roster_interval":
+        try:
+            return max(1.0, float(value))
+        except (TypeError, ValueError):
+            return 10.0
     return value

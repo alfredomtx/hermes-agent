@@ -22,7 +22,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from hermes_constants import get_hermes_home
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from utils import base_url_host_matches, normalize_proxy_env_vars
 
 # NOTE: `import anthropic` is deliberately NOT at module top — the SDK pulls
@@ -321,8 +321,8 @@ def _supports_fast_mode(model: str) -> bool:
 # calls like title generation/session summarization.
 #
 # ``context-1m-2025-08-07`` is still required to unlock the 1M context window
-# on Claude Opus 4.6/4.7 and Sonnet 4.6 when served via AWS Bedrock or Azure
-# AI Foundry. Add it only for those endpoint-specific paths below.
+# on Claude Opus 4.6/4.7/4.8 and Sonnet 4.6 when served via AWS Bedrock or
+# Azure AI Foundry. Add it only for those endpoint-specific paths below.
 _COMMON_BETAS = [
     "interleaved-thinking-2025-05-14",
     "fine-grained-tool-streaming-2025-05-14",
@@ -853,7 +853,7 @@ def build_anthropic_client(
     return _anthropic_sdk.Anthropic(**kwargs)
 
 
-def build_anthropic_bedrock_client(region: str):
+def build_anthropic_bedrock_client(region: str, timeout: Optional[float] = None):
     """Create an AnthropicBedrock client for Bedrock Claude models.
 
     Uses the Anthropic SDK's native Bedrock adapter, which provides full
@@ -863,9 +863,26 @@ def build_anthropic_bedrock_client(region: str):
     Attaches the common Anthropic beta headers as client-level defaults so
     that Bedrock-hosted Claude models get the same enhanced features as
     native Anthropic. The ``context-1m-2025-08-07`` beta in particular
-    unlocks the 1M context window for Opus 4.6/4.7 on Bedrock — without
-    it, Bedrock caps these models at 200K even though the Anthropic API
-    serves them with 1M natively.
+    unlocks the 1M context window for Opus 4.6/4.7/4.8 and Sonnet 4.6 on
+    Bedrock — without it, some Bedrock routes cap these models at 200K
+    even though the Anthropic API serves them with 1M natively.
+
+    If *timeout* is provided (a positive number) it overrides the default
+    1800s read timeout; the connect timeout stays at 10s. Callers pass this
+    from the per-provider / per-model ``request_timeout_seconds`` config
+    (resolved via ``get_provider_request_timeout``) so Bedrock-hosted Claude
+    respects the same knob as the Anthropic-native and OpenAI-wire providers.
+
+    The 1800s default is intentionally a "defense-in-depth backstop" that
+    must NOT preempt the per-event idle/TTFB watchdog wired into the
+    streaming poll loop in ``agent.chat_completion_helpers``. The watchdog
+    fires on a per-event timer (12–180s idle scaled by context, 120s TTFB
+    for small contexts), which is always shorter than the SDK backstop —
+    that is the whole reason this default was raised from 900s. A
+    high-reasoning Opus review that legitimately streams for >900s (events
+    still arriving) used to be killed mid-thought by the old 900s ceiling;
+    1800s gives a productive bursty stream room to finish while still
+    putting a hard ceiling on a wedged-but-not-yet-noticed connection.
 
     Auth uses the boto3 default credential chain (IAM roles, SSO, env vars).
     """
@@ -882,9 +899,44 @@ def build_anthropic_bedrock_client(region: str):
         )
     from httpx import Timeout
 
+    _read_timeout = timeout if (isinstance(timeout, (int, float)) and timeout > 0) else 1800.0
+
+    # backstop_floor (plan §5 / item 8): the SDK read timeout is a
+    # defense-in-depth ceiling that must NEVER preempt the per-event idle/TTFB
+    # watchdog wired into the streaming poll loop. If an operator misconfigures
+    # ``request_timeout_seconds`` (or a model ``timeout_seconds``) BELOW the
+    # worst-case watchdog budget, the SDK read timeout would fire first and the
+    # idle detector could never run — re-introducing the very bug this feature
+    # fixes. Floor the effective read timeout at:
+    #
+    #     idle_max * (max_stream_retries + 1) + ttfb
+    #
+    # where ``idle_max`` is the largest context-scaled idle threshold (180s),
+    # ``max_stream_retries`` is HERMES_STREAM_RETRIES (default 2 → 3 attempts),
+    # and ``ttfb`` is the no-first-byte cutoff (120s). With the defaults that is
+    # 180 * 3 + 120 = 660s, well under the 1800s default — so this floor only
+    # ever raises a *too-low* explicit config, never lowers a sane one.
+    _idle_max = 180.0
+    try:
+        from utils import env_int as _env_int
+        _max_retries = _env_int("HERMES_STREAM_RETRIES", 2)
+    except Exception:
+        _max_retries = 2
+    _ttfb = 120.0
+    _watchdog_floor = _idle_max * (max(_max_retries, 0) + 1) + _ttfb
+    if _read_timeout < _watchdog_floor:
+        import logging as _logging
+        _logging.getLogger("hermes").info(
+            "Flooring AnthropicBedrock read backstop from %.0fs to %.0fs so it "
+            "cannot preempt the idle/TTFB stream watchdog "
+            "(idle_max=%.0f * attempts=%d + ttfb=%.0f).",
+            _read_timeout, _watchdog_floor, _idle_max, max(_max_retries, 0) + 1, _ttfb,
+        )
+        _read_timeout = _watchdog_floor
+
     return _anthropic_sdk.AnthropicBedrock(
         aws_region=region,
-        timeout=Timeout(timeout=900.0, connect=10.0),
+        timeout=Timeout(timeout=float(_read_timeout), connect=10.0),
         # Delegate retry to hermes's outer loop (honors Retry-After); the SDK
         # default max_retries=2 ignores it and double-retries. (#26293)
         max_retries=0,
@@ -2893,23 +2945,32 @@ def create_anthropic_message(
     *,
     log_prefix: str = "",
     prefer_stream: bool = True,
-    on_stream_event=None,
+    on_event: Optional[Callable[[Any], None]] = None,
+    on_fallback_to_create: Optional[Callable[[], None]] = None,
+    on_stream_event: Optional[Callable[[Any], None]] = None,
 ) -> Any:
     """Create an Anthropic message, aggregating via stream when available.
 
     Some Anthropic-compatible gateways are SSE-only: they ignore non-streaming
     requests and return ``text/event-stream`` even for ``messages.create()``.
     The SDK can surface that as raw text, so callers that expect a Message then
-    crash on ``.content``.  Prefer ``messages.stream().get_final_message()`` to
+    crash on ``.content``. Prefer ``messages.stream().get_final_message()`` to
     match the main turn path, falling back to ``create()`` only for providers
     that explicitly do not support streaming, such as restricted Bedrock roles.
 
-    ``on_stream_event``: optional callable invoked once per streamed event
-    (best-effort, exceptions swallowed). Lets callers report forward progress
-    to liveness watchdogs — e.g. the auxiliary compression path ticking its
-    progress hook so a slow-but-generating summary model isn't treated as
-    hung. Only fires on the streaming path; the ``create()`` fallback has no
-    events to report.
+    ``on_event`` is invoked for every event the SDK iterator yields while we
+    aggregate the streamed message. The non-streaming poll loop uses it to
+    refresh the Anthropic idle/TTFB watchdog timestamp.
+
+    ``on_stream_event`` is the compatibility callback used by the auxiliary
+    compression progress path. It is retained alongside upstream's
+    ``on_event`` contract; both callbacks are best-effort and never allowed to
+    abort the SDK call.
+
+    ``on_fallback_to_create`` is invoked exactly once if the stream call has
+    to fall back to ``messages.create()`` (stream-unavailable / Bedrock IAM).
+    The poll loop uses this to disable event-based watchdog handling for a
+    legitimate no-event ``messages.create()`` call.
     """
     sanitize_anthropic_kwargs(api_kwargs, log_prefix=log_prefix)
 
@@ -2920,18 +2981,27 @@ def create_anthropic_message(
         stream_kwargs.pop("stream", None)
         try:
             with stream_fn(**stream_kwargs) as stream:
-                if callable(on_stream_event):
-                    # Consume the event stream manually so each event can
-                    # tick the caller's progress callback; get_final_message
-                    # then returns the accumulated snapshot.
+                callbacks = []
+                for callback in (on_event, on_stream_event):
+                    if callable(callback) and callback not in callbacks:
+                        callbacks.append(callback)
+                if callbacks:
+                    # Iterate the stream so callers can refresh per-event
+                    # liveness; the SDK accumulates internally and
+                    # ``get_final_message()`` returns the same Message object
+                    # regardless of whether we drove the iterator ourselves.
                     for _event in stream:
-                        try:
-                            on_stream_event(_event)
-                        except Exception:
-                            logger.debug(
-                                "%son_stream_event callback failed",
-                                log_prefix, exc_info=True,
-                            )
+                        for callback in callbacks:
+                            try:
+                                callback(_event)
+                            except Exception:
+                                # Instrumentation callbacks must never abort the
+                                # real SDK call.
+                                logger.debug(
+                                    "%sAnthropic stream event callback failed",
+                                    log_prefix,
+                                    exc_info=True,
+                                )
                 return stream.get_final_message()
         except Exception as exc:
             if not _is_stream_unavailable_error(exc):
@@ -2942,6 +3012,11 @@ def create_anthropic_message(
                 log_prefix,
                 exc,
             )
+            if on_fallback_to_create is not None:
+                try:
+                    on_fallback_to_create()
+                except Exception:
+                    pass
 
     create_kwargs = dict(api_kwargs)
     create_kwargs.pop("stream", None)
