@@ -214,6 +214,38 @@ def _format_subagent_progress_card(preview: Optional[str]) -> Optional[str]:
     return text
 
 
+def _build_subagent_roster_sentinel(
+    event_type: str,
+    kwargs: dict,
+    *,
+    preview: str = "",
+    now: Optional[float] = None,
+):
+    """Build an immutable roster lifecycle sentinel for the progress queue."""
+    if event_type not in {"subagent.start", "subagent.complete"}:
+        return None
+    sid = str(kwargs.get("subagent_id") or "")
+    if not sid:
+        return None
+    if event_type == "subagent.start":
+        return (
+            "__roster_start__",
+            sid,
+            kwargs.get("goal") or preview or "",
+            int(kwargs.get("task_index", 0) or 0),
+            time.time() if now is None else now,
+            kwargs.get("model") or "",
+            kwargs.get("reasoning"),
+        )
+    return (
+        "__roster_complete__",
+        sid,
+        str(kwargs.get("status") or "completed").lower(),
+        float(kwargs.get("duration_seconds") or 0.0),
+        int(kwargs.get("tool_count") or 0),
+    )
+
+
 def _append_subagent_duration_to_card(
     line: Any,
     duration: float,
@@ -21555,28 +21587,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "subagent.start",
                 "subagent.complete",
             }:
-                _sid = str(kwargs.get("subagent_id") or "")
-                if not _sid:
-                    return
-                if event_type == "subagent.start":
-                    progress_queue.put(
-                        (
-                            "__roster_start__",
-                            _sid,
-                            kwargs.get("goal") or preview or "",
-                            int(kwargs.get("task_index", 0) or 0),
-                            time.time(),
-                        )
-                    )
-                else:
-                    progress_queue.put(
-                        (
-                            "__roster_complete__",
-                            _sid,
-                            str(kwargs.get("status") or "completed").lower(),
-                            float(kwargs.get("duration_seconds") or 0.0),
-                        )
-                    )
+                sentinel = _build_subagent_roster_sentinel(
+                    event_type,
+                    kwargs,
+                    preview=preview or "",
+                )
+                if sentinel is not None:
+                    progress_queue.put(sentinel)
                 return
 
             # First-touch onboarding: the first time a tool takes longer than

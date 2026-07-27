@@ -516,6 +516,50 @@ class TestRosterPipelineGate:
         ) is False
 
 
+class TestRosterLifecycleSentinel:
+    def test_start_and_complete_preserve_display_metadata(self):
+        from gateway.run import _build_subagent_roster_sentinel
+
+        started = _build_subagent_roster_sentinel(
+            "subagent.start",
+            {
+                "subagent_id": "child-1",
+                "goal": "Inspect roster",
+                "task_index": 2,
+                "model": "gpt-5.6-luna",
+                "reasoning": "xhigh",
+            },
+            preview="fallback",
+            now=123.0,
+        )
+        completed = _build_subagent_roster_sentinel(
+            "subagent.complete",
+            {
+                "subagent_id": "child-1",
+                "status": "completed",
+                "duration_seconds": 12.0,
+                "tool_count": 5,
+            },
+        )
+
+        assert started == (
+            "__roster_start__",
+            "child-1",
+            "Inspect roster",
+            2,
+            123.0,
+            "gpt-5.6-luna",
+            "xhigh",
+        )
+        assert completed == (
+            "__roster_complete__",
+            "child-1",
+            "completed",
+            12.0,
+            5,
+        )
+
+
 from gateway.subagent_roster import _LABEL_CAP
 
 
