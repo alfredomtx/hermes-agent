@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -8,6 +9,8 @@ from typing import Any, Dict, Literal, Optional
 
 from agent.model_metadata import fetch_endpoint_model_metadata, fetch_model_metadata
 from utils import base_url_host_matches
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_PRICING = {"input": 0.0, "output": 0.0}
 
@@ -1071,6 +1074,28 @@ class CorrectionsConfig:
 _NO_CORRECTIONS = CorrectionsConfig(enabled=False)
 
 
+def load_corrections_config() -> CorrectionsConfig:
+    """Read cost corrections from the cached live Hermes configuration."""
+    try:
+        from hermes_cli.config import load_config
+
+        raw = load_config().get("cost_corrections") or {}
+        if not isinstance(raw, dict):
+            return _NO_CORRECTIONS
+        enabled = raw.get("enabled", False)
+        if isinstance(enabled, str):
+            enabled = enabled.strip().lower() in {"1", "true", "yes", "on"}
+        factor = _to_decimal(raw.get("bedrock_cross_region_factor")) or Decimal("1")
+        return CorrectionsConfig(
+            enabled=bool(enabled),
+            codex_tier=str(raw.get("codex_tier") or "priority"),
+            bedrock_cross_region_factor=factor,
+        )
+    except Exception:
+        logger.debug("Unable to load ambient cost corrections", exc_info=True)
+        return _NO_CORRECTIONS
+
+
 def _scale_corrected_result(
     result: CostResult, factor: Decimal, note: str
 ) -> CostResult:
@@ -1478,11 +1503,12 @@ def estimate_usage_cost(
     api_key: Optional[str] = None,
     corrections: Optional[CorrectionsConfig] = None,
 ) -> CostResult:
-    """Estimate usage cost, optionally applying an explicit correction gate.
+    """Estimate usage cost, applying explicit or ambient corrections.
 
-    ``corrections=None`` remains the original upstream behavior. The offline
-    spend shim passes an enabled ``CorrectionsConfig`` explicitly so it does
-    not depend on ambient config or alter other pricing callers.
+    Explicit corrections remain deterministic for callers that provide a
+    ``CorrectionsConfig``. When omitted, the cached live Hermes configuration
+    controls the correction gate; disabled or unreadable configuration keeps
+    the upstream base estimate unchanged.
     """
     base = _estimate_usage_cost_base(
         model_name,
@@ -1491,7 +1517,7 @@ def estimate_usage_cost(
         base_url=base_url,
         api_key=api_key,
     )
-    cfg = corrections if corrections is not None else _NO_CORRECTIONS
+    cfg = corrections if corrections is not None else load_corrections_config()
     if not cfg.enabled:
         return base
     return apply_corrections(

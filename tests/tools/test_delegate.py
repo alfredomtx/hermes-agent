@@ -4140,5 +4140,60 @@ def test_dispatched_profile_uses_uniform_per_task_profile():
     assert _dispatched_profile("coder", dual_review_items) == "coder"
 
 
+def test_background_dispatch_forwards_resolved_child_metadata():
+    parent = _make_mock_parent(depth=0)
+    parent.session_id = "parent-session"
+    fake_child = MagicMock()
+    fake_child.model = "gpt-5.6-luna"
+    fake_child._delegate_role = "leaf"
+    credentials = {
+        "model": "gpt-5.6-luna",
+        "provider": "openrouter",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": "test-key",
+        "api_mode": "chat_completions",
+        "request_overrides": None,
+        "max_output_tokens": None,
+        "command": None,
+        "args": None,
+    }
+    config = {
+        "profiles": {
+            "audit-profile": {
+                "model": "gpt-5.6-luna",
+                "reasoning_effort": "high",
+                "toolsets": ["file"],
+            }
+        }
+    }
+    captured = {}
+
+    def fake_dispatch(**kwargs):
+        captured.update(kwargs)
+        return {"status": "dispatched", "delegation_id": "deleg_metadata"}
+
+    with patch("tools.delegate_tool._load_config", return_value=config), \
+         patch("tools.delegate_tool._build_child_agent", return_value=fake_child), \
+         patch("tools.delegate_tool._resolve_delegation_credentials", return_value=credentials), \
+         patch("tools.delegation_live_log.create_live_transcripts", return_value=("live-id", [], [])), \
+         patch("tools.delegation_live_log.update_manifest_statuses"), \
+         patch("tools.async_delegation.dispatch_async_delegation_batch", side_effect=fake_dispatch):
+        result = delegate_task(
+            tasks=[{"goal": "audit", "profile": "audit-profile"}],
+            background=True,
+            parent_agent=parent,
+        )
+
+    assert json.loads(result)["status"] == "dispatched"
+    assert captured["header_profile"] == "audit-profile"
+    assert captured["header_toolsets"] == ["file"]
+    child = captured["children"][0]
+    assert child["task_index"] == 0
+    assert child["profile"] == "audit-profile"
+    assert child["model"] == "gpt-5.6-luna"
+    assert child["reasoning_effort"] == "high"
+    assert child["toolsets"] == ["file"]
+
+
 if __name__ == "__main__":
     unittest.main()

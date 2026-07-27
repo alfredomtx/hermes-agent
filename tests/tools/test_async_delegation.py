@@ -143,6 +143,140 @@ def test_completion_event_lands_on_shared_queue_with_session_key():
     assert evt["delegation_id"] == res["delegation_id"]
 
 
+def test_batch_completion_retains_child_descriptors_and_lifecycle_fields(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    clock = {"value": 100.0}
+    monkeypatch.setattr(ad.time, "time", lambda: clock["value"])
+    runner_started = threading.Event()
+    release = threading.Event()
+
+    children = [
+        {
+            "task_index": 0,
+            "goal": "audit",
+            "profile": "file-explorer",
+            "model": "gpt-5.6-luna",
+            "reasoning_effort": "high",
+            "toolsets": ["file"],
+        },
+        {
+            "task_index": 1,
+            "goal": "verify",
+            "profile": "coder",
+            "model": "gpt-5.6-terra",
+            "reasoning_effort": "medium",
+            "toolsets": ["terminal"],
+        },
+    ]
+
+    def runner():
+        runner_started.set()
+        release.wait(timeout=2.0)
+        return {
+            "results": [
+                {
+                    "task_index": 1,
+                    "status": "completed",
+                    "ended_at": 112.0,
+                    "duration_seconds": 6.0,
+                    "tool_count": 2,
+                    "cost_usd": 0.21,
+                },
+                {
+                    "task_index": 0,
+                    "status": "completed",
+                    "ended_at": 112.0,
+                    "duration_seconds": 7.0,
+                    "tool_count": 4,
+                    "cost_usd": 0.42,
+                },
+            ]
+        }
+
+    dispatched = ad.dispatch_async_delegation_batch(
+        goals=["audit", "verify"],
+        context=None,
+        toolsets=["file", "terminal"],
+        role="leaf",
+        model="gpt-5.6-luna",
+        session_key="",
+        runner=runner,
+        children=children,
+        header_profile="mixed",
+        header_toolsets=["file", "terminal"],
+    )
+    assert dispatched["status"] == "dispatched"
+    assert runner_started.wait(timeout=2.0)
+
+    mark_started = getattr(ad, "mark_batch_child_started", None)
+    assert callable(mark_started)
+    clock["value"] = 105.0
+    mark_started(dispatched["delegation_id"], 0)
+    clock["value"] = 106.0
+    mark_started(dispatched["delegation_id"], 1)
+    release.set()
+
+    event = process_registry.completion_queue.get(timeout=2.0)
+    assert event["header_profile"] == "mixed"
+    assert event["header_toolsets"] == ["file", "terminal"]
+    by_index = {child["task_index"]: child for child in event["children"]}
+    assert by_index[0]["goal"] == "audit"
+    assert by_index[0]["profile"] == "file-explorer"
+    assert by_index[0]["model"] == "gpt-5.6-luna"
+    assert by_index[0]["reasoning_effort"] == "high"
+    assert by_index[0]["toolsets"] == ["file"]
+    assert by_index[0]["queued_at"] == 100.0
+    assert by_index[0]["started_at"] == 105.0
+    assert by_index[0]["ended_at"] == 112.0
+    assert by_index[0]["duration_seconds"] == 7.0
+    assert by_index[0]["tool_count"] == 4
+    assert by_index[0]["cost_usd"] == 0.42
+    assert by_index[1]["goal"] == "verify"
+    assert by_index[1]["profile"] == "coder"
+    assert by_index[1]["started_at"] == 106.0
+    assert by_index[1]["tool_count"] == 2
+    assert by_index[1]["cost_usd"] == 0.21
+
+
+def test_single_and_batch_completion_events_have_matching_child_shapes(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    single = ad.dispatch_async_delegation(
+        goal="audit",
+        context=None,
+        toolsets=["file"],
+        role="leaf",
+        model="gpt-5.6-luna",
+        session_key="",
+        runner=lambda: {"status": "completed", "summary": "done"},
+    )
+    batch = ad.dispatch_async_delegation_batch(
+        goals=["audit"],
+        context=None,
+        toolsets=["file"],
+        role="leaf",
+        model="gpt-5.6-luna",
+        session_key="",
+        runner=lambda: {
+            "results": [{"task_index": 0, "status": "completed", "summary": "done"}]
+        },
+    )
+
+    events = {
+        event["delegation_id"]: event
+        for _ in range(2)
+        for event in [process_registry.completion_queue.get(timeout=2.0)]
+    }
+    assert events[single["delegation_id"]]["children"]
+    assert events[batch["delegation_id"]]["children"]
+    assert set(events[single["delegation_id"]]["children"][0]) == set(
+        events[batch["delegation_id"]]["children"][0]
+    )
+
+
 def test_rich_reinjection_block_is_self_contained():
     def runner():
         return {"status": "completed", "summary": "The answer is 42.",
@@ -1014,4 +1148,3 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
-

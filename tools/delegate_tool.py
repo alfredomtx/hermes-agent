@@ -2635,6 +2635,10 @@ def _run_single_child_attempt(
         _input_tokens = getattr(child, "session_prompt_tokens", 0)
         _output_tokens = getattr(child, "session_completion_tokens", 0)
         _model = getattr(child, "model", None)
+        _raw_child_cost = getattr(child, "session_estimated_cost_usd", 0.0)
+        _child_cost_usd = (
+            float(_raw_child_cost) if isinstance(_raw_child_cost, (int, float)) else 0.0
+        )
 
         entry: Dict[str, Any] = {
             "task_index": task_index,
@@ -2643,6 +2647,8 @@ def _run_single_child_attempt(
             "api_calls": api_calls,
             "duration_seconds": duration,
             "model": _model if isinstance(_model, str) else None,
+            "cost_usd": _child_cost_usd,
+            "tool_count": len(tool_trace),
             "exit_reason": exit_reason,
             "tokens": {
                 "input": (
@@ -2662,14 +2668,7 @@ def _run_single_child_attempt(
             # Kilo-Org/kilocode#9448 — previously the footer only reflected the
             # parent's direct API calls and under-counted subagent-heavy runs.
             # Stripped before the dict is serialised back to the model.
-            "_child_cost_usd": (
-                float(getattr(child, "session_estimated_cost_usd", 0.0) or 0.0)
-                if isinstance(
-                    getattr(child, "session_estimated_cost_usd", 0.0),
-                    (int, float),
-                )
-                else 0.0
-            ),
+            "_child_cost_usd": _child_cost_usd,
         }
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
@@ -3128,6 +3127,50 @@ def delegate_task(
         # Authoritative restore: reset global to parent's tool names after all children built
         _model_tools._last_resolved_tool_names = _parent_tool_names
 
+    child_descriptors: List[Dict[str, Any]] = []
+    for i, task, child in children:
+        spec = task_specs[i]
+        child_model = getattr(child, "model", None)
+        child_descriptors.append(
+            {
+                "task_index": i,
+                "goal": task["goal"],
+                "profile": spec["profile"],
+                "model": child_model if isinstance(child_model, str) else spec["creds"]["model"],
+                "reasoning_effort": spec["cfg"].get("reasoning_effort"),
+                "toolsets": list(spec["toolsets"] or []),
+            }
+        )
+
+    def _shared_explicit_value(key: str):
+        values = [descriptor.get(key) for descriptor in child_descriptors]
+        if not values or any(value is None or value == "" or value == [] for value in values):
+            return None
+        first = values[0]
+        if all(value == first for value in values[1:]):
+            return list(first) if isinstance(first, list) else first
+        return None
+
+    header_profile_value = _shared_explicit_value("profile")
+    header_profile: Optional[str] = (
+        header_profile_value if isinstance(header_profile_value, str) else None
+    )
+    header_toolsets_value = _shared_explicit_value("toolsets")
+    header_toolsets: Optional[List[str]] = (
+        header_toolsets_value if isinstance(header_toolsets_value, list) else None
+    )
+    async_delegation_id = live_deleg_id if background else None
+
+    def _mark_child_started(task_index: int) -> None:
+        if not async_delegation_id:
+            return
+        try:
+            from tools.async_delegation import mark_batch_child_started
+
+            mark_batch_child_started(async_delegation_id, task_index)
+        except Exception:
+            logger.debug("Could not mark async child %s started", task_index, exc_info=True)
+
     def _execute_and_aggregate() -> dict:
         """Run all built children (1 or N), join on them, aggregate results,
         fire subagent_stop hooks + cost rollup, and return the combined result
@@ -3141,6 +3184,9 @@ def delegate_task(
         if n_tasks == 1:
             # Single task -- run directly (no thread pool overhead)
             _i, _t, child = children[0]
+            # This is the execution boundary: lifecycle start must be stamped
+            # immediately before the child enters _run_single_child.
+            _mark_child_started(_i)
             result = _run_single_child(
                 _i,
                 _t["goal"],
@@ -3160,15 +3206,21 @@ def delegate_task(
             from tools.daemon_pool import DaemonThreadPoolExecutor
             with DaemonThreadPoolExecutor(max_workers=max_children) as executor:
                 futures = {}
-                for i, t, child in children:
-                    future = executor.submit(
-                        _run_single_child,
+
+                def _run_indexed_child(i, t, child):
+                    # Mark at the worker's actual execution boundary rather
+                    # than when the future is merely queued.
+                    _mark_child_started(i)
+                    return _run_single_child(
                         task_index=i,
                         goal=t["goal"],
                         child=child,
                         parent_agent=parent_agent,
                         delegation_cfg=task_specs[i]["cfg"],
                     )
+
+                for i, t, child in children:
+                    future = executor.submit(_run_indexed_child, i, t, child)
                     futures[future] = i
 
                 # Poll futures with interrupt checking.  as_completed() blocks
@@ -3549,6 +3601,9 @@ def delegate_task(
             # Reuse the live-transcript directory's id (when created) so the
             # returned delegation_id matches cache/delegation/live/<id>/.
             delegation_id=live_deleg_id,
+            children=child_descriptors,
+            header_profile=header_profile,
+            header_toolsets=header_toolsets,
         )
 
         if dispatch.get("status") == "dispatched":

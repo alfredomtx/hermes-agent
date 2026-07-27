@@ -1,3 +1,4 @@
+from decimal import Decimal
 from types import SimpleNamespace
 
 from agent.usage_pricing import (
@@ -202,6 +203,50 @@ def test_estimate_usage_cost_marks_subscription_routes_included():
 
     assert result.status == "included"
     assert float(result.amount_usd) == 0.0
+
+
+def test_estimate_usage_cost_reads_enabled_ambient_corrections(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "cost_corrections:\n"
+        "  enabled: true\n"
+        "  codex_tier: priority\n"
+        "  bedrock_cross_region_factor: 1.1\n",
+        encoding="utf-8",
+    )
+    usage = CanonicalUsage(input_tokens=1_000_000)
+    result = estimate_usage_cost(
+        "us.anthropic.claude-opus-4-6",
+        usage,
+        provider="bedrock",
+        base_url="https://bedrock-runtime.us-east-1.amazonaws.com",
+    )
+
+    assert result.status == "estimated"
+    assert result.amount_usd == Decimal("5.5")
+    assert "bedrock-cross-region-uplift" in result.notes
+
+
+def test_estimate_usage_cost_keeps_base_total_when_ambient_corrections_disabled(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "cost_corrections:\n"
+        "  enabled: false\n"
+        "  bedrock_cross_region_factor: 1.1\n",
+        encoding="utf-8",
+    )
+    result = estimate_usage_cost(
+        "us.anthropic.claude-opus-4-6",
+        CanonicalUsage(input_tokens=1_000_000),
+        provider="bedrock",
+        base_url="https://bedrock-runtime.us-east-1.amazonaws.com",
+    )
+
+    assert result.status == "estimated"
+    assert result.amount_usd == Decimal("5")
+    assert "bedrock-cross-region-uplift" not in result.notes
 
 
 def test_estimate_usage_cost_refuses_cache_pricing_without_official_cache_rate(monkeypatch):

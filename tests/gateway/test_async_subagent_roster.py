@@ -1,5 +1,9 @@
-from gateway.async_subagent_roster import build_async_subagent_roster_rows
+from gateway.async_subagent_roster import (
+    build_async_dispatched_header,
+    build_async_subagent_roster_rows,
+)
 from gateway.subagent_roster import format_subagent_roster
+from tools.process_registry import process_registry
 
 
 def test_async_rows_use_active_registry_for_running_elapsed():
@@ -102,6 +106,107 @@ def test_async_final_rows_fallback_to_results_when_children_missing():
     assert lines[0] == "⚠️ 2 subagents · 1 ✓ · 1 ✗ · `10s`"
     assert lines[1] == "✓ `sleep 6` · `6s`"
     assert lines[2] == "✗ `sleep 10` · `10s`"
+
+
+def test_completed_async_store_event_renders_preserved_child_metadata(tmp_path, monkeypatch):
+    import queue
+
+    from tools import async_delegation as ad
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+
+    try:
+        dispatched = ad.dispatch_async_delegation_batch(
+            goals=["audit"],
+            context=None,
+            toolsets=["file"],
+            role="leaf",
+            model="gpt-5.6-luna",
+            session_key="",
+            runner=lambda: {
+                "results": [
+                    {
+                        "task_index": 0,
+                        "status": "completed",
+                        "profile": "file-explorer",
+                        "model": "gpt-5.6-luna",
+                        "reasoning_effort": "high",
+                        "toolsets": ["file"],
+                        "queued_at": 100.0,
+                        "started_at": 105.0,
+                        "ended_at": 112.0,
+                        "duration_seconds": 7.0,
+                        "tool_count": 4,
+                        "cost_usd": 0.42,
+                    }
+                ]
+            },
+        )
+        process_registry.completion_queue.get(timeout=2.0)
+        restored = queue.Queue()
+        assert ad.restore_undelivered_completions(restored) == 1
+        event = restored.get(timeout=2.0)
+
+        rows = build_async_subagent_roster_rows(event, [], now=120.0)
+        assert rows[0]["profile"] == "file-explorer"
+        assert rows[0]["model"] == "gpt-5.6-luna"
+        assert rows[0]["reasoning"] == "high"
+        assert rows[0]["tools"] == 4
+        assert rows[0]["cost_usd"] == 0.42
+        assert rows[0]["elapsed"] == 7.0
+        assert build_async_dispatched_header(event).endswith("toolsets=`file`")
+        assert event["delegation_id"] == dispatched["delegation_id"]
+    finally:
+        ad._reset_for_tests()
+
+
+def test_async_store_event_keeps_invalid_timestamps_from_affecting_duration(
+    tmp_path, monkeypatch
+):
+    import queue
+
+    from tools import async_delegation as ad
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+
+    try:
+        ad.dispatch_async_delegation_batch(
+            goals=["audit"],
+            context=None,
+            toolsets=None,
+            role="leaf",
+            model="gpt-5.6-luna",
+            session_key="",
+            runner=lambda: {
+                "results": [
+                    {
+                        "task_index": 0,
+                        "status": "completed",
+                        "started_at": 120.0,
+                        "ended_at": 110.0,
+                        "duration_seconds": "not-a-duration",
+                    }
+                ]
+            },
+        )
+        process_registry.completion_queue.get(timeout=2.0)
+        restored = queue.Queue()
+        assert ad.restore_undelivered_completions(restored) == 1
+        event = restored.get(timeout=2.0)
+
+        rows = build_async_subagent_roster_rows(event, [], now=200.0)
+        assert rows[0]["elapsed"] == 0.0
+        assert "timing" not in rows[0]
+        assert event["results"][0]["started_at"] == 120.0
+        assert event["results"][0]["ended_at"] == 110.0
+    finally:
+        ad._reset_for_tests()
 
 
 # ---------------------------------------------------------------------------

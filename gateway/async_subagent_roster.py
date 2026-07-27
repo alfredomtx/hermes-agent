@@ -44,8 +44,11 @@ def _children_from_record(record: Dict[str, Any]) -> List[Dict[str, Any]]:
                 {
                     "task_index": i,
                     "subagent_id": str(result.get("subagent_id") or ""),
-                    "goal": goal,
-                    "model": record.get("model"),
+                    "goal": result.get("goal", goal),
+                    "profile": result.get("profile") or record.get("profile"),
+                    "model": result.get("model") or record.get("model"),
+                    "reasoning_effort": result.get("reasoning_effort"),
+                    "toolsets": result.get("toolsets") or [],
                     "status": result.get("status") or "pending",
                     "queued_at": result.get("queued_at", record.get("queued_at")),
                     "started_at": result.get("started_at"),
@@ -88,7 +91,9 @@ def build_async_subagent_roster_rows(
         profile = child.get("profile") or ""
         reasoning = child.get("reasoning")
         if reasoning is None:
-            reasoning = record.get("reasoning")
+            reasoning = child.get("reasoning_effort")
+        if reasoning is None:
+            reasoning = record.get("reasoning") or record.get("reasoning_effort")
 
         if active is not None and status == "pending":
             started = (
@@ -167,17 +172,13 @@ def build_async_subagent_roster_rows(
         except (TypeError, ValueError, OverflowError):
             elapsed = 0.0
 
-        # Final tool count: the child record carries tool_count (falling back to
-        # api_calls). The live registry entry is gone once the child completes,
-        # so the finished row keeps the count from the record.
+        # Finished rows retain their tool count after the live registry entry expires.
         try:
             tools = int(child.get("tool_count") or child.get("api_calls") or 0)
         except (TypeError, ValueError):
             tools = 0
 
-        # Final cost: threaded as a PUBLIC cost_usd onto the child record (see
-        # delegate_tool._run_single_child + async_delegation._update_child_result_locked).
-        # Completion-only; missing/non-numeric -> None so the row shows no cost cell.
+        # Cost is completion-only; missing values omit the cost cell.
         _row_cost = child.get("cost_usd")
         row = {
             "glyph": glyph,

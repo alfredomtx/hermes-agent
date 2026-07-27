@@ -176,7 +176,18 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         owner_started_at = None
     task_payload = {
         key: record.get(key)
-        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch")
+        for key in (
+            "goal",
+            "goals",
+            "context",
+            "toolsets",
+            "role",
+            "model",
+            "is_batch",
+            "children",
+            "header_profile",
+            "header_toolsets",
+        )
         if key in record
     }
     with _DB_LOCK, _transaction() as conn:
@@ -296,6 +307,9 @@ def recover_abandoned_delegations() -> int:
                 "goals": task.get("goals"), "context": task.get("context"),
                 "toolsets": task.get("toolsets"), "role": task.get("role"),
                 "model": task.get("model"), "is_batch": bool(task.get("is_batch")),
+                "children": task.get("children"),
+                "header_profile": task.get("header_profile"),
+                "header_toolsets": task.get("header_toolsets"),
                 "status": "unknown", "summary": None,
                 "error": "Delegation owner exited before recording a terminal result; outcome unknown.",
                 "dispatched_at": dispatched_at, "completed_at": now,
@@ -512,6 +526,154 @@ def _new_delegation_id() -> str:
     return f"deleg_{uuid.uuid4().hex[:8]}"
 
 
+def _normalise_children(
+    children: Optional[List[Dict[str, Any]]],
+    goals: List[str],
+    model: Optional[str],
+    *,
+    queued_at: float,
+) -> List[Dict[str, Any]]:
+    """Normalize accepted child descriptors to one stable lifecycle shape."""
+    raw_children = [child for child in (children or []) if isinstance(child, dict)]
+    indexed_children = {
+        task_index: child
+        for child in raw_children
+        if isinstance((task_index := child.get("task_index")), int) and task_index >= 0
+    }
+    use_indexes = bool(indexed_children)
+    normalized: List[Dict[str, Any]] = []
+    for index, goal in enumerate(goals):
+        if use_indexes:
+            source = indexed_children.get(index, {})
+        else:
+            source = raw_children[index] if index < len(raw_children) else {}
+        child = dict(source)
+        child.update(
+            {
+                "task_index": index,
+                "goal": source.get("goal") or goal,
+                "profile": source.get("profile"),
+                "model": source.get("model") or model,
+                "reasoning_effort": source.get("reasoning_effort"),
+                "toolsets": list(source.get("toolsets") or []),
+                "queued_at": (
+                    queued_at if source.get("queued_at") is None else source.get("queued_at")
+                ),
+                "started_at": source.get("started_at"),
+                "ended_at": source.get("ended_at"),
+            }
+        )
+        normalized.append(child)
+    return normalized
+
+
+def _finite_nonnegative_duration(started_at: Any, ended_at: Any) -> Optional[float]:
+    try:
+        duration = float(ended_at) - float(started_at)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if duration != duration or duration in (float("inf"), float("-inf")):
+        return None
+    return max(0.0, duration)
+
+
+def _merge_terminal_children(
+    children: List[Dict[str, Any]],
+    results: List[Dict[str, Any]],
+    *,
+    terminal_at: float,
+    default_status: str = "completed",
+) -> List[Dict[str, Any]]:
+    """Merge terminal child results by task index without dropping descriptors."""
+    result_by_index: Dict[int, Dict[str, Any]] = {}
+    for position, result in enumerate(results or []):
+        if not isinstance(result, dict):
+            continue
+        task_index = result.get("task_index", position)
+        if isinstance(task_index, int) and task_index >= 0:
+            result_by_index[task_index] = result
+
+    merged: List[Dict[str, Any]] = []
+    known_indexes = set()
+    for child in children:
+        task_index = child.get("task_index")
+        if not isinstance(task_index, int):
+            task_index = len(merged)
+        known_indexes.add(task_index)
+        result = result_by_index.get(task_index, {})
+        item = dict(child)
+        for key, value in result.items():
+            if key != "task_index" and not key.startswith("_"):
+                item[key] = value
+        item["task_index"] = task_index
+        item["status"] = result.get("status") or item.get("status") or default_status
+        if item.get("ended_at") is None:
+            item["ended_at"] = terminal_at
+        if item.get("duration_seconds") is None:
+            duration = _finite_nonnegative_duration(
+                item.get("started_at"), item.get("ended_at")
+            )
+            if duration is not None:
+                item["duration_seconds"] = duration
+        merged.append(item)
+
+    # Keep an unexpected result addressable rather than silently discarding it.
+    for task_index, result in result_by_index.items():
+        if task_index in known_indexes:
+            continue
+        item = dict(result)
+        item["task_index"] = task_index
+        item.setdefault("goal", "")
+        item.setdefault("profile", None)
+        item.setdefault("model", None)
+        item.setdefault("reasoning_effort", None)
+        item.setdefault("toolsets", [])
+        item.setdefault("queued_at", terminal_at)
+        item.setdefault("started_at", None)
+        item.setdefault("ended_at", terminal_at)
+        item.setdefault("status", default_status)
+        duration = _finite_nonnegative_duration(item.get("started_at"), item.get("ended_at"))
+        if item.get("duration_seconds") is None and duration is not None:
+            item["duration_seconds"] = duration
+        merged.append(item)
+
+    merged.sort(key=lambda child: int(child.get("task_index", 0) or 0))
+    return merged
+
+
+def _record_event_fields(record: Dict[str, Any], event: Dict[str, Any]) -> None:
+    """Copy terminal event metadata into the in-memory accepted record."""
+    with _records_lock:
+        current = _records.get(str(record.get("delegation_id") or ""))
+        if current is None:
+            return
+        for key in ("children", "header_profile", "header_toolsets", "results"):
+            if key in event:
+                current[key] = event[key]
+        current["status"] = event.get("status", current.get("status"))
+        current["completed_at"] = event.get("completed_at", current.get("completed_at"))
+
+
+def mark_batch_child_started(
+    delegation_id: str,
+    task_index: int,
+    *,
+    started_at: Optional[float] = None,
+) -> bool:
+    """Stamp a child at the boundary where its execution actually begins."""
+    timestamp = time.time() if started_at is None else started_at
+    with _records_lock:
+        record = _records.get(delegation_id)
+        if record is None:
+            return False
+        for child in record.get("children") or []:
+            if child.get("task_index") == task_index:
+                if child.get("started_at") is None:
+                    child["started_at"] = timestamp
+                return True
+    return False
+
+
 def _prune_completed_locked() -> None:
     """Drop the oldest completed records beyond the retention cap.
 
@@ -572,6 +734,9 @@ def dispatch_async_delegation(
     origin_session_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
+    children: Optional[List[Dict[str, Any]]] = None,
+    header_profile: Optional[str] = None,
+    header_toolsets: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Spawn ``runner`` on the daemon executor and return a handle immediately.
 
@@ -609,6 +774,9 @@ def dispatch_async_delegation(
     """
     delegation_id = _new_delegation_id()
     dispatched_at = time.time()
+    children = _normalise_children(
+        children, [goal], model, queued_at=dispatched_at
+    )
     record: Dict[str, Any] = {
         "delegation_id": delegation_id,
         "goal": goal,
@@ -624,7 +792,12 @@ def dispatch_async_delegation(
         "dispatched_at": dispatched_at,
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
+        "children": children,
     }
+    if header_profile is not None:
+        record["header_profile"] = header_profile
+    if header_toolsets is not None:
+        record["header_toolsets"] = list(header_toolsets)
     # Capacity check and record insert under ONE lock hold — checking
     # active_count() separately would let two concurrent dispatches (e.g.
     # from different gateway sessions) both pass the check and exceed the cap.
@@ -756,7 +929,19 @@ def _push_completion_event(
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
         "exit_reason": result.get("exit_reason"),
+        "children": _merge_terminal_children(
+            record.get("children") or _normalise_children(
+                None, [record.get("goal", "")], record.get("model"), queued_at=dispatched_at
+            ),
+            [result],
+            terminal_at=completed_at,
+            default_status=status,
+        ),
     }
+    for key in ("header_profile", "header_toolsets"):
+        if key in record:
+            evt[key] = record[key]
+    _record_event_fields(record, evt)
     _persist_completion(evt, result)
     try:
         process_registry.completion_queue.put(evt)
@@ -783,6 +968,9 @@ def dispatch_async_delegation_batch(
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
+    children: Optional[List[Dict[str, Any]]] = None,
+    header_profile: Optional[str] = None,
+    header_toolsets: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
 
@@ -807,6 +995,7 @@ def dispatch_async_delegation_batch(
     delegation_id = delegation_id or _new_delegation_id()
     dispatched_at = time.time()
     n = len(goals)
+    children = _normalise_children(children, goals, model, queued_at=dispatched_at)
     # A combined goal label for status listings / the completion header.
     combined_goal = (
         goals[0] if n == 1 else f"{n} parallel subagents: " + "; ".join(g[:40] for g in goals)
@@ -828,7 +1017,12 @@ def dispatch_async_delegation_batch(
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
         "is_batch": True,
+        "children": children,
     }
+    if header_profile is not None:
+        record["header_profile"] = header_profile
+    if header_toolsets is not None:
+        record["header_toolsets"] = list(header_toolsets)
     with _records_lock:
         running = sum(
             1 for r in _records.values() if r.get("status") == "running"
@@ -943,7 +1137,17 @@ def _finalize_batch(
         "total_duration_seconds": combined.get("total_duration_seconds"),
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
+        "children": _merge_terminal_children(
+            event_record.get("children") or [],
+            combined.get("results") or [],
+            terminal_at=completed_at,
+            default_status=status,
+        ),
     }
+    for key in ("header_profile", "header_toolsets"):
+        if key in event_record:
+            evt[key] = event_record[key]
+    _record_event_fields(event_record, evt)
     _persist_completion(evt, combined)
     try:
         process_registry.completion_queue.put(evt)
