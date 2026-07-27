@@ -40,7 +40,10 @@ from agent.conversation_compression import (
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.iteration_budget import IterationBudget
-from agent.memory_manager import build_memory_context_block
+from agent.memory_manager import (
+    build_memory_context_block,
+    build_plugin_context_block,
+)
 from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
@@ -53,12 +56,14 @@ def compose_user_api_content(
     content: Any,
     ext_prefetch_cache: str,
     plugin_user_context: str,
+    gateway_notes: str = "",
 ) -> Optional[str]:
     """Compose the API-bound content of the current turn's user message.
 
     Sources: memory-manager prefetch + ``pre_llm_call`` plugin context with
-    target="user_message" (the default). Both are appended to the *API copy*
-    of the user message only — the stored content stays clean.
+    target="user_message" (the default), followed by trusted gateway notes.
+    All are appended to the *API copy* of the user message only — the stored
+    content stays clean.
 
     This is the single source of that composition. The prologue stamps the
     result onto the live message as ``api_content`` (persisted alongside the
@@ -78,7 +83,11 @@ def compose_user_api_content(
         if fenced:
             injections.append(fenced)
     if plugin_user_context:
-        injections.append(plugin_user_context)
+        fenced = build_plugin_context_block(plugin_user_context)
+        if fenced:
+            injections.append(fenced)
+    if gateway_notes and gateway_notes.strip():
+        injections.append(gateway_notes)
     if not injections:
         return None
     return content + "\n\n" + "\n\n".join(injections)
@@ -1074,7 +1083,8 @@ def build_turn_context(
                     )
                 except Exception as _spill_exc:
                     logger.warning("hook context spill failed: %s", _spill_exc)
-            _ctx_parts.append(_piece)
+            if _piece.strip():
+                _ctx_parts.append(_piece)
         if _ctx_parts:
             plugin_user_context = "\n\n".join(_ctx_parts)
     except Exception as exc:
@@ -1096,12 +1106,6 @@ def build_turn_context(
         )
         if isinstance(_gw_turn_content, list):
             append_notes_to_multimodal_content(_gw_turn_content, _gateway_notes)
-        else:
-            plugin_user_context = (
-                plugin_user_context + "\n\n" + _gateway_notes
-                if plugin_user_context
-                else _gateway_notes
-            )
 
     # Per-turn file-mutation verifier state.
     agent._turn_failed_file_mutations = {}
@@ -1164,7 +1168,10 @@ def build_turn_context(
     ):
         _turn_user_msg = messages[current_turn_user_idx]
         _api_content = compose_user_api_content(
-            _turn_user_msg.get("content", ""), ext_prefetch_cache, plugin_user_context
+            _turn_user_msg.get("content", ""),
+            ext_prefetch_cache,
+            plugin_user_context,
+            _gateway_notes,
         )
         if _api_content is not None and _api_content != _turn_user_msg.get("content"):
             _turn_user_msg["api_content"] = _api_content

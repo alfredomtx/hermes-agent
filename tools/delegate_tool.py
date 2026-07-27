@@ -38,6 +38,7 @@ from toolsets import TOOLSETS
 # not natively known (named custom providers, third-party aggregators, etc.).
 # Must match hermes_cli.runtime_provider.RUNTIME_PROVIDER_TYPE_CUSTOM.
 _RUNTIME_PROVIDER_CUSTOM = "custom"
+from tools import agent_receipt
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
@@ -333,6 +334,34 @@ def _looks_like_error_output(content: Any) -> bool:
         or first.startswith("traceback ")
         or first.startswith("exception:")
     )
+
+
+def _stamp_agent_receipt(
+    entry: Dict[str, Any], *, summary: Any, tool_trace: Any
+) -> Dict[str, Any]:
+    """Stamp receipt evidence on a completed delegate result."""
+    try:
+        owed = bool(
+            agent_receipt.owes_receipt(
+                surface="delegate",
+                role=entry.get("_child_role"),
+                tool_trace=tool_trace,
+            )
+        )
+    except Exception:
+        logger.debug("agent receipt stamp failed", exc_info=True)
+        owed = False
+
+    entry["receipt_owed"] = owed
+    if owed:
+        try:
+            valid, errors = agent_receipt.validate_text(summary or "")
+            entry["receipt_valid"] = bool(valid)
+            if not valid:
+                entry["receipt_errors"] = list(errors)[:5]
+        except Exception:
+            logger.debug("agent receipt validation failed", exc_info=True)
+    return entry
 
 
 def _normalize_role(r: Optional[str]) -> str:
@@ -2672,6 +2701,8 @@ def _run_single_child_attempt(
         }
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
+
+        _stamp_agent_receipt(entry, summary=summary, tool_trace=tool_trace)
 
         # Cross-agent file-state reminder.  If this subagent wrote any
         # files the parent had already read, surface it so the parent

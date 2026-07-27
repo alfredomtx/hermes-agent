@@ -37,6 +37,7 @@ from tools.delegate_tool import (
     _inherit_parent_base_url,
     _get_inherit_mcp_toolsets,
     _merge_delegation_profile,
+    _run_single_child,
 )
 
 
@@ -1761,6 +1762,105 @@ class TestDelegateObservability(unittest.TestCase):
 
             result = json.loads(delegate_task(goal="Test empty sentinel", parent_agent=parent))
             self.assertEqual(result["results"][0]["status"], "failed")
+
+
+class TestDelegateReceiptStamps(unittest.TestCase):
+    """Receipt contracts at the real child-result aggregation boundary."""
+
+    def _run_child(self, summary, tool_name="write_file", role="leaf"):
+        child = MagicMock()
+        child._credential_pool = None
+        child._delegate_role = role
+        child._delegate_saved_tool_names = []
+        child.model = "claude-sonnet-4-6"
+        child.session_prompt_tokens = 0
+        child.session_completion_tokens = 0
+        child.tool_progress_callback = None
+        child.run_conversation.return_value = {
+            "final_response": summary,
+            "completed": True,
+            "interrupted": False,
+            "api_calls": 1,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "receipt-tool-1",
+                            "function": {
+                                "name": tool_name,
+                                "arguments": "{}",
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "receipt-tool-1",
+                    "content": "ok",
+                },
+            ],
+        }
+        entry = _run_single_child(
+            task_index=0,
+            goal="receipt contract test",
+            child=child,
+            parent_agent=_make_mock_parent(),
+            child_timeout=None,
+        )
+        return entry, child
+
+    @staticmethod
+    def _valid_receipt_text():
+        from tests.tools.test_agent_receipt import _good
+
+        return "work complete\n\n```receipt\n" + json.dumps(_good()) + "\n```"
+
+    def test_write_capable_child_with_valid_receipt_is_valid(self):
+        entry, _ = self._run_child(self._valid_receipt_text())
+
+        self.assertEqual(entry["_child_role"], "leaf")
+        self.assertEqual(entry["tool_trace"][0]["tool"], "write_file")
+        self.assertTrue(entry["receipt_owed"])
+        self.assertTrue(entry["receipt_valid"])
+        self.assertNotIn("receipt_errors", entry)
+
+    def test_write_capable_child_with_missing_or_invalid_receipt_is_bounded(self):
+        invalid_summaries = (
+            "work complete without a receipt",
+            "work complete\n\n```receipt\n{}\n```",
+        )
+        for summary in invalid_summaries:
+            with self.subTest(summary=summary):
+                entry, _ = self._run_child(summary)
+
+                self.assertTrue(entry["receipt_owed"])
+                self.assertFalse(entry["receipt_valid"])
+                self.assertLessEqual(len(entry["receipt_errors"]), 5)
+
+    def test_read_only_lookup_does_not_owe_a_receipt(self):
+        entry, _ = self._run_child("lookup complete", tool_name="read_file")
+
+        self.assertFalse(entry["receipt_owed"])
+        self.assertNotIn("receipt_valid", entry)
+        self.assertNotIn("receipt_errors", entry)
+
+    def test_validator_exception_preserves_child_result_without_extra_call(self):
+        from tools import agent_receipt
+
+        summary = self._valid_receipt_text()
+        with patch.object(
+            agent_receipt,
+            "validate_text",
+            side_effect=RuntimeError("validator infrastructure unavailable"),
+        ) as validate_text:
+            entry, child = self._run_child(summary)
+
+        validate_text.assert_called_once_with(summary)
+        self.assertEqual(entry["summary"], summary)
+        self.assertEqual(entry["status"], "completed")
+        self.assertEqual(entry["tool_trace"][0]["tool"], "write_file")
+        self.assertEqual(child.run_conversation.call_count, 1)
 
 
 class TestSubagentCostRollup(unittest.TestCase):
