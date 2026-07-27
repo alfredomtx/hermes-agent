@@ -32,6 +32,12 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.tool_guardrails import ToolGuardrailDecision
+from agent.activity import (
+    clear_current_tool_if_idle,
+    mark_concurrent_tools_started,
+    mark_tool_completed,
+    mark_tool_started,
+)
 from agent.tool_dispatch_helpers import (
     _is_destructive_command,
     _is_multimodal_tool_result,
@@ -652,6 +658,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # we're executing tools (not stuck).
     agent._current_tool = tool_names_str
     agent._touch_activity(f"executing {num_tools} tools concurrently: {tool_names_str}")
+    mark_concurrent_tools_started(
+        agent,
+        [
+            {"name": name, "args": args, "call_id": getattr(tc, "id", "") or ""}
+            for tc, name, args, _trace, block_result, _blocked_by_guardrail in parsed_calls
+            if block_result is None
+        ],
+    )
 
     def _run_tool(index, tool_call, function_name, function_args, middleware_trace):
         """Worker function executed in a thread."""
@@ -683,6 +697,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # ContextVars are propagated by propagate_context_to_thread() at the
         # submit site below (GHSA-qg5c-hvr5-hjgr, #13617).
         start = time.time()
+        activity_error = True
+        activity_duration = None
         try:
             try:
                 result = agent._invoke_tool(
@@ -710,6 +726,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     middleware_trace=list(middleware_trace),
                 )
                 duration = time.time() - start
+                activity_duration = duration
                 logger.info("tool %s cancelled (%.2fs)", function_name, duration)
                 results[index] = (function_name, function_args, result, duration, True, False, middleware_trace)
                 return
@@ -717,13 +734,22 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
             duration = time.time() - start
+            activity_duration = duration
             is_error, _ = _detect_tool_failure(function_name, result)
+            activity_error = is_error
             if is_error:
                 logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
             else:
                 logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
             results[index] = (function_name, function_args, result, duration, is_error, False, middleware_trace)
         finally:
+            mark_tool_completed(
+                agent,
+                function_name,
+                activity_duration,
+                is_error=activity_error,
+                call_id=getattr(tool_call, "id", "") or "",
+            )
             # Tear down worker-tid tracking.  Clear any interrupt bit we may
             # have set so the next task scheduled onto this recycled tid
             # starts with a clean slate.  This MUST be in a finally block
@@ -1022,7 +1048,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 response_preview = _preview_str[:agent.log_prefix_chars] + "..." if len(_preview_str) > agent.log_prefix_chars else _preview_str
                 print(f"  ✅ Tool {i+1} completed in {tool_duration:.2f}s - {response_preview}")
 
-        agent._current_tool = None
+        clear_current_tool_if_idle(agent)
         _status_suffix = " (error)" if is_error else ""
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s){_status_suffix}")
 
@@ -1309,6 +1335,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 pass  # never block tool execution
 
         tool_start_time = time.time()
+        if not _execution_blocked:
+            mark_tool_started(
+                agent,
+                function_name,
+                function_args,
+                call_id=getattr(tool_call, "id", "") or "",
+            )
 
         if _block_msg is not None:
             # Tool blocked by plugin policy — return error without executing.
@@ -1607,6 +1640,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     middleware_trace=list(middleware_trace),
                 )
                 _spinner_result = function_result
+                mark_tool_completed(
+                    agent,
+                    function_name,
+                    time.time() - tool_start_time,
+                    is_error=True,
+                    call_id=getattr(tool_call, "id", "") or "",
+                )
                 try:
                     agent.interrupt("keyboard interrupt")
                 except Exception:
@@ -1647,6 +1687,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     start_time=tool_start_time,
                     middleware_trace=list(middleware_trace),
                 )
+                mark_tool_completed(
+                    agent,
+                    function_name,
+                    time.time() - tool_start_time,
+                    is_error=True,
+                    call_id=getattr(tool_call, "id", "") or "",
+                )
                 try:
                     agent.interrupt("keyboard interrupt")
                 except Exception:
@@ -1670,6 +1717,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Log tool errors to the persistent error log so [error] tags
         # in the UI always have a corresponding detailed entry on disk.
         _is_error_result, _ = _detect_tool_failure(function_name, function_result)
+        mark_tool_completed(
+            agent,
+            function_name,
+            tool_duration,
+            is_error=_is_error_result,
+            call_id=getattr(tool_call, "id", "") or "",
+        )
+        clear_current_tool_if_idle(agent)
         # The agent-runtime tools above (todo, session_search, memory,
         # context-engine, memory-manager, clarify, delegate_task) are
         # dispatched inline — they never reach handle_function_call, so the
@@ -1729,7 +1784,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             except Exception as cb_err:
                 logging.debug(f"Tool progress callback error: {cb_err}")
 
-        agent._current_tool = None
         _status_suffix = " (error)" if _is_error_result else ""
         agent._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s){_status_suffix}")
 
