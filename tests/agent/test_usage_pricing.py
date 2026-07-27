@@ -3,8 +3,10 @@ from types import SimpleNamespace
 
 from agent.usage_pricing import (
     CanonicalUsage,
+    CorrectionsConfig,
     estimate_usage_cost,
     get_pricing_entry,
+    load_corrections_config,
     normalize_usage,
 )
 
@@ -247,6 +249,58 @@ def test_estimate_usage_cost_keeps_base_total_when_ambient_corrections_disabled(
     assert result.status == "estimated"
     assert result.amount_usd == Decimal("5")
     assert "bedrock-cross-region-uplift" not in result.notes
+
+
+def test_unknown_codex_tier_disables_ambient_corrections(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "cost_corrections": {
+                "enabled": True,
+                "codex_tier": "unrecognized-tier",
+                "bedrock_cross_region_factor": 1.1,
+            }
+        },
+    )
+
+    corrections = load_corrections_config()
+    assert corrections == CorrectionsConfig()
+
+    result = estimate_usage_cost(
+        "gpt-5.6",
+        CanonicalUsage(input_tokens=1_000_000),
+        provider="openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+    )
+
+    assert result.status == "included"
+    assert result.amount_usd == Decimal("0")
+
+
+def test_malformed_bedrock_factor_disables_ambient_corrections(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "cost_corrections": {
+                "enabled": True,
+                "codex_tier": "priority",
+                "bedrock_cross_region_factor": "not-a-factor",
+            }
+        },
+    )
+
+    corrections = load_corrections_config()
+    assert corrections == CorrectionsConfig()
+
+    result = estimate_usage_cost(
+        "gpt-5.6",
+        CanonicalUsage(input_tokens=1_000_000),
+        provider="openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+    )
+
+    assert result.status == "included"
+    assert result.amount_usd == Decimal("0")
 
 
 def test_estimate_usage_cost_refuses_cache_pricing_without_official_cache_rate(monkeypatch):

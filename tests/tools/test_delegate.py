@@ -1862,6 +1862,58 @@ class TestDelegateReceiptStamps(unittest.TestCase):
         self.assertEqual(entry["tool_trace"][0]["tool"], "write_file")
         self.assertEqual(child.run_conversation.call_count, 1)
 
+    def test_timeout_result_includes_receipt_owed(self):
+        child = MagicMock()
+        child._credential_pool = None
+        child._delegate_role = "leaf"
+        child._delegate_saved_tool_names = []
+        child._interrupt_requested = False
+        child.tool_progress_callback = None
+        child.get_activity_summary.return_value = {"api_call_count": 0}
+        child.interrupt.side_effect = lambda: setattr(child, "_interrupt_requested", True)
+
+        def wait_for_interrupt(**_kwargs):
+            while not child._interrupt_requested:
+                time.sleep(0.001)
+
+        child.run_conversation.side_effect = wait_for_interrupt
+
+        with patch(
+            "tools.delegate_tool._dump_subagent_timeout_diagnostic",
+            return_value=None,
+        ):
+            entry = _run_single_child(
+                task_index=0,
+                goal="timeout receipt contract test",
+                child=child,
+                parent_agent=_make_mock_parent(),
+                child_timeout=0.01,
+            )
+
+        self.assertEqual(entry["status"], "timeout")
+        self.assertFalse(entry["receipt_owed"])
+        self.assertNotIn("receipt_valid", entry)
+
+    def test_exception_result_includes_receipt_owed(self):
+        child = MagicMock()
+        child._credential_pool = None
+        child._delegate_role = "leaf"
+        child._delegate_saved_tool_names = []
+        child.tool_progress_callback = None
+        child.run_conversation.side_effect = RuntimeError("child exploded")
+
+        entry = _run_single_child(
+            task_index=0,
+            goal="exception receipt contract test",
+            child=child,
+            parent_agent=_make_mock_parent(),
+            child_timeout=1.0,
+        )
+
+        self.assertEqual(entry["status"], "error")
+        self.assertFalse(entry["receipt_owed"])
+        self.assertNotIn("receipt_valid", entry)
+
 
 class TestSubagentCostRollup(unittest.TestCase):
     """Port of Kilo-Org/kilocode#9448 — parent's session_estimated_cost_usd

@@ -29,7 +29,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agent.memory_manager import build_memory_context_block
+from agent.memory_manager import build_memory_context_block, build_plugin_context_block
 from agent.turn_context import build_turn_context, compose_user_api_content
 from hermes_state import SessionDB
 
@@ -49,15 +49,25 @@ class TestComposeUserApiContent:
     def test_composes_memory_block_and_plugin_context(self):
         out = compose_user_api_content("hello", "likes tea", "PLUGIN-CTX")
         fenced = build_memory_context_block("likes tea")
-        assert out == "hello" + "\n\n" + fenced + "\n\n" + "PLUGIN-CTX"
+        plugin_block = build_plugin_context_block("PLUGIN-CTX")
+        assert out == "hello" + "\n\n" + fenced + "\n\n" + plugin_block
 
     def test_plugin_context_only(self):
-        assert compose_user_api_content("hello", "", "CTX") == "hello\n\nCTX"
+        assert compose_user_api_content("hello", "", "CTX") == (
+            "hello\n\n" + build_plugin_context_block("CTX")
+        )
 
     def test_deterministic_across_calls(self):
         a = compose_user_api_content("hello", "likes tea", "CTX")
         b = compose_user_api_content("hello", "likes tea", "CTX")
-        assert a == b
+        expected = (
+            "hello\n\n"
+            + build_memory_context_block("likes tea")
+            + "\n\n"
+            + build_plugin_context_block("CTX")
+        )
+        assert a == expected
+        assert b == expected
 
 
 # ---------------------------------------------------------------------------
@@ -292,9 +302,8 @@ class TestPrologueStamping:
         assert msg["api_content"] == compose_user_api_content(
             "hello", ctx.ext_prefetch_cache, ctx.plugin_user_context
         )
-        assert msg["api_content"] == "hello\n\nPLUGIN-CTX"
         # The early persist saw the stamped sidecar (written in one insert).
-        assert agent.api_content_at_persist == "hello\n\nPLUGIN-CTX"
+        assert agent.api_content_at_persist == msg["api_content"]
 
     def test_no_stamp_without_injections(self):
         agent = _FakeAgent()
@@ -537,7 +546,9 @@ class TestWireInvariant:
         assert len(reqs) == 2
         sent_1 = _user_messages(reqs[0])[0]["content"]
         sent_2 = _user_messages(reqs[1])[0]["content"]
-        assert sent_1 == "hello please\n\nPLUGIN-CTX"
+        assert sent_1 == (
+            "hello please\n\n" + build_plugin_context_block("PLUGIN-CTX")
+        )
         assert sent_2 == sent_1  # repeated builds: identical bytes
 
         # The sidecar never reaches the provider.
@@ -578,7 +589,9 @@ class TestWireInvariant:
 
         # And the new current-turn message got its own injection + sidecar.
         current = _user_messages(_chat_requests(handler)[0])[-1]
-        assert current["content"] == "second question\n\nPLUGIN-CTX"
+        assert current["content"] == (
+            "second question\n\n" + build_plugin_context_block("PLUGIN-CTX")
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -694,9 +707,12 @@ class TestPrologueMoaAndInPlaceBackfill:
 
         msg = ctx.messages[ctx.current_turn_user_idx]
         assert msg["content"] == "hello"
-        assert msg["api_content"] == "hello\n\nPLUGIN-CTX"
+        expected_api_content = (
+            "hello\n\n" + build_plugin_context_block("PLUGIN-CTX")
+        )
+        assert msg["api_content"] == expected_api_content
         agent._session_db.set_latest_user_api_content.assert_called_once_with(
-            "sess-1", "hello", "hello\n\nPLUGIN-CTX"
+            "sess-1", "hello", expected_api_content
         )
 
 

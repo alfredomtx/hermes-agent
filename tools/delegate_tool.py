@@ -339,7 +339,16 @@ def _looks_like_error_output(content: Any) -> bool:
 def _stamp_agent_receipt(
     entry: Dict[str, Any], *, summary: Any, tool_trace: Any
 ) -> Dict[str, Any]:
-    """Stamp receipt evidence on a completed delegate result."""
+    """Stamp receipt evidence on a terminal delegate result."""
+    if "receipt_owed" in entry:
+        return entry
+
+    # Terminal errors without a usable child trace cannot establish reusable
+    # work, and must not manufacture receipt validation fields.
+    if entry.get("status") != "completed" and not tool_trace:
+        entry["receipt_owed"] = False
+        return entry
+
     try:
         owed = bool(
             agent_receipt.owes_receipt(
@@ -362,6 +371,15 @@ def _stamp_agent_receipt(
         except Exception:
             logger.debug("agent receipt validation failed", exc_info=True)
     return entry
+
+
+def _normalize_delegate_receipt(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Stamp receipt evidence at the terminal delegate result boundary."""
+    return _stamp_agent_receipt(
+        entry,
+        summary=entry.get("summary"),
+        tool_trace=entry.get("tool_trace"),
+    )
 
 
 def _normalize_role(r: Optional[str]) -> str:
@@ -2199,7 +2217,7 @@ def _run_single_child(
         if result.get("status") != "timeout":
             if len(tried) > 1:
                 result["duration_seconds"] = round(time.monotonic() - started, 2)
-            return result
+            return _normalize_delegate_receipt(result)
         last = result
         if index >= len(routes) - 1:
             break
@@ -2227,13 +2245,13 @@ def _run_single_child(
             assert child_builder is not None
             current = child_builder(next_route)
         except Exception as exc:
-            return {
+            return _normalize_delegate_receipt({
                 "task_index": task_index, "status": "error", "summary": None,
                 "error": f"Subagent timed out on {label}, then failed to build fallback child {next_label}: {exc}",
                 "exit_reason": "error", "api_calls": int(result.get("api_calls") or 0),
                 "duration_seconds": round(time.monotonic() - started, 2),
                 "providers_tried": list(tried), "attempt_count": len(tried),
-            }
+            })
 
     if last is not None:
         attempts = len(tried)
@@ -2246,13 +2264,13 @@ def _run_single_child(
         if budget is not None:
             last["timeout_budget_seconds"] = round(budget, 2)
         last["duration_seconds"] = round(time.monotonic() - started, 2)
-        return last
-    return {
+        return _normalize_delegate_receipt(last)
+    return _normalize_delegate_receipt({
         "task_index": task_index, "status": "error", "summary": None,
         "error": "Subagent did not run.", "exit_reason": "error", "api_calls": 0,
         "duration_seconds": round(time.monotonic() - started, 2),
         "providers_tried": list(tried), "attempt_count": len(tried),
-    }
+    })
 
 
 def _run_single_child_attempt(
@@ -2569,7 +2587,7 @@ def _run_single_child_attempt(
             else:
                 _err = str(_timeout_exc)
 
-            return {
+            return _normalize_delegate_receipt({
                 "task_index": task_index,
                 "status": "timeout" if is_timeout else "error",
                 "summary": None,
@@ -2579,7 +2597,7 @@ def _run_single_child_attempt(
                 "duration_seconds": duration,
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
-            }
+            })
         finally:
             # Shut down executor without waiting — if the child thread
             # is stuck on blocking I/O, wait=True would hang forever.
@@ -2814,7 +2832,7 @@ def _run_single_child_attempt(
                 )
             except Exception as e:
                 logger.debug("Progress callback failure relay failed: %s", e)
-        return {
+        return _normalize_delegate_receipt({
             "task_index": task_index,
             "status": "error",
             "summary": None,
@@ -2822,7 +2840,7 @@ def _run_single_child_attempt(
             "api_calls": 0,
             "duration_seconds": duration,
             "_child_role": getattr(child, "_delegate_role", None),
-        }
+        })
 
     finally:
         # Stop the heartbeat thread so it doesn't keep touching parent activity
@@ -3355,6 +3373,11 @@ def delegate_task(
 
             # Sort by task_index so results match input order
             results.sort(key=lambda r: r["task_index"])
+
+        # Normalize every terminal row, including rows fabricated when the
+        # parent is interrupted or a child future raises before returning one.
+        for entry in results:
+            _normalize_delegate_receipt(entry)
 
         # Cap subagent summaries against the parent's remaining context
         # headroom (split across the batch) before they enter the parent's

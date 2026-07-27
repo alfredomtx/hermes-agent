@@ -1085,10 +1085,22 @@ def load_corrections_config() -> CorrectionsConfig:
         enabled = raw.get("enabled", False)
         if isinstance(enabled, str):
             enabled = enabled.strip().lower() in {"1", "true", "yes", "on"}
-        factor = _to_decimal(raw.get("bedrock_cross_region_factor")) or Decimal("1")
+        if not bool(enabled):
+            return _NO_CORRECTIONS
+
+        codex_tier = str(raw.get("codex_tier") or "priority").strip().lower()
+        if codex_tier not in {"priority", "standard"}:
+            return _NO_CORRECTIONS
+
+        if "bedrock_cross_region_factor" in raw:
+            factor = _to_decimal(raw["bedrock_cross_region_factor"])
+            if factor is None or not factor.is_finite():
+                return _NO_CORRECTIONS
+        else:
+            factor = Decimal("1")
         return CorrectionsConfig(
-            enabled=bool(enabled),
-            codex_tier=str(raw.get("codex_tier") or "priority"),
+            enabled=True,
+            codex_tier=codex_tier,
             bedrock_cross_region_factor=factor,
         )
     except Exception:
