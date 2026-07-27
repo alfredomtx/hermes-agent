@@ -21718,6 +21718,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
 
             if tool_name == "delegate_task" and delegate_task_args_enabled:
+                _agent = agent_holder[0] if agent_holder else None
+                _delegate_depth = getattr(_agent, "_delegate_depth", 0)
+                if subagent_roster_enabled and _delegate_depth == 0:
+                    return
                 for card in _format_delegate_task_args_progress(args):
                     progress_queue.put(("__tool_start__", tool_name, card))
                 return

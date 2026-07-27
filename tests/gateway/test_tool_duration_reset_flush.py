@@ -259,6 +259,23 @@ async def test_duration_suffix_survives_reset_from_interim_content(monkeypatch):
     assert 'write_file: "/tmp/x.out" · 0.5s' in rendered
 
 
+@pytest.mark.asyncio
+async def test_delegate_task_args_card_is_suppressed_when_subagent_roster_enabled(monkeypatch):
+    """The async roster watcher owns the merged delegate_task card."""
+    user_config = _user_config(interim=False)
+    user_config["display"]["platforms"]["telegram"]["subagent_roster"] = "on"
+
+    result, _rendered, adapter = await _run(
+        monkeypatch, user_config, FakeInterimResetAgent
+    )
+
+    assert result["final_response"] == "done"
+    parent_adapter_output = [
+        item["content"] for item in adapter.sent + adapter.edits
+    ]
+    assert not any("🔀 Delegate task" in content for content in parent_adapter_output)
+
+
 class FakeResetMidToolAgent(BaseFakeTimingAgent):
     """A __reset__ lands BETWEEN a terminal's start and completed.
 
