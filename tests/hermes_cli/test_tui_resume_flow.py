@@ -403,6 +403,46 @@ def test_termux_fast_cli_launch_oneshot_uses_light_parser(monkeypatch, main_mod)
         "provider": "openai",
         "toolsets": None,
         "usage_file": "usage.json",
+        "no_tools": False,
+    }
+
+
+def test_termux_fast_cli_launch_oneshot_forwards_no_tools(monkeypatch, main_mod):
+    captured = {}
+    prepared = []
+
+    monkeypatch.setenv("TERMUX_VERSION", "1")
+    monkeypatch.delenv("HERMES_TUI", raising=False)
+    monkeypatch.setattr(
+        sys, "argv", ["hermes", "-z", "hello", "--no-tools"]
+    )
+    monkeypatch.setattr(
+        main_mod, "_prepare_agent_startup", lambda args: prepared.append(args.command)
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.oneshot",
+        types.SimpleNamespace(
+            run_oneshot=lambda prompt, **kwargs: captured.update(
+                {"prompt": prompt, **kwargs}
+            )
+            or 17
+        ),
+    )
+    monkeypatch.setattr(main_mod, "_exit_after_oneshot", _raise_exit)
+
+    with pytest.raises(SystemExit) as exc:
+        main_mod._try_termux_fast_cli_launch()
+
+    assert exc.value.code == 17
+    assert prepared == [None]
+    assert captured == {
+        "prompt": "hello",
+        "model": None,
+        "provider": None,
+        "toolsets": None,
+        "usage_file": None,
+        "no_tools": True,
     }
 
 
@@ -657,6 +697,58 @@ def test_main_top_level_oneshot_accepts_toolsets(monkeypatch, main_mod):
         "provider": None,
         "toolsets": "web,terminal",
         "usage_file": "usage.json",
+        "no_tools": False,
+    }
+
+
+def test_main_top_level_oneshot_forwards_no_tools(monkeypatch, main_mod):
+    captured = {}
+
+    import hermes_cli.config as config_mod
+
+    monkeypatch.setattr(sys, "argv", ["hermes", "-z", "hello", "--no-tools"])
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.plugins",
+        types.SimpleNamespace(discover_plugins=lambda: None),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.mcp_tool",
+        types.SimpleNamespace(discover_mcp_tools=lambda: None),
+    )
+    monkeypatch.setattr(config_mod, "load_config", lambda: {})
+    monkeypatch.setattr(config_mod, "get_container_exec_info", lambda: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "agent.shell_hooks",
+        types.SimpleNamespace(
+            register_from_config=lambda _cfg, accept_hooks=False: None
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.oneshot",
+        types.SimpleNamespace(
+            run_oneshot=lambda prompt, **kwargs: captured.update(
+                {"prompt": prompt, **kwargs}
+            )
+            or 0
+        ),
+    )
+    monkeypatch.setattr(main_mod, "_exit_after_oneshot", _raise_exit)
+
+    with pytest.raises(SystemExit) as exc:
+        main_mod.main()
+
+    assert exc.value.code == 0
+    assert captured == {
+        "prompt": "hello",
+        "model": None,
+        "provider": None,
+        "toolsets": None,
+        "usage_file": None,
+        "no_tools": True,
     }
 
 
@@ -1379,6 +1471,69 @@ def _stub_plugin_discovery(monkeypatch):
     )
 
 
+def test_oneshot_no_tools_disables_configured_toolsets(monkeypatch):
+    _stub_plugin_discovery(monkeypatch)
+    import hermes_cli.oneshot as oneshot_mod
+
+    captured = {}
+
+    def fake_run_agent(prompt, **kwargs):
+        captured.update({"prompt": prompt, **kwargs})
+        return "done", {}
+
+    monkeypatch.setattr(oneshot_mod, "_run_agent", fake_run_agent)
+
+    assert oneshot_mod.run_oneshot("hello", no_tools=True) == 0
+    assert captured == {
+        "prompt": "hello",
+        "model": None,
+        "provider": None,
+        "toolsets": None,
+        "use_config_toolsets": False,
+    }
+
+
+def test_oneshot_no_tools_rejects_explicit_toolsets_without_agent(
+    monkeypatch, capsys
+):
+    _stub_plugin_discovery(monkeypatch)
+    import hermes_cli.oneshot as oneshot_mod
+
+    invoked = []
+    monkeypatch.setattr(
+        oneshot_mod,
+        "_run_agent",
+        lambda *args, **kwargs: invoked.append((args, kwargs)) or ("done", {}),
+    )
+
+    assert oneshot_mod.run_oneshot("hello", no_tools=True, toolsets="web") == 2
+    captured = capsys.readouterr()
+
+    assert invoked == []
+    assert captured.out == ""
+    assert captured.err.strip() == (
+        "hermes -z: --no-tools cannot be combined with --toolsets."
+    )
+
+
+def test_oneshot_preserves_explicit_toolsets(monkeypatch):
+    _stub_plugin_discovery(monkeypatch)
+    import hermes_cli.oneshot as oneshot_mod
+
+    captured = {}
+
+    def fake_run_agent(prompt, **kwargs):
+        captured.update({"prompt": prompt, **kwargs})
+        return "done", {}
+
+    monkeypatch.setattr(oneshot_mod, "_run_agent", fake_run_agent)
+
+    assert oneshot_mod.run_oneshot("hello", toolsets="web,terminal") == 0
+    assert captured["prompt"] == "hello"
+    assert captured["toolsets"] == ["web", "terminal"]
+    assert captured["use_config_toolsets"] is False
+
+
 def test_oneshot_rejects_invalid_only_toolsets(monkeypatch, capsys):
     _stub_plugin_discovery(monkeypatch)
     from hermes_cli.oneshot import run_oneshot
@@ -1633,6 +1788,68 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
     assert captured["session_db"] is sentinel_db
     assert captured["enabled_toolsets"] == ["session_search"]
     assert captured["prompt"] == "recall this"
+
+
+def test_oneshot_run_agent_no_tools_passes_empty_toolsets_to_agent(monkeypatch):
+    import hermes_cli.oneshot as oneshot_mod
+
+    captured = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.suppress_status_output = False
+            self.stream_delta_callback = object()
+            self.tool_gen_callback = object()
+            self._session_messages = []
+
+        def run_conversation(self, prompt, **_kwargs):
+            captured["prompt"] = prompt
+            return {"final_response": "ok"}
+
+        def shutdown_memory_provider(self, messages=None):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setitem(
+        sys.modules, "run_agent", types.SimpleNamespace(AIAgent=FakeAgent)
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"model": {"default": "gpt-test", "provider": "openai"}},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: {
+            "api_key": "key",
+            "base_url": "https://example.invalid",
+            "provider": "openai",
+            "api_mode": "chat_completions",
+            "credential_pool": None,
+        },
+    )
+    monkeypatch.setattr(oneshot_mod, "_create_session_db_for_oneshot", lambda: None)
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._get_platform_tools",
+        lambda *_args, **_kwargs: pytest.fail(
+            "configured toolsets must not be resolved in --no-tools mode"
+        ),
+    )
+
+    text, result = oneshot_mod._run_agent(
+        "hello",
+        model="gpt-test",
+        provider="openai",
+        use_config_toolsets=False,
+    )
+
+    assert text == "ok"
+    assert not result.get("failed")
+    assert captured["enabled_toolsets"] == []
+    assert captured["enabled_toolsets"] is not None
+    assert captured["prompt"] == "hello"
 
 
 def test_launch_tui_exports_model_provider_and_toolsets(monkeypatch, main_mod):

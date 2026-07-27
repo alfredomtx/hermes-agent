@@ -154,6 +154,12 @@ def build_top_level_parser():
         help="Comma-separated toolsets to enable for this invocation. Applies to -z/--oneshot and --tui.",
     )
     parser.add_argument(
+        "--no-tools",
+        action="store_true",
+        default=False,
+        help="disable all tools for one-shot mode.",
+    )
+    parser.add_argument(
         "--resume",
         "-r",
         metavar="SESSION",

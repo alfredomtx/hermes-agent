@@ -3,8 +3,8 @@
 Bypasses cli.py entirely.  No banner, no spinner, no session_id line,
 no stderr chatter.  Just the agent's final text to stdout.
 
-Toolsets = explicit --toolsets when provided, otherwise whatever the user has
-configured for "cli" in `hermes tools`.
+Toolsets = none with --no-tools, explicit --toolsets when provided, otherwise
+whatever the user has configured for "cli" in `hermes tools`.
 Rules / memory / AGENTS.md / preloaded skills = same as a normal chat turn.
 Approvals = auto-bypassed (HERMES_YOLO_MODE=1 is set for the call).
 Working directory = the user's CWD (AGENTS.md etc. resolve from there as usual).
@@ -173,6 +173,7 @@ def run_oneshot(
     provider: Optional[str] = None,
     toolsets: object = None,
     usage_file: Optional[str] = None,
+    no_tools: bool = False,
 ) -> int:
     """Execute a single prompt and print only the final content block.
 
@@ -187,6 +188,8 @@ def run_oneshot(
             cost, token counts, model, api_calls) is written there after the
             run — even when the run fails — so pipelines can account for
             spend per invocation.
+        no_tools: Disable every toolset, including configured CLI toolsets.
+            Cannot be combined with ``toolsets``.
 
     Returns the exit code.  The caller owns process termination.
     """
@@ -210,11 +213,19 @@ def run_oneshot(
         )
         return 2
 
+    normalized_toolsets = _normalize_toolsets(toolsets)
+    if no_tools and normalized_toolsets is not None:
+        sys.stderr.write("hermes -z: --no-tools cannot be combined with --toolsets.\n")
+        return 2
+
     explicit_toolsets, toolsets_error = _validate_explicit_toolsets(toolsets)
     if toolsets_error:
         sys.stderr.write(toolsets_error)
         return 2
-    use_config_toolsets = _normalize_toolsets(toolsets) is None
+    use_config_toolsets = normalized_toolsets is None
+    if no_tools:
+        explicit_toolsets = None
+        use_config_toolsets = False
 
     # Auto-approve any shell / tool approvals.  Non-interactive by
     # definition — a prompt would hang forever.
@@ -392,8 +403,11 @@ def _run_agent(
     # has enabled for "cli". sorted() gives stable ordering for config-derived
     # sets; explicit values preserve user order.
     toolsets_list = _normalize_toolsets(toolsets)
-    if toolsets_list is None and use_config_toolsets:
-        toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
+    if toolsets_list is None:
+        if use_config_toolsets:
+            toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
+        else:
+            toolsets_list = []
 
     session_db = _create_session_db_for_oneshot()
     # The try spans agent construction (not just ``chat``) so the SQLite store
