@@ -3429,6 +3429,27 @@ class TestDelegateEventEnum(unittest.TestCase):
         cb("tool.started", tool_name="terminal", preview="ls")
         parent._delegate_spinner.print_above.assert_called()
 
+    def test_progress_callback_relays_late_bound_reasoning(self):
+        parent = _make_mock_parent()
+        parent.tool_progress_callback = MagicMock()
+        session_ref = {}
+        cb = _build_child_progress_callback(
+            0,
+            "test goal",
+            parent,
+            task_count=1,
+            subagent_id="child-1",
+            session_ref=session_ref,
+        )
+
+        session_ref["reasoning"] = {"enabled": True, "effort": "xhigh"}
+        cb("subagent.start", preview="test goal")
+
+        assert parent.tool_progress_callback.call_args.kwargs["reasoning"] == {
+            "enabled": True,
+            "effort": "xhigh",
+        }
+
     def test_progress_callback_normalises_thinking(self):
         """Both _thinking and reasoning.available route to TASK_THINKING."""
         parent = _make_mock_parent()

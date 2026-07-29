@@ -1210,6 +1210,8 @@ def _build_child_progress_callback(
         # event lets UIs open/inspect the subagent's session directly.
         if session_ref and session_ref.get("session_id"):
             kw["child_session_id"] = str(session_ref["session_id"])
+        if session_ref and session_ref.get("reasoning") is not None:
+            kw["reasoning"] = session_ref["reasoning"]
         kw["tool_count"] = _tool_count[0]
         return kw
 
@@ -1667,6 +1669,7 @@ def _build_child_agent(
                 )
     except Exception as exc:
         logger.debug("Could not load delegation reasoning_effort: %s", exc)
+    child_session_ref["reasoning"] = child_reasoning
 
     # Inherit the parent's fallback provider chain so subagents can recover
     # from rate-limits and credential exhaustion exactly like the top-level
