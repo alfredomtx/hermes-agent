@@ -19273,10 +19273,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if not synth_text:
                         continue
                     try:
-                        await self._finalize_async_delegation_roster(
-                            evt,
-                            active_subagents,
-                        )
+                        try:
+                            await self._finalize_async_delegation_roster(
+                                evt,
+                                active_subagents,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Async delegation roster finalization failed",
+                                exc_info=True,
+                            )
                         delivered = await self._deliver_completion_notification(synth_text, evt)
                         if delivered is False:
                             _pr.completion_queue.put(evt)

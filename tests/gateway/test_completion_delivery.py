@@ -186,6 +186,41 @@ def test_failed_async_injection_is_retried_and_only_success_is_acked(
     assert acknowledgements == ["deleg_duplicate"]
 
 
+def test_batch_completion_delivery_survives_roster_finalization_failure(
+    monkeypatch, isolated_registry,
+):
+    event = _async_event("deleg_roster_failure")
+    event["is_batch"] = True
+    _persist_pending_completion(event)
+
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    isolated.put(event)
+
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    async def _raise_roster_finalization(*_args, **_kwargs):
+        raise RuntimeError("roster unavailable")
+
+    monkeypatch.setattr(
+        runner,
+        "_finalize_async_delegation_roster",
+        _raise_roster_finalization,
+    )
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    adapter.handle_message.assert_awaited_once()
+    from tools import async_delegation
+
+    row = async_delegation.get_durable_delegation(event["delegation_id"])
+    assert row is not None
+    assert row["delivery_state"] == "delivered"
+    assert row["delivery_attempts"] == 1
+
+
 def _persist_pending_completion(event):
     from tools import async_delegation
 
