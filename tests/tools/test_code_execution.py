@@ -46,6 +46,7 @@ from tools.code_execution_tool import (
     EXECUTE_CODE_SCHEMA,
     _TOOL_DOC_LINES,
     _execute_remote,
+    _rpc_poll_loop,
 )
 
 
@@ -178,6 +179,70 @@ class TestExecuteCodeRemoteTempDir(unittest.TestCase):
         self.assertIn("rm -rf /data/data/com.termux/files/usr/tmp/hermes_exec_", cleanup_cmd)
         self.assertNotIn("mkdir -p /tmp/hermes_exec_", mkdir_cmd)
 
+
+class TestRemoteRpcContext(unittest.TestCase):
+    def test_rpc_poll_loop_forwards_parent_context(self):
+        stop_event = threading.Event()
+
+        class FakeEnv:
+            def __init__(self):
+                self.response_written = False
+
+            def execute(self, command, cwd=None, timeout=None):
+                if command == "ls -1 /rpc/req_* 2>/dev/null || true":
+                    return {"output": "/rpc/req_000001\n"}
+                if command == "cat /rpc/req_000001":
+                    return {
+                        "output": json.dumps({
+                            "token": "rpc-token",
+                            "tool": "terminal",
+                            "args": {"command": "echo ok"},
+                            "seq": 1,
+                        })
+                    }
+                if command.startswith("echo '") and "/rpc/res_000001.tmp" in command:
+                    self.response_written = True
+                    stop_event.set()
+                    return {"output": ""}
+                if command == "rm -f /rpc/req_000001":
+                    return {"output": ""}
+                raise AssertionError(f"Unexpected fake env command: {command}")
+
+        env = FakeEnv()
+        tool_call_log = []
+        tool_call_counter = [0]
+
+        with patch(
+            "model_tools.handle_function_call",
+            return_value=json.dumps({"output": "ok", "exit_code": 0}),
+        ) as dispatch:
+            _rpc_poll_loop(
+                env,
+                "/rpc",
+                "task-123",
+                tool_call_log,
+                tool_call_counter,
+                1,
+                frozenset({"terminal"}),
+                stop_event,
+                "rpc-token",
+                "session-456",
+                "turn-789",
+                "request-012",
+            )
+
+        dispatch.assert_called_once_with(
+            "terminal",
+            {"command": "echo ok"},
+            task_id="task-123",
+            session_id="session-456",
+            turn_id="turn-789",
+            api_request_id="request-012",
+        )
+        self.assertTrue(env.response_written)
+        self.assertEqual(tool_call_counter, [1])
+        self.assertEqual(tool_call_log[0]["tool"], "terminal")
+
     def test_timezone_shell_quoted_in_remote_execution(self):
         """HERMES_TIMEZONE must be shell-quoted in remote env_prefix to prevent injection."""
         class FakeEnv:
@@ -272,6 +337,35 @@ print(result.get("output", ""))
         self.assertEqual(result["status"], "success")
         self.assertIn("mock output for: echo hello", result["output"])
         self.assertEqual(result["tool_calls_made"], 1)
+
+    def test_nested_tool_calls_forward_parent_context(self):
+        """Nested UDS tool calls receive the parent request context."""
+        code = """
+from hermes_tools import terminal
+print(terminal("echo nested")["output"])
+"""
+
+        def capture_nested_tool(function_name, function_args, **kwargs):
+            return json.dumps({"output": "nested output", "exit_code": 0})
+
+        with patch("model_tools.handle_function_call",
+                   side_effect=capture_nested_tool) as dispatch:
+            result = json.loads(execute_code(
+                code=code,
+                task_id="parent-task",
+                enabled_tools=["terminal"],
+                session_id="parent-session",
+                turn_id="parent-turn",
+                api_request_id="parent-request",
+            ))
+
+        self.assertEqual(result["status"], "success", result)
+        self.assertEqual(result["tool_calls_made"], 1)
+        _, call_kwargs = dispatch.call_args
+        self.assertEqual(call_kwargs["task_id"], "parent-task")
+        self.assertEqual(call_kwargs["session_id"], "parent-session")
+        self.assertEqual(call_kwargs["turn_id"], "parent-turn")
+        self.assertEqual(call_kwargs["api_request_id"], "parent-request")
 
     def test_multi_tool_chain(self):
         """Script calls multiple tools sequentially."""
