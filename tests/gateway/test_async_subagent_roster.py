@@ -258,6 +258,31 @@ class NoEditAsyncRosterAdapter(AsyncRosterAdapter):
     edit_message = BasePlatformAdapter.edit_message
 
 
+class FloodEditAsyncRosterAdapter(AsyncRosterAdapter):
+    def __init__(self, clock):
+        super().__init__()
+        self._clock = clock
+        self.edit_times = []
+
+    async def edit_message(self, chat_id, message_id, content, **kwargs):
+        self.edits.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+                "kwargs": kwargs,
+            }
+        )
+        self.edit_times.append(self._clock["now"])
+        if len(self.edits) == 1:
+            return SendResult(
+                success=False,
+                error="flood_control:40",
+                retry_after=40.0,
+            )
+        return SendResult(success=True, message_id=message_id)
+
+
 def _runner(adapter, *, entries=None):
     from gateway.run import GatewayRunner
 
@@ -600,6 +625,42 @@ async def test_watcher_roster_reseeds_after_flood_reject(monkeypatch):
     await runner._tick_async_delegation_rosters([_record()], active)
     assert len(adapter.sent) == 2, "must retry the seed after a flood reject"
     assert bubble["message_id"] is not None, "second seed should land the bubble"
+
+
+@pytest.mark.asyncio
+async def test_watcher_roster_edit_flood_honors_server_delay(monkeypatch):
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"display": {"platforms": {"telegram": {"subagent_roster": "on"}}}},
+    )
+    clock = {"now": 1000.0}
+    fake_time = types.SimpleNamespace(
+        monotonic=lambda: clock["now"],
+        time=lambda: clock["now"],
+    )
+    monkeypatch.setattr(gateway_run, "time", fake_time)
+
+    adapter = FloodEditAsyncRosterAdapter(clock)
+    runner = _runner(adapter)
+    record = _record()
+    active = [{"subagent_id": "sa-0", "started_at": 101.0, "tool_count": 0}]
+
+    await runner._tick_async_delegation_rosters([record], active)
+
+    clock["now"] = 1010.0
+    await runner._tick_async_delegation_rosters([record], active)
+    assert adapter.edit_times == [1010.0]
+
+    clock["now"] = 1049.0
+    await runner._tick_async_delegation_rosters([record], active)
+    assert adapter.edit_times == [1010.0]
+
+    clock["now"] = 1050.0
+    await runner._tick_async_delegation_rosters([record], active)
+    assert adapter.edit_times == [1010.0, 1050.0]
 
 
 @pytest.mark.asyncio

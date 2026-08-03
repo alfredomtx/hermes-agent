@@ -19048,6 +19048,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         from gateway.subagent_roster import (
             format_subagent_roster,
+            next_roster_retry_deadline,
             resolve_roster_interval,
         )
 
@@ -19111,6 +19112,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "seed_failed": False,
                 "last_text": None,
                 "last_edit_ts": 0.0,
+                "retry_deadline": 0.0,
             },
         )
         try:
@@ -19124,6 +19126,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             interval = ROSTER_EDIT_INTERVAL
         now = time.monotonic()
         if not force and now - float(bubble.get("last_edit_ts") or 0.0) < interval:
+            return
+        if not force and now < float(bubble.get("retry_deadline") or 0.0):
             return
         if not force and text == bubble.get("last_text"):
             return
@@ -19155,12 +19159,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if metadata and self._adapter_edit_accepts_metadata(adapter):
                 kwargs["metadata"] = metadata
             try:
-                await adapter.edit_message(**kwargs)
+                result = await adapter.edit_message(**kwargs)
             except Exception:
                 logger.debug("async roster edit failed", exc_info=True)
+                bubble["last_edit_ts"] = now
+                bubble["retry_deadline"] = next_roster_retry_deadline(
+                    now, interval, None
+                )
+                return
+            if not getattr(result, "success", False):
+                bubble["last_edit_ts"] = now
+                bubble["retry_deadline"] = next_roster_retry_deadline(
+                    now, interval, result
+                )
                 return
         bubble["last_text"] = text
         bubble["last_edit_ts"] = now
+        bubble["retry_deadline"] = 0.0
 
     async def _tick_async_delegation_rosters(
         self,
@@ -22073,6 +22088,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 SubagentRosterState,
                 format_subagent_roster,
                 is_flood_error,
+                next_roster_retry_deadline,
                 resolve_roster_interval,
             )
             from tools.delegate_tool import list_active_subagents
@@ -22080,6 +22096,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             roster = SubagentRosterState()
             roster_msg_id = None
             _last_roster_edit_ts = 0.0
+            _roster_retry_deadline = 0.0
             _last_roster_text = None
             roster_seed_failed = False
             _roster_interval = resolve_roster_interval(user_config, platform_key)
@@ -22102,7 +22119,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 *, force: bool, collapsed: bool = False, allow_seed: bool = True
             ) -> None:
                 nonlocal roster_msg_id, _last_roster_edit_ts
-                nonlocal _last_roster_text, roster_seed_failed
+                nonlocal _roster_retry_deadline, _last_roster_text, roster_seed_failed
                 if not _run_still_current():
                     return
                 text = _render_roster(collapsed)
@@ -22110,6 +22127,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return
                 now = time.monotonic()
                 if not force and (now - _last_roster_edit_ts) < _roster_interval:
+                    return
+                if not force and now < _roster_retry_deadline:
                     return
                 if not force and text == _last_roster_text:
                     return
@@ -22148,11 +22167,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     try:
                         result = await adapter.edit_message(**kwargs)
                     except Exception:
+                        _last_roster_edit_ts = now
+                        _roster_retry_deadline = next_roster_retry_deadline(
+                            now, _roster_interval, None
+                        )
                         return
                     if not getattr(result, "success", False):
+                        _last_roster_edit_ts = now
+                        _roster_retry_deadline = next_roster_retry_deadline(
+                            now, _roster_interval, result
+                        )
                         return
                 _last_roster_edit_ts = now
                 _last_roster_text = text
+                _roster_retry_deadline = 0.0
 
             async def _maybe_tick_roster() -> None:
                 if roster_msg_id is None and not roster.has_records():

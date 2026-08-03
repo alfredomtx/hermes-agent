@@ -202,6 +202,53 @@ class SlowRosterAgent:
         return {"final_response": "done", "messages": [], "api_calls": 1}
 
 
+class FloodEditAdapter(ProgressCaptureAdapter):
+    def __init__(self, clock):
+        super().__init__()
+        self._clock = clock
+        self.edit_times = []
+
+    async def edit_message(self, chat_id, message_id, content, **kwargs) -> SendResult:
+        self.edits.append({"message_id": message_id, "content": content})
+        self.edit_times.append(self._clock["now"])
+        if len(self.edits) == 1:
+            return SendResult(
+                success=False,
+                error="flood_control:40",
+                retry_after=40.0,
+            )
+        return SendResult(success=True, message_id=message_id)
+
+
+def _clocked_roster_agent(clock):
+    class ClockedRosterAgent:
+        def __init__(self, **kwargs):
+            self.tool_progress_callback = kwargs.get("tool_progress_callback")
+            self.tools = []
+            self._interrupt_requested = False
+
+        @property
+        def is_interrupted(self) -> bool:
+            return self._interrupt_requested
+
+        def run_conversation(self, message, conversation_history=None, task_id=None):
+            cb = self.tool_progress_callback
+            _emit_start(cb, "sa-0", "verify php", 0)
+            time.sleep(0.5)
+            clock["now"] = 1010.0
+            time.sleep(0.5)
+            clock["now"] = 1020.0
+            time.sleep(0.5)
+            clock["now"] = 1049.0
+            time.sleep(0.5)
+            clock["now"] = 1050.0
+            time.sleep(0.5)
+            _emit_complete(cb, "sa-0", "completed", 50.0)
+            return {"final_response": "done", "messages": [], "api_calls": 1}
+
+    return ClockedRosterAgent
+
+
 def _make_runner(adapter):
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
@@ -389,3 +436,31 @@ async def test_sync_roster_latches_on_ambiguous_seed_failure(monkeypatch, tmp_pa
     assert len(adapter.sent) <= 1, (
         f"ambiguous seed failure must latch, got {len(adapter.sent)} sends (spam)"
     )
+
+
+@pytest.mark.asyncio
+async def test_sync_roster_edit_flood_honors_server_delay(monkeypatch, tmp_path):
+    import gateway.run as gateway_run
+
+    real_time = gateway_run.time
+    clock = {"now": 1000.0}
+    epoch = real_time.time()
+    fake_time = SimpleNamespace(
+        monotonic=lambda: clock["now"],
+        time=lambda: epoch + clock["now"] - 1000.0,
+    )
+    monkeypatch.setattr(gateway_run, "time", fake_time)
+    adapter = FloodEditAdapter(clock)
+
+    _, result = await _run(
+        monkeypatch,
+        tmp_path,
+        _clocked_roster_agent(clock),
+        "sess-sync-edit-flood",
+        adapter=adapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.edit_times[0] == 1010.0
+    assert all(t >= 1050.0 for t in adapter.edit_times[1:])
+    assert len(adapter.edit_times) >= 2, "edit should become eligible after retry_after"

@@ -61,6 +61,17 @@ def resolve_roster_interval(user_config: Any, platform_key: str) -> float:
         return ROSTER_EDIT_INTERVAL
 
 
+def next_roster_retry_deadline(now: float, interval: float, result: Any) -> float:
+    """Return the next monotonic deadline after a failed roster attempt."""
+    try:
+        retry_after = float(getattr(result, "retry_after", None))
+    except (TypeError, ValueError, OverflowError):
+        retry_after = None
+    if retry_after is None or not math.isfinite(retry_after) or retry_after <= 0:
+        retry_after = interval
+    return now + max(interval, retry_after)
+
+
 def is_flood_error(result: Any) -> bool:
     """True if a failed adapter send/edit result is flood-control / rate-limit.
 
