@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 import os
 import threading
 import time
+import uuid
 from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
@@ -33,15 +34,12 @@ _STDLIB_THREAD_POOL_EXECUTOR = ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
 
 from toolsets import TOOLSETS
+from agent import child_execution
 
-# Sentinel value used by the runtime provider system for providers that are
-# not natively known (named custom providers, third-party aggregators, etc.).
-# Must match hermes_cli.runtime_provider.RUNTIME_PROVIDER_TYPE_CUSTOM.
-_RUNTIME_PROVIDER_CUSTOM = "custom"
 from tools import agent_receipt
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
-from utils import base_url_hostname, is_truthy_value
+from utils import is_truthy_value
 
 
 # Tools that children must never have access to
@@ -772,26 +770,7 @@ def _single_reviewer_profile_error(profile_name: str) -> str:
 
 
 def _merge_delegation_profile(cfg: dict, profile: Optional[str]) -> dict:
-    profile_name = _normalize_profile_name(profile)
-    base = {k: v for k, v in (cfg or {}).items() if k != "profiles"}
-    if not profile_name:
-        return base
-    profiles = (cfg or {}).get("profiles") or {}
-    if not isinstance(profiles, dict) or profile_name not in profiles:
-        known = sorted(str(k) for k in profiles) if isinstance(profiles, dict) else []
-        suffix = f" Known profiles: {', '.join(known)}." if known else " No profiles configured."
-        raise ValueError(f"Unknown delegation profile '{profile_name}'.{suffix}")
-    profile_cfg = profiles[profile_name]
-    if not isinstance(profile_cfg, dict):
-        raise ValueError(f"Delegation profile '{profile_name}' must be a mapping.")
-    merged = dict(base)
-    merged.update({k: v for k, v in profile_cfg.items() if v is not None})
-    merged["_profile"] = profile_name
-    merged["_profile_child_timeout_overridden"] = (
-        "child_timeout_seconds" in profile_cfg and profile_cfg.get("child_timeout_seconds") is not None
-    )
-    merged["_global_child_timeout_seconds"] = base.get("child_timeout_seconds")
-    return merged
+    return child_execution.merge_child_route(cfg or {}, _normalize_profile_name(profile))
 
 
 def _profile_toolsets(cfg: dict) -> Optional[List[str]]:
@@ -806,29 +785,8 @@ def _profile_max_iterations(cfg: dict, default: int) -> int:
         return default
 
 
-def _parse_service_tier_config(raw: Any) -> Optional[str]:
-    value = str(raw or "").strip().lower()
-    if not value or value in {"normal", "default", "standard", "off", "none"}:
-        return None
-    if value in {"fast", "priority", "on"}:
-        return "priority"
-    logger.warning("Unknown delegation service_tier '%s', ignoring", raw)
-    return None
-
-
 def _request_overrides_for_child(model: Optional[str], cfg: dict, parent_agent) -> tuple[Optional[str], Dict[str, Any]]:
-    raw = (cfg or {}).get("service_tier")
-    if raw in (None, ""):
-        raw = getattr(parent_agent, "service_tier", None)
-    tier = _parse_service_tier_config(raw)
-    overrides = dict((cfg or {}).get("request_overrides") or {})
-    if tier:
-        try:
-            from hermes_cli.models import resolve_fast_mode_overrides
-            overrides.update(resolve_fast_mode_overrides(model) or {})
-        except Exception:
-            pass
-    return tier, overrides
+    return child_execution._request_overrides_for_child(model, cfg or {}, parent_agent)
 
 
 def _is_mcp_toolset_name(name: str) -> bool:
@@ -1366,42 +1324,261 @@ def _build_child_progress_callback(
     return _callback
 
 
-def _normalized_runtime_url(value: Any) -> str:
-    return str(value or "").strip().rstrip("/")
-
-
 def _inherit_parent_base_url(parent_agent, fallback_base_url: Optional[str]) -> Optional[str]:
-    """Return the base URL the parent is actually calling, not a stale attribute.
+    return child_execution.inherit_parent_base_url(parent_agent, fallback_base_url)
 
-    ``parent_agent.base_url`` can still carry a leftover OpenRouter URL from an
-    old config while the live OpenAI client in ``_client_kwargs`` already points
-    at local Ollama. Subagents must inherit the active endpoint or they 401
-    against OpenRouter with a dummy/local key.
-    """
-    surface_url = _normalized_runtime_url(fallback_base_url)
-    client_kwargs = getattr(parent_agent, "_client_kwargs", None)
-    if isinstance(client_kwargs, dict):
-        kwargs_url = _normalized_runtime_url(client_kwargs.get("base_url"))
-        if (
-            kwargs_url
-            and kwargs_url != surface_url
-            and kwargs_url.startswith(("http://", "https://"))
-        ):
-            return kwargs_url
+def _prepare_child_inputs(
+    task_index: int,
+    goal: str,
+    context: Optional[str],
+    toolsets: Optional[List[str]],
+    model: Optional[str],
+    max_iterations: int,
+    task_count: int,
+    parent_agent,
+    override_provider: Optional[str] = None,
+    override_base_url: Optional[str] = None,
+    override_api_key: Optional[str] = None,
+    override_api_mode: Optional[str] = None,
+    override_request_overrides: Optional[Dict[str, Any]] = None,
+    override_max_tokens: Optional[int] = None,
+    override_acp_command: Optional[str] = None,
+    override_acp_args: Optional[List[str]] = None,
+    role: str = "leaf",
+    delegation_cfg: Optional[dict] = None,
+    saved_tool_names: Optional[List[str]] = None,
+):
+    cfg = dict(delegation_cfg or _load_config())
+    resolved_credentials = cfg.pop("_resolved_credentials", None)
+    child_depth = getattr(parent_agent, "_delegate_depth", 0) + 1
+    max_spawn = _get_max_spawn_depth()
+    effective_role = (
+        role
+        if role == "orchestrator"
+        and _get_orchestrator_enabled()
+        and child_depth < max_spawn
+        else "leaf"
+    )
 
-    client = getattr(parent_agent, "client", None)
-    if client is not None:
-        # OpenAI SDK exposes ``base_url`` as an ``httpx.URL``, not ``str`` —
-        # coerce so the comparison works regardless of the client's type.
-        live_url = _normalized_runtime_url(getattr(client, "base_url", ""))
-        if (
-            live_url
-            and live_url != surface_url
-            and live_url.startswith(("http://", "https://"))
-        ):
-            return live_url
+    parent_enabled_raw = getattr(parent_agent, "enabled_toolsets", None)
+    parent_enabled = (
+        parent_enabled_raw
+        if isinstance(parent_enabled_raw, (list, tuple, set, frozenset))
+        else None
+    )
+    if parent_enabled is not None:
+        parent_toolsets = set(parent_enabled)
+    elif isinstance(getattr(parent_agent, "valid_tool_names", None), (list, tuple, set, frozenset)):
+        import model_tools
 
-    return fallback_base_url or None
+        parent_toolsets = {
+            toolset
+            for name in getattr(parent_agent, "valid_tool_names", [])
+            if (toolset := model_tools.get_toolset_for_tool(name)) is not None
+        }
+    else:
+        parent_toolsets = set(DEFAULT_TOOLSETS)
+
+    if toolsets is None:
+        child_toolsets = (
+            list(parent_enabled)
+            if parent_enabled is not None
+            else sorted(parent_toolsets)
+        )
+    else:
+        expanded_parent = _expand_parent_toolsets(parent_toolsets)
+        child_toolsets = []
+        for name in toolsets:
+            resolved = _resolve_child_toolset_name(name, expanded_parent)
+            if resolved is not None:
+                child_toolsets.append(resolved)
+        if _get_inherit_mcp_toolsets(cfg):
+            child_toolsets = _preserve_parent_mcp_toolsets(
+                child_toolsets, parent_toolsets
+            )
+    child_toolsets = _strip_blocked_tools(child_toolsets)
+    if effective_role == "orchestrator" and "delegation" not in child_toolsets:
+        child_toolsets.append("delegation")
+
+    raw_parent_disabled = getattr(parent_agent, "disabled_toolsets", None)
+    inherited_disabled = (
+        [str(name) for name in raw_parent_disabled]
+        if isinstance(raw_parent_disabled, (list, tuple, set))
+        else []
+    )
+    if effective_role == "orchestrator":
+        inherited_disabled = [
+            name for name in inherited_disabled if name != "delegation"
+        ]
+    disabled_toolsets = list(
+        dict.fromkeys(
+            inherited_disabled
+            + _blocked_toolsets_for_role(effective_role)
+            + ["kanban"]
+        )
+    )
+
+    workspace_hint = _resolve_workspace_hint(parent_agent)
+    child_prompt = _build_child_system_prompt(
+        goal,
+        context,
+        workspace_path=workspace_hint,
+        role=effective_role,
+        max_spawn_depth=max_spawn,
+        child_depth=child_depth,
+    )
+
+    child_session_ref: Dict[str, Any] = {}
+    subagent_id = f"sa-{task_index}-{uuid.uuid4().hex[:8]}"
+    child_progress_cb = _build_child_progress_callback(
+        task_index,
+        goal,
+        parent_agent,
+        task_count,
+        subagent_id=subagent_id,
+        parent_id=getattr(parent_agent, "_subagent_id", None),
+        depth=max(0, child_depth - 1),
+        model=model or getattr(parent_agent, "model", None),
+        toolsets=child_toolsets,
+        session_ref=child_session_ref,
+    )
+    child_thinking_cb = None
+    if child_progress_cb:
+        def _child_thinking(text: str) -> None:
+            if not text:
+                return
+            try:
+                child_progress_cb("_thinking", text)
+            except Exception:
+                logger.debug("Child thinking callback relay failed", exc_info=True)
+        child_thinking_cb = _child_thinking
+
+    route_overrides = {
+        key: value
+        for key, value in {
+            "provider": override_provider,
+            "model": model,
+            "base_url": override_base_url,
+            "api_key": override_api_key,
+            "api_mode": override_api_mode,
+            "request_overrides": override_request_overrides,
+            "max_output_tokens": override_max_tokens,
+            "command": override_acp_command,
+            "args": override_acp_args,
+        }.items()
+        if value is not None
+    }
+    route_cfg = dict(cfg)
+    route_cfg.update(route_overrides)
+    credentials = resolved_credentials or _resolve_delegation_credentials(route_cfg, parent_agent)
+    child_spec = {
+        **route_overrides,
+        "resolved_credentials": credentials,
+        "enabled_toolsets": child_toolsets,
+        "disabled_toolsets": disabled_toolsets,
+        "instructions": child_prompt,
+        "reasoning_effort": route_cfg.get("reasoning_effort"),
+        "max_tokens": override_max_tokens,
+    }
+    child_context = {
+        "delegation_cfg": cfg,
+        "max_iterations": max_iterations,
+        "session_db": getattr(parent_agent, "_session_db", None),
+        "parent_session_id": getattr(parent_agent, "session_id", None),
+        "platform": "subagent",
+        "log_prefix": f"[subagent-{task_index}]",
+        "saved_tool_names": saved_tool_names,
+    }
+    native = {
+        "child_depth": child_depth,
+        "effective_role": effective_role,
+        "subagent_id": subagent_id,
+        "parent_subagent_id": getattr(parent_agent, "_subagent_id", None),
+        "goal": goal,
+        "session_ref": child_session_ref,
+        "progress": child_progress_cb,
+        "route_cfg": route_cfg,
+        "saved_tool_names": saved_tool_names,
+        "credential_provider": credentials.get("provider")
+        or getattr(parent_agent, "provider", None),
+        "credential_base_url": credentials.get("base_url")
+        or _inherit_parent_base_url(
+            parent_agent, getattr(parent_agent, "base_url", None)
+        ),
+    }
+    return child_spec, {"progress": child_progress_cb, "thinking": child_thinking_cb}, child_context, native
+
+
+def _finish_native_child(parent_agent, child, native: Dict[str, Any]):
+    """Attach native identity, tracking, hooks, and progress after construction."""
+    child._print_fn = getattr(parent_agent, "_print_fn", None)
+    child._delegate_depth = native["child_depth"]
+    child._delegate_role = native["effective_role"]
+    child._subagent_id = native["subagent_id"]
+    child._parent_subagent_id = native["parent_subagent_id"]
+    child._subagent_goal = native["goal"]
+    child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
+    session_ref = native["session_ref"]
+    session_ref["session_id"] = getattr(child, "session_id", "") or ""
+    session_ref["reasoning"] = getattr(child, "reasoning_config", None)
+    child._delegate_progress_ref = session_ref
+    child._delegate_saved_tool_names = list(
+        getattr(child, "_child_saved_tool_names", native["saved_tool_names"] or [])
+    )
+
+    parent_sid = getattr(parent_agent, "session_id", None)
+    if parent_sid and getattr(child, "_session_init_model_config", None) is not None:
+        child._session_init_model_config["_delegate_from"] = parent_sid
+        try:
+            from tools.tier_labels import derive_tier
+
+            route_cfg = native["route_cfg"]
+            child._session_init_model_config["_profile"] = route_cfg.get("_profile")
+            child._session_init_model_config["_tier"] = derive_tier(
+                route_cfg.get("_profile"), route_cfg
+            )
+        except Exception:
+            logger.debug("tier-label telemetry stamp failed", exc_info=True)
+
+    child_pool = _resolve_child_credential_pool(
+        native["credential_provider"],
+        parent_agent,
+        native["credential_base_url"],
+    )
+    if child_pool is not None:
+        child._credential_pool = child_pool
+
+    if hasattr(parent_agent, "_active_children"):
+        lock = getattr(parent_agent, "_active_children_lock", None)
+        if lock:
+            with lock:
+                parent_agent._active_children.append(child)
+        else:
+            parent_agent._active_children.append(child)
+
+    progress = native["progress"]
+    if progress:
+        try:
+            progress("subagent.spawn_requested", preview=native["goal"])
+        except Exception:
+            logger.debug("spawn_requested relay failed", exc_info=True)
+
+    try:
+        from hermes_cli.plugins import invoke_hook as _invoke_hook
+
+        _invoke_hook(
+            "subagent_start",
+            parent_session_id=getattr(parent_agent, "session_id", None),
+            parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "",
+            parent_subagent_id=native["parent_subagent_id"],
+            child_session_id=getattr(child, "session_id", None),
+            child_subagent_id=native["subagent_id"],
+            child_role=native["effective_role"],
+            child_goal=native["goal"],
+        )
+    except Exception:
+        logger.debug("subagent_start hook invocation failed", exc_info=True)
+    return child
 
 
 def _build_child_agent(
@@ -1413,438 +1590,43 @@ def _build_child_agent(
     max_iterations: int,
     task_count: int,
     parent_agent,
-    # Credential overrides from delegation config (provider:model resolution)
     override_provider: Optional[str] = None,
     override_base_url: Optional[str] = None,
     override_api_key: Optional[str] = None,
     override_api_mode: Optional[str] = None,
     override_request_overrides: Optional[Dict[str, Any]] = None,
     override_max_tokens: Optional[int] = None,
-    # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
-    # Per-call role controlling whether the child can further delegate.
-    # 'leaf' (default) cannot; 'orchestrator' retains the delegation
-    # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
     delegation_cfg: Optional[dict] = None,
+    saved_tool_names: Optional[List[str]] = None,
 ):
-    """
-    Build a child AIAgent on the main thread (thread-safe construction).
-    Returns the constructed child agent without running it.
-
-    When override_* params are set (from delegation config), the child uses
-    those credentials instead of inheriting from the parent.  This enables
-    routing subagents to a different provider:model pair (e.g. cheap/fast
-    model on OpenRouter while the parent runs on Nous Portal).
-    """
-    from run_agent import AIAgent
-    import uuid as _uuid
-
-    # ── Role resolution ─────────────────────────────────────────────────
-    # Honor the caller's role only when BOTH the kill switch and the
-    # child's depth allow it.  This is the single point where role
-    # degrades to 'leaf' — keeps the rule predictable.  Callers pass
-    # the normalised role (_normalize_role ran in delegate_task) so
-    # we only deal with 'leaf' or 'orchestrator' here.
-    child_depth = getattr(parent_agent, "_delegate_depth", 0) + 1
-    max_spawn = _get_max_spawn_depth()
-    orchestrator_ok = _get_orchestrator_enabled() and child_depth < max_spawn
-    effective_role = role if (role == "orchestrator" and orchestrator_ok) else "leaf"
-
-    # ── Subagent identity (stable across events, 0-indexed for TUI) ─────
-    # subagent_id is generated here so the progress callback, the
-    # spawn_requested event, and the _active_subagents registry all share
-    # one key.  parent_id is non-None when THIS parent is itself a subagent
-    # (nested orchestrator -> worker chain).
-    subagent_id = f"sa-{task_index}-{_uuid.uuid4().hex[:8]}"
-    parent_subagent_id = getattr(parent_agent, "_subagent_id", None)
-    tui_depth = max(0, child_depth - 1)  # 0 = first-level child for the UI
-
-    delegation_cfg = delegation_cfg or _load_config()
-
-    # When no explicit toolsets given, inherit from parent's enabled toolsets
-    # so disabled tools (e.g. web) don't leak to subagents.
-    # Note: enabled_toolsets=None means "all tools enabled" (the default),
-    # so we must derive effective toolsets from the parent's loaded tools.
-    parent_enabled_raw = getattr(parent_agent, "enabled_toolsets", None)
-    parent_enabled = (
-        parent_enabled_raw
-        if isinstance(parent_enabled_raw, (list, tuple, set, frozenset))
-        else None
-    )
-    if parent_enabled is not None:
-        parent_toolsets = set(parent_enabled)
-    elif parent_agent and isinstance(
-        getattr(parent_agent, "valid_tool_names", None), (list, tuple, set, frozenset)
-    ):
-        # enabled_toolsets is None (all tools) — derive from loaded tool names
-        import model_tools
-
-        parent_toolsets = {
-            ts
-            for name in getattr(parent_agent, "valid_tool_names", [])
-            if (ts := model_tools.get_toolset_for_tool(name)) is not None
-        }
-    else:
-        parent_toolsets = set(DEFAULT_TOOLSETS)
-
-    if toolsets:
-        # Intersect with parent — subagent must not gain tools the parent lacks.
-        # Expand composite toolsets (e.g. hermes-cli) so that individual
-        # toolset names (e.g. web, terminal) are recognised during intersection.
-        expanded_parent = _expand_parent_toolsets(parent_toolsets)
-        child_toolsets = []
-        for name in toolsets:
-            resolved = _resolve_child_toolset_name(name, expanded_parent)
-            if resolved is not None:
-                child_toolsets.append(resolved)
-        if _get_inherit_mcp_toolsets(delegation_cfg):
-            child_toolsets = _preserve_parent_mcp_toolsets(
-                child_toolsets, parent_toolsets
-            )
-        child_toolsets = _strip_blocked_tools(child_toolsets)
-    elif parent_agent and parent_enabled is not None:
-        child_toolsets = _strip_blocked_tools(list(parent_enabled))
-    elif parent_toolsets:
-        child_toolsets = _strip_blocked_tools(sorted(parent_toolsets))
-    else:
-        child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
-
-    # Blocked tools also live inside mixed platform bundles (hermes-cli,
-    # hermes-telegram, etc.) that _strip_blocked_tools must keep because they
-    # carry useful tools too. Pass exact one-tool deny toolsets through to the
-    # child so model_tools subtracts the blocked names AFTER composite
-    # expansion, and the restriction survives later registry/MCP refreshes.
-    raw_parent_disabled = getattr(parent_agent, "disabled_toolsets", None)
-    if isinstance(raw_parent_disabled, (list, tuple, set)):
-        inherited_disabled = [str(name) for name in raw_parent_disabled]
-    else:
-        inherited_disabled = []
-    if effective_role == "orchestrator":
-        # Role grants delegate_task explicitly, matching the unconditional
-        # delegation toolset re-add below.
-        inherited_disabled = [
-            name for name in inherited_disabled if name != "delegation"
-        ]
-    child_disabled_toolsets = list(
-        dict.fromkeys(
-            inherited_disabled + _blocked_toolsets_for_role(effective_role) + ["kanban"]
-        )
-    )
-
-    # Orchestrators retain the 'delegation' toolset that _strip_blocked_tools
-    # removed.  The re-add is unconditional on parent-toolset membership because
-    # orchestrator capability is granted by role, not inherited — see the
-    # test_intersection_preserves_delegation_bound test for the design rationale.
-    if effective_role == "orchestrator" and "delegation" not in child_toolsets:
-        child_toolsets.append("delegation")
-
-    workspace_hint = _resolve_workspace_hint(parent_agent)
-    child_prompt = _build_child_system_prompt(
-        goal,
-        context,
-        workspace_path=workspace_hint,
-        role=effective_role,
-        max_spawn_depth=max_spawn,
-        child_depth=child_depth,
-    )
-    # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
-    parent_api_key = getattr(parent_agent, "api_key", None)
-    if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
-        parent_api_key = parent_agent._client_kwargs.get("api_key")
-
-    # Resolve the child's effective model early so it can ride on every event.
-    effective_model_for_cb = model or getattr(parent_agent, "model", None)
-
-    # Build progress callback to relay tool calls to parent display.
-    # Identity kwargs thread the subagent_id through every emitted event so the
-    # TUI can reconstruct the spawn tree and route per-branch controls.
-    child_session_ref: Dict[str, Any] = {}
-    child_progress_cb = _build_child_progress_callback(
+    spec, callbacks, child_context, native = _prepare_child_inputs(
         task_index,
         goal,
-        parent_agent,
+        context,
+        toolsets,
+        model,
+        max_iterations,
         task_count,
-        subagent_id=subagent_id,
-        parent_id=parent_subagent_id,
-        depth=tui_depth,
-        model=effective_model_for_cb,
-        toolsets=child_toolsets,
-        session_ref=child_session_ref,
+        parent_agent,
+        override_provider,
+        override_base_url,
+        override_api_key,
+        override_api_mode,
+        override_request_overrides,
+        override_max_tokens,
+        override_acp_command,
+        override_acp_args,
+        role,
+        delegation_cfg,
+        saved_tool_names,
     )
-
-    # Each subagent gets its own iteration budget capped at max_iterations
-    # (configurable via delegation.max_iterations, default 50).  This means
-    # total iterations across parent + subagents can exceed the parent's
-    # max_iterations.  The user controls the per-subagent cap in config.yaml.
-
-    child_thinking_cb = None
-    if child_progress_cb:
-
-        def _child_thinking(text: str) -> None:
-            if not text:
-                return
-            try:
-                child_progress_cb("_thinking", text)
-            except Exception as e:
-                logger.debug("Child thinking callback relay failed: %s", e)
-
-        child_thinking_cb = _child_thinking
-
-    # Resolve effective credentials: config override > parent inherit
-    effective_model = model or parent_agent.model
-    effective_provider = override_provider or getattr(parent_agent, "provider", None)
-    effective_base_url = override_base_url or parent_agent.base_url
-    if not override_base_url:
-        effective_base_url = _inherit_parent_base_url(parent_agent, effective_base_url)
-    effective_api_key = override_api_key or parent_api_key
-    # Bug #20558 / PR #20563: api_mode must NOT be inherited when the child uses a
-    # different provider than the parent — each provider has its own API surface
-    # (e.g. MiniMax uses anthropic_messages, DeepSeek uses chat_completions).
-    # Inheriting the parent's mode causes 404 errors when the child routes to the
-    # wrong endpoint.  Derive the mode from the target provider when it differs.
-    _parent_provider = getattr(parent_agent, "provider", None) or ""
-    if override_api_mode is not None:
-        effective_api_mode = override_api_mode
-    elif effective_provider != _parent_provider:
-        effective_api_mode = None  # force re-derivation from provider's defaults
-    else:
-        effective_api_mode = getattr(parent_agent, "api_mode", None)
-    # Defensive: validate trusted delegation.command exists on PATH before
-    # honoring it. Stale config should not force a child onto the ACP transport
-    # and then fail at subprocess startup.
-    if override_acp_command:
-        import shutil as _shutil
-
-        if not _shutil.which(override_acp_command):
-            logger.warning(
-                "Ignoring acp_command=%r: binary not found on PATH; "
-                "falling back to default transport.",
-                override_acp_command,
-            )
-            override_acp_command = None
-            override_acp_args = None
-    effective_acp_command = override_acp_command or getattr(
-        parent_agent, "acp_command", None
+    child = child_execution.create_child(
+        parent_agent, spec, callbacks=callbacks, context=child_context
     )
-    effective_acp_args = list(
-        override_acp_args
-        if override_acp_args is not None
-        else (getattr(parent_agent, "acp_args", []) or [])
-    )
-
-    # When override_provider is set (e.g. delegation.provider: minimax-cn),
-    # the subagent must use direct API calls — not the parent's ACP transport.
-    # Inheriting acp_command unconditionally causes run_agent.py to initialize
-    # CopilotACPClient, bypassing override credentials entirely (issue #16816).
-    if override_provider and not override_acp_command:
-        effective_acp_command = None
-        effective_acp_args = []
-
-    if override_acp_command:
-        # If explicitly forcing an ACP transport override, the provider MUST be copilot-acp
-        # so run_agent.py initializes the CopilotACPClient.
-        effective_provider = "copilot-acp"
-        effective_api_mode = "chat_completions"
-
-    # Resolve reasoning config: delegation override > parent inherit
-    parent_reasoning = getattr(parent_agent, "reasoning_config", None)
-    child_reasoning = parent_reasoning
-    try:
-        # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
-        # False (``reasoning_effort: false``) to "" and inherit the parent
-        # instead of disabling thinking for children.
-        delegation_effort = delegation_cfg.get("reasoning_effort")
-        if delegation_effort or delegation_effort is False:
-            from hermes_constants import parse_reasoning_effort
-
-            parsed = parse_reasoning_effort(delegation_effort)
-            if parsed is not None:
-                child_reasoning = parsed
-            else:
-                logger.warning(
-                    "Unknown delegation.reasoning_effort '%s', inheriting parent level",
-                    delegation_effort,
-                )
-    except Exception as exc:
-        logger.debug("Could not load delegation reasoning_effort: %s", exc)
-    child_session_ref["reasoning"] = child_reasoning
-
-    # Inherit the parent's fallback provider chain so subagents can recover
-    # from rate-limits and credential exhaustion exactly like the top-level
-    # agent does.  _fallback_chain is a list accepted by AIAgent's
-    # fallback_model parameter (which handles both list and dict forms).
-    parent_fallback = getattr(parent_agent, "_fallback_chain", None) or None
-
-    # Inherit the parent's OpenRouter provider-preference filters by default
-    # (so subagents routed to the same provider honour the same routing
-    # constraints).  BUT: when `delegation.provider` is set the user is
-    # explicitly asking the child to run on a different provider, and
-    # parent-level OpenRouter filters (e.g. `only=["Anthropic"]`) would
-    # silently force the child back onto the parent's provider. Clear the
-    # filters in that case so the delegated provider is honoured.
-    child_providers_allowed = getattr(parent_agent, "providers_allowed", None)
-    child_providers_ignored = getattr(parent_agent, "providers_ignored", None)
-    child_providers_order = getattr(parent_agent, "providers_order", None)
-    child_provider_sort = getattr(parent_agent, "provider_sort", None)
-    child_provider_require_parameters = getattr(
-        parent_agent, "provider_require_parameters", False
-    )
-    child_provider_data_collection = getattr(
-        parent_agent, "provider_data_collection", None
-    ) or ""
-    child_openrouter_min_coding_score = getattr(parent_agent, "openrouter_min_coding_score", None)
-    if override_provider:
-        child_providers_allowed = None
-        child_providers_ignored = None
-        child_providers_order = None
-        child_provider_sort = None
-        child_provider_require_parameters = False
-        child_provider_data_collection = ""
-        # Note: openrouter_min_coding_score is model-gated (only emitted on
-        # openrouter/pareto-code), so we keep it inherited even when the
-        # provider is overridden — it's a no-op on any other model.
-
-    child_max_tokens = (
-        override_max_tokens
-        if override_max_tokens is not None
-        else getattr(parent_agent, "max_tokens", None)
-    )
-    child_optional_kwargs: Dict[str, Any] = {}
-    if isinstance(child_max_tokens, int):
-        child_optional_kwargs["max_tokens"] = child_max_tokens
-
-    child_service_tier, profile_request_overrides = _request_overrides_for_child(
-        effective_model, delegation_cfg, parent_agent
-    )
-    child_request_overrides = (
-        dict(override_request_overrides or {})
-        if override_provider
-        else dict(getattr(parent_agent, "request_overrides", {}) or {})
-    )
-    child_request_overrides.update(profile_request_overrides)
-
-    from agent.delegation_context import delegated_child_context
-
-    with delegated_child_context():
-        child = AIAgent(
-            base_url=effective_base_url,
-            api_key=effective_api_key,
-            model=effective_model,
-            provider=effective_provider,
-            api_mode=effective_api_mode,
-            acp_command=effective_acp_command,
-            acp_args=effective_acp_args,
-            max_iterations=max_iterations,
-
-            reasoning_config=child_reasoning,
-            service_tier=child_service_tier,
-            prefill_messages=getattr(parent_agent, "prefill_messages", None),
-            fallback_model=parent_fallback,
-            enabled_toolsets=child_toolsets,
-            disabled_toolsets=child_disabled_toolsets,
-            quiet_mode=True,
-            ephemeral_system_prompt=child_prompt,
-            log_prefix=f"[subagent-{task_index}]",
-            platform="subagent",
-            skip_context_files=True,
-            skip_memory=True,
-            clarify_callback=None,
-            thinking_callback=child_thinking_cb,
-            session_db=getattr(parent_agent, "_session_db", None),
-            parent_session_id=getattr(parent_agent, "session_id", None),
-            providers_allowed=child_providers_allowed,
-            providers_ignored=child_providers_ignored,
-            providers_order=child_providers_order,
-            provider_sort=child_provider_sort,
-            provider_require_parameters=child_provider_require_parameters,
-            provider_data_collection=child_provider_data_collection,
-            request_overrides=child_request_overrides,
-            openrouter_min_coding_score=child_openrouter_min_coding_score,
-            tool_progress_callback=child_progress_cb,
-            iteration_budget=None,  # fresh budget per subagent
-            **child_optional_kwargs,
-        )
-    child._print_fn = getattr(parent_agent, "_print_fn", None)
-    # Now the child exists, its session id can ride on every relayed event
-    # (including the spawn_requested below — first emit happens after this).
-    child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
-    if not isinstance(child_session_ref["session_id"], str):
-        child_session_ref["session_id"] = ""
-    child._delegate_progress_ref = child_session_ref
-    # Set delegation depth so children can't spawn grandchildren
-    child._delegate_depth = child_depth
-    # Stash the post-degrade role for introspection (leaf if the
-    # kill switch or depth bounded the caller's requested role).
-    child._delegate_role = effective_role
-    # Stash subagent identity for nested-delegation event propagation and
-    # for _run_single_child / interrupt_subagent to look up by id.
-    child._subagent_id = subagent_id
-    child._parent_subagent_id = parent_subagent_id
-    child._subagent_goal = goal
-    child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
-    # Stable sidebar marker: delegate subagent sessions must stay out of
-    # session pickers even when a parent delete orphans them (parent_session_id
-    # → NULL). Mirrors /branch's ``_branched_from`` pattern — see
-    # ``list_sessions_rich`` child-exclusion clause.
-    parent_sid = getattr(parent_agent, "session_id", None)
-    if parent_sid and getattr(child, "_session_init_model_config", None) is not None:
-        child._session_init_model_config["_delegate_from"] = parent_sid
-        try:
-            from tools.tier_labels import derive_tier
-
-            profile_name = (delegation_cfg or {}).get("_profile")
-            child._session_init_model_config["_profile"] = profile_name
-            child._session_init_model_config["_tier"] = derive_tier(
-                profile_name, delegation_cfg or {}
-            )
-        except Exception:
-            logger.debug("tier-label telemetry stamp failed", exc_info=True)
-
-    # Share a credential pool with the child when possible so subagents can
-    # rotate credentials on rate limits instead of getting pinned to one key.
-    child_pool = _resolve_child_credential_pool(
-        effective_provider, parent_agent, effective_base_url
-    )
-    if child_pool is not None:
-        child._credential_pool = child_pool
-
-    # Register child for interrupt propagation
-    if hasattr(parent_agent, "_active_children"):
-        lock = getattr(parent_agent, "_active_children_lock", None)
-        if lock:
-            with lock:
-                parent_agent._active_children.append(child)
-        else:
-            parent_agent._active_children.append(child)
-
-    # Announce the spawn immediately — the child may sit in a queue
-    # for seconds if max_concurrent_children is saturated, so the TUI
-    # wants a node in the tree before run starts.
-    if child_progress_cb:
-        try:
-            child_progress_cb("subagent.spawn_requested", preview=goal)
-        except Exception as exc:
-            logger.debug("spawn_requested relay failed: %s", exc)
-
-    try:
-        from hermes_cli.plugins import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "subagent_start",
-            parent_session_id=getattr(parent_agent, "session_id", None),
-            parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "",
-            parent_subagent_id=parent_subagent_id,
-            child_session_id=getattr(child, "session_id", None),
-            child_subagent_id=subagent_id,
-            child_role=effective_role,
-            child_goal=goal,
-        )
-    except Exception:
-        logger.debug("subagent_start hook invocation failed", exc_info=True)
-
-    return child
-
+    return _finish_native_child(parent_agent, child, native)
 
 def _dump_subagent_timeout_diagnostic(
     *,
@@ -2499,8 +2281,9 @@ def _run_single_child_attempt(
             from agent.delegation_context import delegated_child_context
 
             with delegated_child_context():
-                return child.run_conversation(
-                    user_message=goal,
+                return child_execution.run_child(
+                    child,
+                    goal,
                     task_id=child_task_id,
                     stream_callback=_relay_child_text,
                 )
@@ -3090,14 +2873,14 @@ def delegate_task(
     )
 
     # Save parent tool names BEFORE any child construction mutates the global.
-    # _build_child_agent() calls AIAgent() which calls get_tool_definitions(),
+    # Child construction calls AIAgent() which calls get_tool_definitions(),
     # which overwrites model_tools._last_resolved_tool_names with child's toolset.
     import model_tools as _model_tools
 
     _parent_tool_names = list(_model_tools._last_resolved_tool_names)
 
     # Capture the ORIGINATING session's wake target BEFORE any child agent is
-    # constructed: _build_child_agent() -> AIAgent() -> agent_init calls
+    # constructed: child construction -> AIAgent() -> agent_init calls
     # set_current_session_id(child.session_id), which clobbers the
     # HERMES_SESSION_ID ContextVar and os.environ with the subagent's internal
     # id before the background-dispatch code below would read it. The
@@ -3108,9 +2891,7 @@ def delegate_task(
 
     _origin_wake_sid = _current_origin_session_id()
 
-    # Build all child agents on the main thread (thread-safe construction)
-    # Wrapped in try/finally so the global is always restored even if a
-    # child build raises (otherwise _last_resolved_tool_names stays corrupted).
+    # Build all child agents on the main thread (thread-safe construction).
     children = []
     try:
         for i, t in enumerate(task_list):
@@ -3120,54 +2901,52 @@ def delegate_task(
                 task_index=i,
                 goal=t["goal"],
                 context=t.get("context"),
-                # Toolsets remain operator-controlled through the profile.
                 toolsets=spec["toolsets"],
-                model=creds["model"],
+                model=creds.get("model"),
                 max_iterations=spec["max_iterations"],
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
+                override_provider=creds.get("provider"),
+                override_base_url=creds.get("base_url"),
+                override_api_key=creds.get("api_key"),
+                override_api_mode=creds.get("api_mode"),
                 override_request_overrides=creds.get("request_overrides"),
                 override_max_tokens=creds.get("max_output_tokens"),
                 override_acp_command=creds.get("command"),
                 override_acp_args=creds.get("args"),
                 role=spec["role"],
-                delegation_cfg=spec["cfg"],
+                delegation_cfg={**spec["cfg"], "_resolved_credentials": creds},
+                saved_tool_names=_parent_tool_names,
             )
+
             def _timeout_builder(route, *, _i=i, _t=t, _spec=spec):
                 fallback_cfg = _delegation_cfg_for_timeout_fallback(_spec["cfg"], route)
-                fallback_creds = _resolve_delegation_credentials(fallback_cfg, parent_agent)
+                fallback_creds = _resolve_delegation_credentials(
+                    fallback_cfg, parent_agent
+                )
                 return _build_child_agent(
                     task_index=_i,
                     goal=_t["goal"],
                     context=_t.get("context"),
                     toolsets=_spec["toolsets"],
-                    model=fallback_creds["model"],
+                    model=fallback_creds.get("model"),
                     max_iterations=_spec["max_iterations"],
                     task_count=n_tasks,
                     parent_agent=parent_agent,
-                    override_provider=fallback_creds["provider"],
-                    override_base_url=fallback_creds["base_url"],
-                    override_api_key=fallback_creds["api_key"],
-                    override_api_mode=fallback_creds["api_mode"],
+                    override_provider=fallback_creds.get("provider"),
+                    override_base_url=fallback_creds.get("base_url"),
+                    override_api_key=fallback_creds.get("api_key"),
+                    override_api_mode=fallback_creds.get("api_mode"),
                     override_request_overrides=fallback_creds.get("request_overrides"),
                     override_max_tokens=fallback_creds.get("max_output_tokens"),
                     override_acp_command=fallback_creds.get("command"),
                     override_acp_args=fallback_creds.get("args"),
                     role=_spec["role"],
-                    delegation_cfg=fallback_cfg,
+                    delegation_cfg={**fallback_cfg, "_resolved_credentials": fallback_creds},
+                    saved_tool_names=_parent_tool_names,
                 )
+
             child._delegate_timeout_builder = _timeout_builder
-            # Override with correct parent tool names (before child construction mutated global)
-            child._delegate_saved_tool_names = _parent_tool_names
-            # Tee the child's progress events into its live transcript log.
-            # wrap_progress_callback preserves the inner callback contract
-            # (including the _flush attribute) and never lets writer failures
-            # reach the agent loop. When no parent display exists the inner
-            # callback is None and the wrapper still records events.
             _writer = live_writers[i] if i < len(live_writers) else None
             if _writer is not None:
                 child.tool_progress_callback = wrap_progress_callback(
@@ -3176,7 +2955,6 @@ def delegate_task(
                 child._live_transcript_path = str(_writer.path)
             children.append((i, t, child))
     finally:
-        # Authoritative restore: reset global to parent's tool names after all children built
         _model_tools._last_resolved_tool_names = _parent_tool_names
 
     child_descriptors: List[Dict[str, Any]] = []
@@ -3804,131 +3582,8 @@ def _resolve_child_credential_pool(
 
 
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
-    """Resolve credentials for subagent delegation.
-
-    If ``delegation.base_url`` is configured, subagents use that direct
-    OpenAI-compatible endpoint. ``delegation.api_key`` overrides the key; when
-    omitted, ``api_key`` is returned as ``None`` so ``_build_child_agent``
-    inherits the parent agent's key (``effective_api_key = override_api_key or
-    parent_api_key``). This lets providers that store their key outside
-    ``OPENAI_API_KEY`` (e.g. ``MINIMAX_API_KEY``, ``DASHSCOPE_API_KEY``) work
-    without a duplicate config entry.
-
-    Otherwise, if ``delegation.provider`` is configured, the full credential
-    bundle (base_url, api_key, api_mode, provider) is resolved via the runtime
-    provider system — the same path used by CLI/gateway startup. This lets
-    subagents run on a completely different provider:model pair.
-
-    If neither base_url nor provider is configured, returns None values so the
-    child inherits everything from the parent agent.
-
-    Raises ValueError with a user-friendly message on credential failure.
-    """
-    configured_model = str(cfg.get("model") or "").strip() or None
-    configured_provider = str(cfg.get("provider") or "").strip() or None
-    configured_base_url = str(cfg.get("base_url") or "").strip() or None
-    configured_api_key = str(cfg.get("api_key") or "").strip() or None
-    configured_api_mode = str(cfg.get("api_mode") or "").strip().lower() or None
-
-    # Native-SDK providers (Bedrock, Vertex, Google GenAI) speak their own
-    # wire protocol — they cannot be reached via OpenAI chat_completions against
-    # a base_url. For these, always fall through to resolve_runtime_provider()
-    # so the proper SDK path is taken. The configured base_url is still
-    # forwarded through runtime-provider resolution when applicable (e.g. a
-    # custom Bedrock regional endpoint).
-    _NATIVE_SDK_PROVIDERS = {"bedrock", "vertex", "google", "google-genai"}
-    _provider_lower = (configured_provider or "").strip().lower()
-    _is_native_sdk_provider = _provider_lower in _NATIVE_SDK_PROVIDERS
-
-    if configured_base_url and not _is_native_sdk_provider:
-        # When delegation.api_key is not set, return None so _build_child_agent
-        # falls back to the parent agent's API key via the credential inheritance
-        # path (effective_api_key = override_api_key or parent_api_key). This
-        # lets providers that store their key in a non-OPENAI_API_KEY env var
-        # (e.g. MINIMAX_API_KEY, DASHSCOPE_API_KEY) work without requiring
-        # callers to duplicate the key under delegation.api_key.
-        api_key = configured_api_key  # None → inherited from parent in _build_child_agent
-
-        # Use the shared URL-based api_mode detector (same path the main agent's
-        # runtime resolver uses) so Anthropic-compatible direct endpoints with a
-        # /anthropic suffix — Azure AI Foundry, MiniMax, Zhipu GLM, LiteLLM
-        # proxies — pick the right transport automatically. Without this,
-        # subagents would default to chat_completions and hit 404s on endpoints
-        # that only speak the Anthropic Messages protocol. Fixes #10213.
-        from hermes_cli.runtime_provider import _detect_api_mode_for_url
-
-        base_lower = configured_base_url.lower()
-        provider = "custom"
-        api_mode = _detect_api_mode_for_url(configured_base_url) or "chat_completions"
-        if (
-            base_url_hostname(configured_base_url) == "chatgpt.com"
-            and "/backend-api/codex" in base_lower
-        ):
-            provider = "openai-codex"
-            api_mode = "codex_responses"
-        elif base_url_hostname(configured_base_url) == "api.anthropic.com":
-            provider = "anthropic"
-            api_mode = "anthropic_messages"
-        elif "api.kimi.com/coding" in base_lower:
-            provider = "custom"
-            api_mode = "anthropic_messages"
-
-        # Explicit delegation.api_mode in config always wins. Lets users force
-        # a transport for non-standard endpoints the URL heuristic can't detect.
-        if configured_api_mode in {"chat_completions", "codex_responses", "anthropic_messages"}:
-            api_mode = configured_api_mode
-
-        return {
-            "model": configured_model,
-            "provider": provider,
-            "base_url": configured_base_url,
-            "api_key": api_key,
-            "api_mode": api_mode,
-        }
-
-    if not configured_provider:
-        # No provider override — child inherits everything from parent
-        return {
-            "model": configured_model,
-            "provider": None,
-            "base_url": None,
-            "api_key": None,
-            "api_mode": None,
-            "request_overrides": None,
-            "max_output_tokens": None,
-        }
-
-    # Provider is configured — resolve full credentials
-    try:
-        from hermes_cli.runtime_provider import resolve_runtime_provider
-
-        runtime = resolve_runtime_provider(requested=configured_provider, target_model=configured_model)
-    except Exception as exc:
-        raise ValueError(
-            f"Cannot resolve delegation provider '{configured_provider}': {exc}. "
-            f"Check that the provider is configured (API key set, valid provider name), "
-            f"or set delegation.base_url/delegation.api_key for a direct endpoint. "
-            f"Available providers: openrouter, nous, zai, kimi-coding, minimax."
-        ) from exc
-
-    api_key = runtime.get("api_key", "")
-    if not api_key:
-        raise ValueError(
-            f"Delegation provider '{configured_provider}' resolved but has no API key. "
-            f"Set the appropriate environment variable or run 'hermes auth'."
-        )
-
-    return {
-        "model": configured_model or runtime.get("model") or None,
-        "provider": configured_provider if runtime.get("provider") == _RUNTIME_PROVIDER_CUSTOM else runtime.get("provider"),
-        "base_url": runtime.get("base_url"),
-        "api_key": api_key,
-        "api_mode": runtime.get("api_mode"),
-        "request_overrides": dict(runtime.get("request_overrides") or {}),
-        "max_output_tokens": runtime.get("max_output_tokens"),
-        "command": runtime.get("command"),
-        "args": list(runtime.get("args") or []),
-    }
+    """Compatibility wrapper for generic credential resolution."""
+    return child_execution.resolve_child_credentials(cfg or {}, parent_agent)
 
 
 def _load_config() -> dict:
