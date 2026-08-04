@@ -9,11 +9,13 @@ import threading
 from pathlib import Path
 from types import SimpleNamespace
 
+from agent import child_execution
 from agent.child_execution import (
     _request_overrides_for_child,
     create_child,
     inherit_parent_base_url,
     resolve_child_credentials,
+    resolve_child_route,
     run_child,
 )
 
@@ -132,6 +134,63 @@ def test_create_child_resolves_native_profile_and_preserves_generic_overrides(
     assert child.cwd == str(cwd)
 
 
+def test_resolve_child_route_prefers_explicit_context_config(monkeypatch):
+    parent = _parent()
+    explicit_cfg = {
+        "profiles": {
+            "reviewer": {
+                "provider": "context-provider",
+                "model": "context-model",
+            }
+        }
+    }
+    monkeypatch.setattr(
+        child_execution,
+        "load_child_config",
+        lambda: {"profiles": {"reviewer": {"model": "loader-model"}}},
+    )
+
+    route, _credentials = resolve_child_route(
+        parent,
+        {
+            "profile": "reviewer",
+            "resolved_credentials": {"model": "resolved-model"},
+        },
+        {"delegation_cfg": explicit_cfg},
+    )
+
+    assert route["provider"] == "context-provider"
+    assert route["model"] == "context-model"
+
+
+def test_resolve_child_route_loads_profile_config_when_context_omits_it(monkeypatch):
+    parent = _parent()
+    monkeypatch.setattr(
+        child_execution,
+        "load_child_config",
+        lambda: {
+            "profiles": {
+                "reviewer": {
+                    "provider": "loader-provider",
+                    "model": "loader-model",
+                }
+            }
+        },
+    )
+
+    route, _credentials = resolve_child_route(
+        parent,
+        {
+            "profile": "reviewer",
+            "resolved_credentials": {"model": "resolved-model"},
+        },
+        {},
+    )
+
+    assert route["provider"] == "loader-provider"
+    assert route["model"] == "loader-model"
+
+
 def test_create_child_does_not_depend_on_the_delegate_tool_adapter(monkeypatch):
     """The reusable core seam must work without importing native delegation."""
     parent = _parent()
@@ -186,6 +245,21 @@ def test_run_child_preserves_raw_result_fields_and_adds_terminal_metadata():
     assert child.calls == [
         ((), {"user_message": "run the child once", "task_id": "child-task"})
     ]
+
+
+def test_run_child_passes_exact_conversation_history_object():
+    history = [{"role": "user", "content": "prior context"}]
+    child = _RecordingChild({"final_response": "finished"})
+
+    run_child(
+        child,
+        "continue the child",
+        task_id="child-task",
+        conversation_history=history,
+    )
+
+    passed_history = child.calls[0][1]["conversation_history"]
+    assert passed_history is history
 
 
 def test_run_child_timeout_interrupts_the_child():

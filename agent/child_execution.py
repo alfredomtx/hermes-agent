@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import logging
+import os
 import shutil
 import time
-import logging
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import Any, Mapping, Optional
 
@@ -174,11 +175,47 @@ def resolve_child_credentials(cfg: Mapping[str, Any], parent_agent: Any) -> dict
     }
 
 
+def load_child_config() -> dict:
+    """Load delegation config from the active Hermes config.
+
+    The persistent loader follows the active HERMES_HOME/profile and returns a
+    shared mapping that consumers treat as read-only. ``cli.CLI_CONFIG`` keeps
+    entry points without the persistent loader functional.
+
+    ``HERMES_IGNORE_USER_CONFIG=1`` (``hermes chat --ignore-user-config``) is
+    honored through ``cli.CLI_CONFIG`` so the flag suppresses user config.yaml
+    settings.
+    """
+    use_cli_config = os.environ.get("HERMES_IGNORE_USER_CONFIG") == "1"
+    if not use_cli_config:
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            full = load_config_readonly()
+            cfg = full.get("delegation") or {}
+            if isinstance(cfg, dict):
+                return cfg
+        except Exception:
+            pass
+    try:
+        from cli import CLI_CONFIG
+
+        cfg = CLI_CONFIG.get("delegation") or {}
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
+
+
 def resolve_child_route(
     parent_agent: Any, spec: Mapping[str, Any], context: Mapping[str, Any]
 ) -> tuple[dict, dict]:
+    delegation_cfg = (
+        context["delegation_cfg"]
+        if "delegation_cfg" in context
+        else load_child_config()
+    )
     route = merge_child_route(
-        context.get("delegation_cfg"),
+        delegation_cfg,
         spec.get("profile"),
         spec,
     )
@@ -367,6 +404,7 @@ def run_child(
     task_id: str,
     timeout: Optional[float] = None,
     stream_callback: Any = None,
+    conversation_history: Any = None,
     initializer: Any = None,
     initargs: tuple = (),
 ):
@@ -381,6 +419,8 @@ def run_child(
         kwargs = {"user_message": prompt, "task_id": task_id}
         if stream_callback is not None:
             kwargs["stream_callback"] = stream_callback
+        if conversation_history is not None:
+            kwargs["conversation_history"] = conversation_history
         return child.run_conversation(**kwargs)
 
     executor = None
