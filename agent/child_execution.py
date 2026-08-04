@@ -134,6 +134,7 @@ def resolve_child_credentials(cfg: Mapping[str, Any], parent_agent: Any) -> dict
             "base_url": None,
             "api_key": None,
             "api_mode": None,
+            "credential_pool": None,
             "request_overrides": None,
             "max_output_tokens": None,
         }
@@ -168,6 +169,7 @@ def resolve_child_credentials(cfg: Mapping[str, Any], parent_agent: Any) -> dict
         "base_url": runtime.get("base_url"),
         "api_key": api_key,
         "api_mode": runtime.get("api_mode"),
+        "credential_pool": runtime.get("credential_pool"),
         "request_overrides": dict(runtime.get("request_overrides") or {}),
         "max_output_tokens": runtime.get("max_output_tokens"),
         "command": runtime.get("command"),
@@ -258,6 +260,21 @@ def create_child(
     if api_mode is None and provider == parent_provider:
         api_mode = getattr(parent_agent, "api_mode", None)
 
+    credential_pool = credentials.get("credential_pool")
+    parent_pool = getattr(parent_agent, "_credential_pool", None)
+    if parent_pool is None:
+        parent_pool = getattr(parent_agent, "credential_pool", None)
+    same_parent_route = not provider or provider == parent_provider
+    same_custom_endpoint = (
+        provider != "custom"
+        or _normalized_runtime_url(base_url)
+        == _normalized_runtime_url(
+            inherit_parent_base_url(parent_agent, getattr(parent_agent, "base_url", None))
+        )
+    )
+    if same_parent_route and same_custom_endpoint and parent_pool is not None:
+        credential_pool = parent_pool
+
     route_overridden = bool(
         spec.get("provider")
         or spec.get("base_url")
@@ -322,6 +339,7 @@ def create_child(
         "prefill_messages": context.get(
             "prefill_messages", getattr(parent_agent, "prefill_messages", None)
         ),
+        "credential_pool": credential_pool,
         "fallback_model": getattr(parent_agent, "_fallback_chain", None) or None,
         "enabled_toolsets": spec.get("enabled_toolsets", spec.get("toolsets")),
         "disabled_toolsets": list(spec.get("disabled_toolsets") or []),

@@ -366,6 +366,7 @@ def test_create_child_profile_only_reasoning_preserves_parent_route_and_filters(
     parent.provider_sort = "throughput"
     parent.provider_require_parameters = True
     parent.provider_data_collection = "deny"
+    parent.openrouter_min_coding_score = 0.8
     parent.request_overrides = {"temperature": 0.2}
     parent.acp_command = "copilot"
     parent.acp_args = ["--stdio"]
@@ -395,6 +396,7 @@ def test_create_child_profile_only_reasoning_preserves_parent_route_and_filters(
     assert child.kwargs["provider_sort"] == parent.provider_sort
     assert child.kwargs["provider_require_parameters"] is True
     assert child.kwargs["provider_data_collection"] == parent.provider_data_collection
+    assert child.kwargs["openrouter_min_coding_score"] == parent.openrouter_min_coding_score
     assert child.kwargs["request_overrides"] == parent.request_overrides
     assert child.kwargs["acp_command"] == parent.acp_command
     assert child.kwargs["acp_args"] == parent.acp_args
@@ -402,6 +404,40 @@ def test_create_child_profile_only_reasoning_preserves_parent_route_and_filters(
     assert child.kwargs["ephemeral_system_prompt"] == (
         "Inspect only the requested repository."
     )
+
+
+def test_create_child_inherits_parent_credential_pool_for_inherited_route(monkeypatch):
+    parent = _parent()
+    pool = object()
+    parent._credential_pool = pool
+    monkeypatch.setattr("run_agent.AIAgent", _FakeAgent)
+
+    child = create_child(parent, {"instructions": "Use the inherited route."})
+
+    assert child.kwargs["credential_pool"] is pool
+
+
+def test_create_child_does_not_reuse_parent_pool_for_overridden_route(monkeypatch):
+    parent = _parent()
+    parent._credential_pool = object()
+    monkeypatch.setattr("run_agent.AIAgent", _FakeAgent)
+
+    child = create_child(
+        parent,
+        {
+            "provider": "other-provider",
+            "model": "other-model",
+            "resolved_credentials": {
+                "provider": "other-provider",
+                "model": "other-model",
+                "base_url": "https://other.example.test/v1",
+                "api_key": "child-key",
+                "api_mode": "chat_completions",
+            },
+        },
+    )
+
+    assert child.kwargs["credential_pool"] is None
 
 
 def test_native_delegate_task_uses_shared_child_seam(monkeypatch):
