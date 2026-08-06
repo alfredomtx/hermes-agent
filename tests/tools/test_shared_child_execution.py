@@ -134,6 +134,15 @@ def test_create_child_resolves_native_profile_and_preserves_generic_overrides(
     assert child.cwd == str(cwd)
 
 
+def test_create_child_omits_max_iterations_without_explicit_cap(monkeypatch):
+    parent = _parent()
+    monkeypatch.setattr("run_agent.AIAgent", _FakeAgent)
+
+    child = create_child(parent, {"instructions": "Work."})
+
+    assert "max_iterations" not in getattr(child, "kwargs")
+
+
 def test_resolve_child_route_prefers_explicit_context_config(monkeypatch):
     parent = _parent()
     explicit_cfg = {

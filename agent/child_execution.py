@@ -325,15 +325,15 @@ def create_child(
         if parsed is not None:
             reasoning = parsed
 
+    max_iterations = context.get(
+        "max_iterations", getattr(parent_agent, "max_iterations", None)
+    )
     child_kwargs = {
         "base_url": base_url,
         "api_key": api_key,
         "model": model,
         "provider": provider,
         "api_mode": api_mode,
-        "max_iterations": context.get(
-            "max_iterations", getattr(parent_agent, "max_iterations", 90)
-        ),
         "reasoning_config": reasoning,
         "service_tier": service_tier,
         "prefill_messages": context.get(
@@ -364,6 +364,8 @@ def create_child(
         "iteration_budget": None,
         **provider_filters,
     }
+    if max_iterations is not None:
+        child_kwargs["max_iterations"] = max_iterations
     max_tokens = spec.get("max_tokens")
     if not isinstance(max_tokens, int):
         max_tokens = credentials.get("max_output_tokens")
