@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import sys
+import threading
 from typing import Any, Dict, List, cast
 from unittest.mock import MagicMock, patch
 
@@ -1608,6 +1609,45 @@ class TestCuaDriverSessionReconnect:
             session.call_tool("list_apps", {})
         # Exactly one attempt, no reconnect.
         assert len(bridge.calls) == 1
+
+    def test_call_tool_revives_ended_session_and_retries_once(self):
+        """An ended cua-driver session must be revived before one retry."""
+        from typing import Any, cast
+        from tools.computer_use.cua_backend import _CuaDriverSession
+
+        ended = {
+            "data": "The session has ended; call start_session to revive it",
+            "structuredContent": None,
+            "isError": True,
+        }
+        revived = {"data": "", "structuredContent": None, "isError": False}
+
+        class FakeBridge:
+            def __init__(self):
+                self.calls = []
+                self.effects = [ended, revived, revived]
+
+            def run(self, value, timeout=None):
+                self.calls.append((value, timeout))
+                return self.effects.pop(0)
+
+        bridge = FakeBridge()
+        session = cast(Any, _CuaDriverSession.__new__(_CuaDriverSession))
+        session._bridge = bridge
+        session._session = object()
+        session._lock = threading.Lock()
+        session._started = True
+        session._declared_session_id = "hermes-test"
+        session._call_tool_async = lambda name, args: ("call", name, args)
+
+        result = session.call_tool("click", {"session": "hermes-test"})
+
+        assert result == revived
+        assert [call[0] for call in bridge.calls] == [
+            ("call", "click", {"session": "hermes-test"}),
+            ("call", "start_session", {"session": "hermes-test"}),
+            ("call", "click", {"session": "hermes-test"}),
+        ]
 
     def test_is_transient_daemon_error_matches_eagain(self):
         """The EAGAIN daemon-proxy error must be classified as transient."""

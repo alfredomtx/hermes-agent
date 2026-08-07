@@ -2971,6 +2971,40 @@ class TestBuildChildAgent(unittest.TestCase):
             ["file", "mcp-activix_lsp"],
         )
 
+    def test_build_child_agent_inherits_mcp_from_valid_parent_tools_when_enabled_omits_it(self):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["file"]
+        parent.valid_tool_names = {"read_file", "mcp__activix_lsp__get_definition"}
+        cfg = {
+            "inherit_mcp_toolsets": True,
+            "toolsets": ["file"],
+        }
+
+        with patch(
+            "model_tools.get_toolset_for_tool",
+            side_effect={
+                "read_file": "file",
+                "mcp__activix_lsp__get_definition": "mcp-activix_lsp",
+            }.get,
+        ):
+            self.assertEqual(
+                self._build_enabled_toolsets(parent, cfg, cfg["toolsets"]),
+                ["file", "mcp-activix_lsp"],
+            )
+
+        strict_cfg = {
+            "inherit_mcp_toolsets": False,
+            "toolsets": ["file", "mcp-activix_lsp"],
+        }
+        with patch(
+            "model_tools.get_toolset_for_tool",
+            return_value="mcp-activix_lsp",
+        ):
+            self.assertEqual(
+                self._build_enabled_toolsets(parent, strict_cfg, strict_cfg["toolsets"]),
+                ["file"],
+            )
+
     def test_build_child_agent_explicit_mcp_toolset_survives_strict_intersection(self):
         parent = _make_mock_parent()
         parent.enabled_toolsets = ["file", "mcp-activix_lsp"]

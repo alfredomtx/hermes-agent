@@ -1366,14 +1366,23 @@ def _prepare_child_inputs(
         if isinstance(parent_enabled_raw, (list, tuple, set, frozenset))
         else None
     )
+    parent_mcp_toolsets = set()
+    parent_valid_names = getattr(parent_agent, "valid_tool_names", None)
     if parent_enabled is not None:
         parent_toolsets = set(parent_enabled)
-    elif isinstance(getattr(parent_agent, "valid_tool_names", None), (list, tuple, set, frozenset)):
+        if isinstance(parent_valid_names, (list, tuple, set, frozenset)):
+            import model_tools
+
+            for name in parent_valid_names:
+                toolset = model_tools.get_toolset_for_tool(name)
+                if toolset and _is_mcp_toolset_name(toolset):
+                    parent_mcp_toolsets.add(toolset)
+    elif isinstance(parent_valid_names, (list, tuple, set, frozenset)):
         import model_tools
 
         parent_toolsets = {
             toolset
-            for name in getattr(parent_agent, "valid_tool_names", [])
+            for name in parent_valid_names
             if (toolset := model_tools.get_toolset_for_tool(name)) is not None
         }
     else:
@@ -1394,7 +1403,7 @@ def _prepare_child_inputs(
                 child_toolsets.append(resolved)
         if _get_inherit_mcp_toolsets(cfg):
             child_toolsets = _preserve_parent_mcp_toolsets(
-                child_toolsets, parent_toolsets
+                child_toolsets, parent_toolsets | parent_mcp_toolsets
             )
     child_toolsets = _strip_blocked_tools(child_toolsets)
     if effective_role == "orchestrator" and "delegation" not in child_toolsets:
