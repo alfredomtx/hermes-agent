@@ -3448,6 +3448,19 @@ def run_conversation(
                     reason=classified.reason.value,
                 )
 
+                # Bedrock's expired AWS SSO token is repairable before any
+                # provider fallback or generic credential-pool recovery.
+                if (
+                    classified.is_auth
+                    and agent.provider == "bedrock"
+                    and not _retry.bedrock_sso_retry_attempted
+                ):
+                    _retry.bedrock_sso_retry_attempted = True
+                    from agent.agent_runtime_helpers import try_repair_bedrock_sso
+
+                    if try_repair_bedrock_sso(agent, api_error):
+                        continue
+
                 if (
                     classified.reason == FailoverReason.billing
                     and _is_nous_inference_route(

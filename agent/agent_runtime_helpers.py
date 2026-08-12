@@ -25,7 +25,9 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 import re
+import subprocess
 import threading
 import time
 from datetime import datetime
@@ -51,6 +53,14 @@ logger = logging.getLogger(__name__)
 # spins forever and never reaches ``_try_activate_fallback``. See #26080.
 _MAX_AUTH_REFRESH_ATTEMPTS = 2
 
+# AWS SSO repair is process-local because concurrent turns can hit one expired
+# profile at once.  The lock serializes the CLI call and the cooldown bounds
+# repeated repair attempts for the same profile.
+_AWS_SSO_LOGIN_LOCK = threading.Lock()
+_AWS_SSO_LOGIN_COOLDOWNS: Dict[str, Tuple[float, bool]] = {}
+_AWS_SSO_LOGIN_TIMEOUT_SECONDS = 120
+_AWS_SSO_LOGIN_COOLDOWN_SECONDS = 60
+
 
 def _ra():
     """Lazy ``run_agent`` reference for test-patch routing."""
@@ -71,6 +81,101 @@ def agent_runtime_owns_post_tool_hook(agent: Any, function_name: str) -> bool:
         return True
     memory_manager = getattr(agent, "_memory_manager", None)
     return bool(memory_manager and memory_manager.has_tool(function_name))
+
+
+def _is_bedrock_sso_token_error(error: BaseException) -> bool:
+    """Return True only for botocore's expired AWS SSO token failure."""
+    current = error
+    for _ in range(5):
+        if type(current).__name__ == "TokenRetrievalError":
+            message = str(current).lower()
+            return "sso" in message and (
+                "expired" in message or "refresh failed" in message
+            )
+        cause = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+        if cause is None or cause is current:
+            break
+        current = cause
+    return False
+
+
+def try_repair_bedrock_sso(agent: Any, api_error: BaseException) -> bool:
+    """Attempt one bounded AWS SSO login for an expired Bedrock profile."""
+    if (
+        getattr(agent, "provider", "") != "bedrock"
+        or getattr(agent, "api_mode", "") not in {
+            "anthropic_messages",
+            "bedrock_converse",
+        }
+        or not _is_bedrock_sso_token_error(api_error)
+    ):
+        return False
+
+    emit_status = getattr(agent, "_emit_status", agent._buffer_status)
+    profile = os.environ.get("AWS_PROFILE", "").strip()
+    if not profile:
+        emit_status(
+            "🔐 Bedrock AWS SSO token expired, but AWS_PROFILE is not set; using fallback."
+        )
+        return False
+
+    with _AWS_SSO_LOGIN_LOCK:
+        now = time.monotonic()
+        cached = _AWS_SSO_LOGIN_COOLDOWNS.get(profile)
+        if cached and cached[0] > now:
+            if cached[1]:
+                emit_status(
+                    "✅ A recent AWS SSO login completed — retrying Bedrock primary request once..."
+                )
+            else:
+                emit_status(
+                    "⚠️ A recent AWS SSO login failed; switching to fallback provider."
+                )
+            return cached[1]
+        emit_status(
+            f"🔐 Bedrock AWS SSO token expired — running aws sso login for profile {profile}..."
+        )
+        failure_status = None
+        try:
+            result = subprocess.run(
+                ["aws", "sso", "login", "--profile", profile],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=_AWS_SSO_LOGIN_TIMEOUT_SECONDS,
+            )
+            success = result.returncode == 0
+            if not success:
+                failure_status = "⚠️ AWS SSO login failed; switching to fallback provider."
+        except subprocess.TimeoutExpired:
+            success = False
+            failure_status = "⚠️ AWS SSO login timed out; switching to fallback provider."
+        except OSError:
+            success = False
+            failure_status = "⚠️ AWS SSO login failed; switching to fallback provider."
+        _AWS_SSO_LOGIN_COOLDOWNS[profile] = (
+            time.monotonic() + _AWS_SSO_LOGIN_COOLDOWN_SECONDS,
+            success,
+        )
+
+    if not success:
+        emit_status(failure_status or "⚠️ AWS SSO login failed; switching to fallback provider.")
+        return False
+
+    if getattr(agent, "api_mode", "") == "bedrock_converse":
+        try:
+            from agent.bedrock_adapter import invalidate_runtime_client
+
+            invalidate_runtime_client(
+                getattr(agent, "_bedrock_region", None) or "us-east-1"
+            )
+        except Exception:
+            logger.debug(
+                "Bedrock client invalidation after AWS SSO login failed",
+                exc_info=True,
+            )
+    emit_status("✅ AWS SSO login completed — retrying Bedrock primary request once...")
+    return True
 
 
 def convert_to_trajectory_format(agent, messages: List[Dict[str, Any]], user_query: str, completed: bool) -> List[Dict[str, Any]]:
