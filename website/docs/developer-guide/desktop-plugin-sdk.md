@@ -1,14 +1,15 @@
 ---
 sidebar_label: "Desktop Plugin SDK"
 title: "Desktop Plugin SDK (@hermes/plugin-sdk)"
-description: "Extend the native Hermes Desktop app — panes, pages, sidebar nav, status bar, palette commands, keybinds, themes, and a scoped backend namespace, with one import and no build step."
+description: "Extend the native Hermes Desktop app — panes, pages, sidebar nav, session-row controls, status bar, palette commands, keybinds, themes, and a scoped backend namespace, with one import and no build step."
 ---
 
 # Desktop Plugin SDK
 
 The native [Hermes Desktop](/user-guide/desktop) app is contribution-driven: every
-surface in the window — panes, routes, sidebar nav, status-bar items, palette
-entries, keybinds, themes — registers into one central registry. Core registers
+surface in the window — panes, routes, sidebar nav, session-row controls,
+status-bar items, palette entries, keybinds, themes — registers into one central
+registry. Core registers
 its surfaces exactly the way a plugin does, so the plugin story is the real one,
 not a bolted-on afterthought.
 
@@ -205,6 +206,7 @@ Import the area constants from the SDK; each area has its own `data` payload.
 | Keybind | `KEYBINDS_AREA` | `data: KeybindContribution` |
 | Theme | `THEMES_AREA` | `data` as a `DesktopTheme` |
 | Composer | `COMPOSER_AREAS.*` | render slots, or middleware / attachment providers |
+| Session row trailing | `SESSION_ROW_AREAS.trailing` | `render(context: SessionRowContext)` |
 
 ### Panes
 
@@ -336,6 +338,46 @@ ctx.register({ id: 'noir', area: THEMES_AREA, data: myDesktopTheme })
 attachment source, or transform a draft before it is sent (`ComposerMiddleware`
 with a `handler(draft) => draft | null`).
 
+### Session-row trailing controls
+
+Use `SESSION_ROW_AREAS.trailing` for a small control rendered at the trailing edge
+of every native sidebar session row. The host calls the contribution with the
+session's identities and owning profile:
+
+```ts
+interface SessionRowContext {
+  storedSessionId: string       // durable id for selection/resume
+  profile: string               // owning Hermes profile
+}
+```
+
+The durable id is the one to use for persisted-session actions. To select that
+session and open the built-in Agents overlay without racing navigation, pass the
+same context to `host.selectSessionAndOpenAgents` and await it:
+
+```javascript
+import { host, SESSION_ROW_AREAS } from '@hermes/plugin-sdk'
+import { jsx } from 'react/jsx-runtime'
+
+ctx.register({
+  id: 'agents',
+  area: SESSION_ROW_AREAS.trailing,
+  render: context =>
+    jsx('button', {
+      type: 'button',
+      'aria-label': 'Open agents',
+      onClick: () => void host.selectSessionAndOpenAgents(context),
+      children: 'Agents'
+    })
+})
+```
+
+Selection is synchronous and completes before the overlay opens; the overlay's
+close action returns to the exact durable session route. Trailing controls are
+wrapped in the SDK contribution error boundary, so one broken contribution
+degrades to its own inline error without removing the native row actions or
+other contributions.
+
 ### Mount-scoped chrome (`Contribute`)
 
 `ctx.register` is for **permanent** contributions. When chrome should live and
@@ -375,6 +417,7 @@ host.onEvent(type, fn)                     // gateway event stream ('*' = all); 
 host.logs(...)                             // tail an app log file
 host.status()                              // one-shot system status snapshot
 host.restartGateway()                      // restart the backend gateway
+host.selectSessionAndOpenAgents(context)    // select a stored row, then open Agents
 host.request<T>(method, params?)           // gateway JSON-RPC — the real power
 ```
 
@@ -596,10 +639,10 @@ not treat this pipeline as a trust boundary.
 
 | Category | Exports |
 |----------|---------|
-| Host | `host` (`.state.*`, `.notify`, `.notifyError`, `.navigate`, `.onEvent`, `.logs`, `.status`, `.restartGateway`, `.request`) |
+| Host | `host` (`.state.*`, `.notify`, `.notifyError`, `.navigate`, `.onEvent`, `.logs`, `.status`, `.restartGateway`, `.selectSessionAndOpenAgents`, `.request`) |
 | Plugin contract | `HermesPlugin`, `PluginContext`, `PluginContribution`, `PluginStorage`, `PluginRestOptions`, `Contribution` |
-| Area constants | `PANES_AREA`, `ROUTES_AREA`, `SIDEBAR_NAV_AREA`, `STATUSBAR_AREAS`, `TITLEBAR_AREAS`, `PALETTE_AREA`, `KEYBINDS_AREA`, `THEMES_AREA`, `COMPOSER_AREAS` |
-| Area payloads | `RouteContribution`, `SidebarNavContribution`, `StatusbarItem`, `TitlebarTool`, `PaletteContribution`, `KeybindContribution`, `ComposerMiddleware`, `ComposerAttachmentProvider` |
+| Area constants | `PANES_AREA`, `ROUTES_AREA`, `SIDEBAR_NAV_AREA`, `STATUSBAR_AREAS`, `TITLEBAR_AREAS`, `PALETTE_AREA`, `KEYBINDS_AREA`, `THEMES_AREA`, `COMPOSER_AREAS`, `SESSION_ROW_AREAS` |
+| Area payloads | `RouteContribution`, `SidebarNavContribution`, `StatusbarItem`, `TitlebarTool`, `PaletteContribution`, `KeybindContribution`, `ComposerMiddleware`, `ComposerAttachmentProvider`, `SessionRowContext`, `SessionRowContribution` |
 | React / state | `useValue`, `atom`, `computed`, `useQuery`, `useMutation`, `useQueryClient`, `queryClient`, `Contribute` |
 | UI kit | `Button`, `Input`, `Textarea`, `Select*`, `Switch`, `Checkbox`, `SegmentedControl`, `Tabs*`, `Dialog*`, `ConfirmDialog`, `DropdownMenu*`, `ContextMenu*`, `Popover*`, `Tip`/`Tooltip*`, `Badge`, `Kbd`/`KbdGroup`, `SearchField`, `ScrollArea`, `Separator`, `Skeleton`, `GlyphSpinner`, `Loader`, `EmptyState`, `ErrorState`, `CopyButton`, `StatusDot`, `LogView`, `Codicon`, `DecodeText` |
 | Helpers | `cn`, `icons`, `haptic`, `useI18n`, `profileColor`, `profileColorSoft`, `relativeTime`, `fmtDateTime`, `fmtDayTime`, `coarseElapsed`, `evaluateRuntimeReadiness` |

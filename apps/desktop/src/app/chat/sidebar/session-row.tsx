@@ -7,6 +7,7 @@ import { PlatformAvatar } from '@/app/messaging/platform-icon'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { Tip } from '@/components/ui/tooltip'
+import { SessionRowTrailing } from '@/contrib/session-row'
 import type { SessionInfo } from '@/hermes'
 import { type Translations, useI18n } from '@/i18n'
 import { sessionTitle } from '@/lib/chat-runtime'
@@ -140,6 +141,12 @@ export function SidebarSessionRow({
                 <Codicon name="kebab-vertical" size="0.875rem" />
               </Button>
             </SessionActionsMenu>
+            <SessionRowTrailing
+              context={{
+                profile: session.profile ?? 'default',
+                storedSessionId: session.id
+              }}
+            />
           </div>
         }
         className={cn(

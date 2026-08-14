@@ -17,13 +17,15 @@ import { createPluginI18n, type PluginI18n } from '@/i18n'
 import { readKey, writeKey } from '@/lib/storage'
 
 import { registry } from './registry'
-import type { Contribution } from './types'
+import type { Contribution, SessionRowContribution } from './types'
 
 export type { PluginRestOptions } from '@/hermes'
 
 /** A contribution as a plugin author writes it — provenance + id scoping are
  *  the host's job, so those fields are off-limits here. */
-export type PluginContribution = Omit<Contribution, 'source' | 'id'> & { id: string }
+export type PluginContribution =
+  | (Omit<Contribution, 'source' | 'id'> & { id: string })
+  | (Omit<SessionRowContribution, 'source' | 'id'> & { id: string })
 
 /** Namespaced JSON persistence (the VS Code `globalState` analog). Keys live
  *  under `hermes.plugin.<id>.` — plugins can't read or clobber each other. */
@@ -96,7 +98,9 @@ function createPluginStorage(pluginId: string): PluginStorage {
  *  receives every registration's disposer (the loader's unload/reload hook). */
 export function createPluginContext(pluginId: string, onDispose?: (dispose: () => void) => void): PluginContext {
   const source = `plugin:${pluginId}`
-  const scope = (c: PluginContribution): Contribution => ({ ...c, id: `${pluginId}:${c.id}`, source })
+  // Session-row contributions keep their contextual renderer in the public
+  // plugin contract; the registry stores the shared, context-free shape.
+  const scope = (c: PluginContribution): Contribution => ({ ...c, id: `${pluginId}:${c.id}`, source }) as Contribution
 
   const track = (dispose: () => void) => {
     onDispose?.(dispose)

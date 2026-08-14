@@ -66,7 +66,17 @@ export function useOverlayRouting() {
     }
   }, [closeOverlayToPreviousRoute, commandCenterOpen, navigate])
 
-  const openAgents = useCallback(() => navigate(AGENTS_ROUTE), [navigate])
+  const openAgents = useCallback(
+    (returnPath?: string) => {
+      if (returnPath) {
+        returnPathRef.current = returnPath
+      }
+
+      navigate(AGENTS_ROUTE)
+    },
+    [navigate]
+  )
+
   const openStarmap = useCallback(() => navigate(STARMAP_ROUTE), [navigate])
 
   return {

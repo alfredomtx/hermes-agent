@@ -23,6 +23,7 @@ import { $newSessionTabAction } from '@/components/pane-shell/tree/store'
 import { FloatingPet } from '@/components/pet/floating-pet'
 import { RemoteDisplayBanner } from '@/components/remote-display-banner'
 import { emitGatewayEvent } from '@/contrib/events'
+import { createSelectSessionAndOpenAgentsAction, setSessionRowHostAction } from '@/contrib/session-row'
 import { getSessionMessages, triggerCronJob } from '@/hermes'
 import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
 import { sessionMessagesSignature } from '@/lib/session-signatures'
@@ -445,6 +446,14 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     syncSessionStateToView,
     updateSessionState
   })
+
+  // The SDK action selects the durable row target synchronously before opening
+  // Agents, with an explicit return route for that same stored session.
+  useEffect(() => {
+    setSessionRowHostAction(createSelectSessionAndOpenAgentsAction({ openAgents }))
+
+    return () => setSessionRowHostAction(null)
+  }, [openAgents])
 
   // A profile switch/create drops to a fresh new-session draft so the
   // previously open session doesn't bleed across contexts. Skip initial value.

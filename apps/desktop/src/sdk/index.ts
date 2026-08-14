@@ -22,6 +22,8 @@ import { atom, type ReadableAtom } from 'nanostores'
 
 import { $narrowViewport } from '@/components/pane-shell/tree/store'
 import { onGatewayEvent } from '@/contrib/events'
+import { selectSessionAndOpenAgents } from '@/contrib/session-row'
+import type { SessionRowContext } from '@/contrib/types'
 import { getLogs, getStatus } from '@/hermes'
 import { $gateway } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
@@ -86,6 +88,9 @@ export const host = {
   navigate: (path: string) => {
     window.location.hash = path.startsWith('#') ? path : `#${path}`
   },
+
+  /** Select a stored session, then open Agents for that row. */
+  selectSessionAndOpenAgents: async (context: SessionRowContext) => selectSessionAndOpenAgents(context),
 
   /** HEAR the gateway stream (message deltas, session lifecycle, tool
    *  activity, …) by event type — `'*'` for everything. Returns a disposer.
@@ -193,6 +198,7 @@ export type {
  *  `ctx.register` stays the door for permanent contributions. Namespace the
  *  id with your plugin slug (`kanban:board-switcher`). */
 export { Contribute, type ContributeProps } from '@/contrib/react/contribute'
+export { SESSION_ROW_AREAS, type SessionRowContext, type SessionRowContribution } from '@/contrib/types'
 export type { Contribution } from '@/contrib/types'
 /** Localized copy. `useI18n` reuses the app's strings; `usePluginI18n(id)` +
  *  `ctx.i18n.register` let a plugin ship its OWN locale bundles, scoped like

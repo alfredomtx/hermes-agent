@@ -1,5 +1,31 @@
 import type { ReactNode } from 'react'
 
+/** Context passed to controls contributed to a native session row. */
+export interface SessionRowContext {
+  /** Durable id used to resume/select the stored session. */
+  storedSessionId: string
+  /** Owning Hermes profile; legacy rows use `'default'`. */
+  profile: string
+}
+
+/** The native session-row trailing contribution surface. */
+export const SESSION_ROW_AREAS = {
+  trailing: 'session-row.trailing'
+} as const
+
+/** A typed contribution for `SESSION_ROW_AREAS.trailing`. */
+export interface SessionRowContribution {
+  id: string
+  area: typeof SESSION_ROW_AREAS.trailing
+  source?: ContributionSource
+  title?: string
+  order?: number
+  when?: () => boolean
+  enabled?: boolean
+  render: (context: SessionRowContext) => ReactNode
+  data?: unknown
+}
+
 /**
  * Where a contribution came from. `'core'` is the app's own default UI;
  * anything else is a plugin/extension id (e.g. `'plugin:kanban'`). This is the

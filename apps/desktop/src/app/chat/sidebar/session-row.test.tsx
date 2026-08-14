@@ -1,9 +1,10 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { atom } from 'nanostores'
 import type * as React from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { startSessionDrag } from '@/app/chat/session-drag'
+import { registry } from '@/contrib/registry'
 import type { SessionInfo } from '@/hermes'
 import type * as ComposerStatusStore from '@/store/composer-status'
 import type * as SessionStore from '@/store/session'
@@ -225,5 +226,142 @@ describe('SidebarSessionRow', () => {
     const avatar = container.querySelector('span[aria-hidden="true"]')
     expect(avatar).toBeTruthy()
     expect(tipTrigger(avatar as HTMLElement)).toBeTruthy()
+  })
+
+  it('renders a contextual trailing contribution for the stored session row', () => {
+    const dispose = registry.register({
+      area: 'session-row.trailing',
+      id: 'test-trailing',
+      render: (...args: unknown[]) => {
+        const context = args[0] as { profile: string; storedSessionId: string }
+
+        return (
+          <button
+            aria-label="Open agents"
+            data-profile={context.profile}
+            data-stored-session-id={context.storedSessionId}
+            onClick={() => undefined}
+            type="button"
+          />
+        )
+      }
+    })
+
+    try {
+      render(
+        <SidebarSessionRow
+          isPinned={false}
+          isSelected={false}
+          isWorking={false}
+          onArchive={noop}
+          onDelete={noop}
+          onPin={noop}
+          onResume={noop}
+          session={makeSession({ title: 'Context row' })}
+        />
+      )
+
+      const control = screen.getByRole('button', { name: 'Open agents' })
+
+      expect(control.dataset.storedSessionId).toBe('s1')
+      expect(control.dataset.profile).toBe('default')
+    } finally {
+      act(() => dispose())
+    }
+  })
+
+  it('isolates trailing control clicks from row resume and session dragging', () => {
+    const onResume = vi.fn()
+    const onTrailingClick = vi.fn()
+
+    const dispose = registry.register({
+      area: 'session-row.trailing',
+      id: 'test-click-isolation',
+      render: (...args: unknown[]) => {
+        void args
+
+        return (
+          <button aria-label="Trailing action" onClick={onTrailingClick} type="button">
+            action
+          </button>
+        )
+      }
+    })
+
+    try {
+      render(
+        <SidebarSessionRow
+          isPinned={false}
+          isSelected={false}
+          isWorking={false}
+          onArchive={noop}
+          onDelete={noop}
+          onPin={noop}
+          onResume={onResume}
+          session={makeSession({ title: 'Click isolation' })}
+        />
+      )
+
+      const control = screen.getByRole('button', { name: 'Trailing action' })
+
+      fireEvent.pointerDown(control, { button: 0, pointerType: 'mouse' })
+      fireEvent.click(control)
+
+      expect(onTrailingClick).toHaveBeenCalledTimes(1)
+      expect(onResume).not.toHaveBeenCalled()
+      expect(vi.mocked(startSessionDrag)).not.toHaveBeenCalled()
+    } finally {
+      act(() => dispose())
+    }
+  })
+
+  it('leaves the native row unchanged when no trailing contribution is registered', () => {
+    render(
+      <SidebarSessionRow
+        isPinned={false}
+        isSelected={false}
+        isWorking={false}
+        onArchive={noop}
+        onDelete={noop}
+        onPin={noop}
+        onResume={noop}
+        session={makeSession({ title: 'Idle row' })}
+      />
+    )
+
+    expect(screen.queryByRole('button', { name: 'Trailing action' })).toBeNull()
+  })
+
+  it('keeps other row controls available when a trailing contribution throws', () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+
+    const dispose = registry.register({
+      area: 'session-row.trailing',
+      id: 'test-broken-trailing',
+      render: () => {
+        throw new Error('broken trailing contribution')
+      }
+    })
+
+    try {
+      render(
+        <SidebarSessionRow
+          isPinned={false}
+          isSelected={false}
+          isWorking={false}
+          onArchive={noop}
+          onDelete={noop}
+          onPin={noop}
+          onResume={noop}
+          session={makeSession({ title: 'Broken plugin' })}
+        />
+      )
+
+      expect(screen.getByRole('button', { name: 'Archive' })).toBeTruthy()
+      expect(screen.getByRole('button', { name: 'Actions for Broken plugin' })).toBeTruthy()
+    } finally {
+      act(() => dispose())
+      consoleError.mockRestore()
+    }
   })
 })
