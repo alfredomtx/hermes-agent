@@ -348,6 +348,9 @@ def _reset_cached_sudo_passwords() -> None:
 
 # Dangerous command detection + approval now consolidated in tools/approval.py
 from tools.approval import (
+    _deobfuscate_shell_word_for_detection,
+    _iter_shell_command_word_spans,
+    _read_shell_word,
     check_all_command_guards as _check_all_guards_impl,
 )
 
@@ -781,6 +784,131 @@ def _count_real_sudo_invocations(command: str) -> int:
         i = next_i
 
     return count
+
+
+_POSITIVE_PID_RE = re.compile(r"^[0-9]+$")
+
+
+def _numeric_kill_pids(command: str) -> list[str]:
+    pids: list[str] = []
+    for _start, command_end, raw in _iter_shell_command_word_spans(command):
+        value = _deobfuscate_shell_word_for_detection(raw)
+        if value.rsplit("/", 1)[-1].lower() != "kill":
+            continue
+        options = True
+        query = False
+        pos = command_end
+        while True:
+            start, end, raw = _read_shell_word(command, pos)
+            if start == end:
+                break
+            value = _deobfuscate_shell_word_for_detection(raw)
+            if options and value == "--":
+                options = False
+            elif options and value in {"-s", "--signal"}:
+                _, end, _ = _read_shell_word(command, end)
+            elif options and value in {"-l", "--list"}:
+                query = True
+            elif query:
+                pass
+            elif options and value.startswith("-"):
+                pass
+            elif _POSITIVE_PID_RE.fullmatch(value):
+                pid = int(value)
+                if pid > 0:
+                    pids.append(str(pid))
+            pos = end
+    return list(dict.fromkeys(pids))
+
+
+def _looks_like_hermes_serve_runtime(command_line: str | None) -> bool:
+    try:
+        tokens = shlex.split(command_line or "")
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+
+    filtered: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in {"-p", "--profile"} and index + 1 < len(tokens):
+            index += 2
+            continue
+        if token.startswith(("-p=", "--profile=")) and token.partition("=")[2]:
+            index += 1
+            continue
+        filtered.append(token)
+        index += 1
+    tokens = filtered
+
+    executable = re.split(r"[/\\]", tokens[0].lower())[-1]
+    if executable in {"hermes", "hermes.exe"}:
+        return len(tokens) > 1 and tokens[1].lower() == "serve"
+
+    if not re.fullmatch(
+        r"python(?:[0-9]+(?:\.[0-9]+)*)?(?:\.exe)?",
+        executable,
+    ):
+        return False
+    module_index = next((i for i, token in enumerate(tokens[1:], 1) if token == "-m"), -1)
+    return (
+        module_index > 0
+        and "-c" not in tokens[1:module_index]
+        and tokens[module_index:module_index + 3] == ["-m", "hermes_cli.main", "serve"]
+    )
+
+
+def _classify_hermes_runtime(command_line: str | None) -> str | None:
+    if _looks_like_hermes_serve_runtime(command_line):
+        return "Hermes serve runtime"
+    try:
+        from gateway.status import looks_like_gateway_runtime_command_line
+        return "Hermes gateway runtime" if looks_like_gateway_runtime_command_line(command_line) else None
+    except Exception:
+        return None
+
+
+def _numeric_pid_block(pid: int, owner: str) -> dict:
+    detail = "process ownership is unreadable or unstable; refusing to signal an unknown owner." if owner == "unknown owner" else "numeric PID kills cannot terminate Hermes runtimes."
+    return {"output": "", "exit_code": 1, "error": f"Blocked: refusing to signal PID {pid} ({owner}); {detail}", "status": "blocked"}
+
+
+def _numeric_pid_runtime_guard(command: str, env_type: str) -> dict | None:
+    if env_type != "local":
+        return None
+    try:
+        from gateway.status import _pid_exists, _read_process_cmdline, get_process_start_time
+    except Exception:
+        return None
+
+    for pid_text in _numeric_kill_pids(command):
+        pid = int(pid_text)
+        try:
+            pid_is_alive = _pid_exists(pid)
+        except Exception:
+            return _numeric_pid_block(pid, "unknown owner")
+        if not pid_is_alive:
+            continue
+
+        for _attempt in range(2):
+            try:
+                start_before = get_process_start_time(pid)
+                cmdline = _read_process_cmdline(pid)
+                start_after = get_process_start_time(pid)
+            except Exception:
+                return _numeric_pid_block(pid, "unknown owner")
+            if start_before is None or not cmdline or start_after is None:
+                return _numeric_pid_block(pid, "unknown owner")
+            if start_before != start_after:
+                continue
+            runtime = _classify_hermes_runtime(cmdline)
+            if runtime:
+                return _numeric_pid_block(pid, runtime)
+            break
+        else:
+            return _numeric_pid_block(pid, "unknown owner")
 
 
 def _sudo_nopasswd_works() -> bool:
@@ -2589,6 +2717,13 @@ def terminal_tool(
         # Get configuration
         config = _get_env_config()
         env_type = config["env_type"]
+
+        # Numeric PID kills can bypass static approval patterns. Resolve the
+        # target process before force/YOLO/approval paths and before any
+        # environment lifecycle command handling.
+        numeric_pid_guard = _numeric_pid_runtime_guard(command, env_type)
+        if numeric_pid_guard:
+            return json.dumps(numeric_pid_guard, ensure_ascii=False)
 
         # Use task_id for environment isolation. By default all subagent
         # task_ids collapse back to "default" so the top-level agent and

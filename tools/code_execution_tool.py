@@ -649,6 +649,22 @@ def _call(tool_name, args):
 _TERMINAL_BLOCKED_PARAMS = {"background", "pty", "notify_on_complete", "watch_patterns"}
 
 
+def _nested_dispatch_kwargs(
+    task_id: Optional[str],
+    session_id: Optional[str],
+    turn_id: Optional[str],
+    api_request_id: Optional[str],
+) -> dict:
+    kwargs = {"task_id": task_id}
+    if session_id is not None:
+        kwargs["session_id"] = session_id
+    if turn_id is not None:
+        kwargs["turn_id"] = turn_id
+    if api_request_id is not None:
+        kwargs["api_request_id"] = api_request_id
+    return kwargs
+
+
 def _rpc_server_loop(
     server_sock: socket.socket,
     task_id: str,
@@ -658,6 +674,9 @@ def _rpc_server_loop(
     allowed_tools: frozenset,
     stop_event: threading.Event,
     rpc_token: str,
+    session_id: Optional[str] = None,
+    turn_id: Optional[str] = None,
+    api_request_id: Optional[str] = None,
 ):
     """
     Accept one client connection and dispatch tool-call requests until
@@ -746,7 +765,11 @@ def _rpc_server_loop(
                 try:
                     with thread_scoped_silence():
                         result = handle_function_call(
-                            tool_name, tool_args, task_id=task_id
+                            tool_name,
+                            tool_args,
+                            **_nested_dispatch_kwargs(
+                                task_id, session_id, turn_id, api_request_id
+                            ),
                         )
                 except Exception as exc:
                     logger.error("Tool call failed in sandbox: %s", exc, exc_info=True)
@@ -928,6 +951,9 @@ def _rpc_poll_loop(
     allowed_tools: frozenset,
     stop_event: threading.Event,
     rpc_token: str,
+    session_id: Optional[str] = None,
+    turn_id: Optional[str] = None,
+    api_request_id: Optional[str] = None,
 ):
     """Poll the remote filesystem for tool call requests and dispatch them.
 
@@ -1021,7 +1047,11 @@ def _rpc_poll_loop(
                     try:
                         with thread_scoped_silence():
                             tool_result = handle_function_call(
-                                tool_name, tool_args, task_id=task_id
+                                tool_name,
+                                tool_args,
+                                **_nested_dispatch_kwargs(
+                                    task_id, session_id, turn_id, api_request_id
+                                ),
                             )
                     except Exception as exc:
                         logger.error("Tool call failed in remote sandbox: %s",
@@ -1064,6 +1094,9 @@ def _execute_remote(
     code: str,
     task_id: Optional[str],
     enabled_tools: Optional[List[str]],
+    session_id: Optional[str] = None,
+    turn_id: Optional[str] = None,
+    api_request_id: Optional[str] = None,
 ) -> str:
     """Run a script on the remote terminal backend via file-based RPC.
 
@@ -1137,6 +1170,7 @@ def _execute_remote(
                 env, f"{sandbox_dir}/rpc", effective_task_id,
                 tool_call_log, tool_call_counter, max_tool_calls,
                 sandbox_tools, stop_event, rpc_token,
+                session_id, turn_id, api_request_id,
             ),
             daemon=True,
         )
@@ -1256,6 +1290,9 @@ def execute_code(
     code: str,
     task_id: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
+    session_id: Optional[str] = None,
+    turn_id: Optional[str] = None,
+    api_request_id: Optional[str] = None,
 ) -> str:
     """
     Run a Python script in a sandboxed child process with RPC access
@@ -1321,7 +1358,14 @@ def execute_code(
         clear_current_thread_interrupt()
 
     if env_type != "local":
-        return _execute_remote(code, task_id, enabled_tools)
+        return _execute_remote(
+            code,
+            task_id,
+            enabled_tools,
+            session_id,
+            turn_id,
+            api_request_id,
+        )
 
     # --- Local execution path (UDS) --- below this line is unchanged ---
 
@@ -1416,6 +1460,7 @@ def execute_code(
             args=(
                 server_sock, task_id, tool_call_log,
                 tool_call_counter, max_tool_calls, sandbox_tools, stop_event, rpc_token,
+                session_id, turn_id, api_request_id,
             ),
             daemon=True,
         )
@@ -2191,6 +2236,9 @@ def _execute_code_handler(args: dict, **kwargs) -> str:
         code=code or "",
         task_id=kwargs.get("task_id"),
         enabled_tools=kwargs.get("enabled_tools"),
+        session_id=kwargs.get("session_id"),
+        turn_id=kwargs.get("turn_id"),
+        api_request_id=kwargs.get("api_request_id"),
     )
 
 

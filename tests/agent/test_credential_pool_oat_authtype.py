@@ -37,7 +37,7 @@ def test_load_heals_legacy_row_and_exposes_it_to_resolver(tmp_path, monkeypatch)
         "agent.anthropic_adapter.read_claude_code_credentials",
         lambda: None,
     )
-    token = "sk-ant-oat-legacy-manual"
+    token = "sk-ant-oat...nual"
     auth_file = hermes_home / "auth.json"
     auth_file.write_text(json.dumps({
         "version": 1,
@@ -61,5 +61,37 @@ def test_load_heals_legacy_row_and_exposes_it_to_resolver(tmp_path, monkeypatch)
     assert entry.auth_type == AUTH_TYPE_OAUTH
     assert persisted["credential_pool"]["anthropic"][0]["auth_type"] == AUTH_TYPE_OAUTH
     assert resolve_anthropic_token() == token
+
+
+def test_profile_global_fallback_normalizes_in_memory_without_writing(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    global_root = tmp_path / ".hermes"
+    global_root.mkdir()
+    profile_home = global_root / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    token = "sk-ant-oat...back"
+    global_auth = global_root / "auth.json"
+    global_auth.write_text(json.dumps({
+        "version": 1,
+        "credential_pool": {
+            "anthropic": [{
+                "id": "global-oat",
+                "label": "Global setup token",
+                "auth_type": AUTH_TYPE_API_KEY,
+                "priority": 0,
+                "source": "manual",
+                "access_token": token,
+            }],
+        },
+    }))
+
+    from agent.credential_pool import load_pool
+
+    entry = load_pool("anthropic").entries()[0]
+    persisted = json.loads(global_auth.read_text())
+    assert entry.auth_type == AUTH_TYPE_OAUTH
+    assert persisted["credential_pool"]["anthropic"][0]["auth_type"] == AUTH_TYPE_API_KEY
+    assert not (profile_home / "auth.json").exists()
 
 
