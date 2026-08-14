@@ -4493,13 +4493,18 @@ class TestCronTopicSelfHeal:
         from cron.jobs import save_jobs, load_jobs
         from gateway.config import Platform
         from gateway.platforms.base import SendResult
+        from gateway.session import build_session_key, SessionSource
 
         home = self._redirect(tmp_path, monkeypatch)
 
         job = {
             "id": "job-a", "name": "Slack monitor", "enabled": True,
             "deliver": "telegram:-100123:17",
-            "origin": {"platform": "telegram", "chat_id": "-100123", "thread_id": "17"},
+            "origin": {
+                "platform": "telegram", "chat_id": "-100123",
+                "chat_type": "group", "user_id": "U42", "thread_id": "17",
+            },
+            "attach_to_session": True,
             "schedule": {"kind": "interval", "minutes": 30},
             "telegram_topic": {"name": "Slack Monitor", "seed": "Slack monitor context.", "icon_emoji_id": "emoji-1"},
         }
@@ -4519,6 +4524,7 @@ class TestCronTopicSelfHeal:
         adapter = MagicMock()
         adapter.send = AsyncMock(side_effect=[dead, ok])
         adapter.create_forum_topic = AsyncMock(return_value="888")
+        adapter._session_store = MagicMock()
 
         pconfig = MagicMock(); pconfig.enabled = True; pconfig.token = "token"
         mock_cfg = MagicMock(); mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
@@ -4531,7 +4537,8 @@ class TestCronTopicSelfHeal:
 
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
-             patch("agent.async_utils.safe_schedule_threadsafe", side_effect=fake_run_coro):
+             patch("agent.async_utils.safe_schedule_threadsafe", side_effect=fake_run_coro), \
+             patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
             result = _deliver_result(job, "Hello world", adapters={Platform.TELEGRAM: adapter}, loop=loop)
 
         assert result is None  # healed + re-sent: NOT a delivery error
@@ -4539,6 +4546,21 @@ class TestCronTopicSelfHeal:
         assert adapter.send.await_count == 2
         # second send targeted the NEW thread
         assert adapter.send.await_args_list[1].kwargs["metadata"]["thread_id"] == "888"
+        adapter._session_store.get_or_create_session.assert_called_once()
+        seeded = adapter._session_store.get_or_create_session.call_args[0][0]
+        inbound = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-100123",
+            chat_type="group",
+            user_id="U42",
+            thread_id="888",
+        )
+        assert seeded.chat_type == "group"
+        assert seeded.thread_id == "888"
+        assert build_session_key(seeded) == build_session_key(inbound)
+        mirror_mock.assert_called_once()
+        assert "Hello world" in mirror_mock.call_args[0][2]
+        assert mirror_mock.call_args.kwargs["thread_id"] == "888"
         # seed sidecar written for the new thread
         seed = json.loads((home / "state" / "topic-seeds" / "888.json").read_text())
         assert seed["seed_text"] == "Slack monitor context."
@@ -5127,6 +5149,192 @@ class TestCronDeliveryMirror:
 
         mirror_mock.assert_called_once()
         assert mirror_mock.call_args.kwargs.get("user_id") == "U42"
+
+    def test_explicit_telegram_topic_cold_start_seeds_inbound_session(self):
+        """An explicit Telegram topic with no session is created with the
+        inbound forum source/key before the real cron brief is mirrored."""
+        from concurrent.futures import Future
+        from gateway.config import Platform
+        from gateway.platforms.base import SendResult
+        from gateway.session import build_session_key, SessionSource
+
+        store = MagicMock()
+        adapter = MagicMock()
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="m1"))
+        adapter._session_store = store
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def fake_run_coro(coro, _loop):
+            future = Future()
+            future.set_result(asyncio.run(coro))
+            return future
+
+        job = {
+            "id": "topic-brief",
+            "name": "Topic brief",
+            "deliver": "telegram:-100123:17",
+            "origin": {
+                "platform": "telegram",
+                "chat_id": "-100123",
+                "chat_type": "group",
+                "user_id": "U42",
+                "thread_id": "17",
+            },
+            "attach_to_session": True,
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("agent.async_utils.safe_schedule_threadsafe", side_effect=fake_run_coro), \
+             patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
+            result = _deliver_result(
+                job,
+                "The actual cron brief.",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+
+        assert result is None
+        store.get_or_create_session.assert_called_once()
+        seeded = store.get_or_create_session.call_args[0][0]
+        inbound = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-100123",
+            chat_type="group",
+            user_id="U42",
+            thread_id="17",
+        )
+        assert seeded.platform == Platform.TELEGRAM
+        assert seeded.chat_id == "-100123"
+        assert seeded.chat_type == "group"
+        assert seeded.thread_id == "17"
+        assert build_session_key(seeded) == build_session_key(inbound)
+        mirror_mock.assert_called_once()
+        assert "The actual cron brief." in mirror_mock.call_args[0][2]
+        assert mirror_mock.call_args.kwargs["thread_id"] == "17"
+
+    def test_telegram_topic_root_fallback_does_not_seed_stale_topic(self):
+        """A successful Telegram root fallback must not seed or mirror the
+        requested topic id that was not actually used for delivery."""
+        from concurrent.futures import Future
+        from gateway.config import Platform
+        from gateway.platforms.base import SendResult
+
+        store = MagicMock()
+        adapter = MagicMock()
+        adapter.send = AsyncMock(return_value=SendResult(
+            success=True,
+            message_id="m1",
+            raw_response={
+                "requested_thread_id": 17,
+                "thread_fallback": True,
+            },
+        ))
+        adapter._session_store = store
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def fake_run_coro(coro, _loop):
+            future = Future()
+            future.set_result(asyncio.run(coro))
+            return future
+
+        job = {
+            "id": "topic-fallback",
+            "name": "Topic fallback",
+            "deliver": "telegram:-100123:17",
+            "origin": {
+                "platform": "telegram",
+                "chat_id": "-100123",
+                "chat_type": "group",
+                "user_id": "U42",
+                "thread_id": "17",
+            },
+            "attach_to_session": True,
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("agent.async_utils.safe_schedule_threadsafe", side_effect=fake_run_coro), \
+             patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
+            result = _deliver_result(
+                job,
+                "The root fallback brief.",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+
+        assert result is not None
+        assert "was not found; delivered without thread_id" in result
+        store.get_or_create_session.assert_not_called()
+        mirror_mock.assert_called_once()
+        assert mirror_mock.call_args.kwargs["thread_id"] is None
+
+    def test_failed_topic_seed_leaves_generic_mirror_eligible(self):
+        """A failed topic session creation must not suppress the generic
+        best-effort mirror."""
+        from concurrent.futures import Future
+        from gateway.config import Platform
+        from gateway.platforms.base import SendResult
+
+        store = MagicMock()
+        store.get_or_create_session.side_effect = RuntimeError("store unavailable")
+        adapter = MagicMock()
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="m1"))
+        adapter._session_store = store
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def fake_run_coro(coro, _loop):
+            future = Future()
+            future.set_result(asyncio.run(coro))
+            return future
+
+        job = {
+            "id": "topic-seed-failure",
+            "name": "Topic seed failure",
+            "deliver": "telegram:-100123:17",
+            "origin": {
+                "platform": "telegram",
+                "chat_id": "-100123",
+                "chat_type": "group",
+                "user_id": "U42",
+                "thread_id": "17",
+            },
+            "attach_to_session": True,
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("agent.async_utils.safe_schedule_threadsafe", side_effect=fake_run_coro), \
+             patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
+            result = _deliver_result(
+                job,
+                "The seed failure brief.",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+
+        assert result is None
+        store.get_or_create_session.assert_called_once()
+        mirror_mock.assert_called_once()
+        assert mirror_mock.call_args.kwargs["thread_id"] == "17"
 
     # --- continuable cron: thread-preferred (Teknium's interface) ---
 

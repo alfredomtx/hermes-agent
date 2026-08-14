@@ -822,7 +822,9 @@ def _seed_cron_thread_session(
     thread_id: str,
     mirror_text: str,
     chat_name: Optional[str] = None,
-) -> None:
+    chat_type: str = "thread",
+    user_id: Optional[str] = "system:cron",
+) -> bool:
     """Seed the freshly-opened cron thread's session with the brief.
 
     Without this the brief is *visible* in the new thread but absent from any
@@ -839,7 +841,7 @@ def _seed_cron_thread_session(
     """
     text = (mirror_text or "").strip()
     if not text:
-        return
+        return False
     try:
         from gateway.config import Platform
         from gateway.session import SessionSource
@@ -849,20 +851,19 @@ def _seed_cron_thread_session(
             try:
                 platform_enum = Platform(platform_name.lower())
             except (ValueError, KeyError):
-                platform_enum = None
-            if platform_enum is not None:
-                dest_source = SessionSource(
-                    platform=platform_enum,
-                    chat_id=str(chat_id),
-                    chat_name=chat_name,
-                    chat_type="thread",
-                    user_id="system:cron",
-                    user_name="Cron",
-                    thread_id=str(thread_id),
-                )
-                # Ensure the thread-keyed session row exists so the mirror has
-                # a target and the user's later reply joins the same session.
-                session_store.get_or_create_session(dest_source)
+                return False
+            dest_source = SessionSource(
+                platform=platform_enum,
+                chat_id=str(chat_id),
+                chat_name=chat_name,
+                chat_type=chat_type,
+                user_id=user_id,
+                user_name="Cron",
+                thread_id=str(thread_id),
+            )
+            # Ensure the thread-keyed session row exists so the mirror has
+            # a target and the user's later reply joins the same session.
+            session_store.get_or_create_session(dest_source)
 
         from gateway.mirror import mirror_to_session
 
@@ -871,24 +872,28 @@ def _seed_cron_thread_session(
         # in-thread reply produces assistant→user→... off a phantom assistant
         # message. Pass the seed user_id so the mirror resolves the exact
         # thread-keyed session row we just created.
-        mirror_to_session(
+        mirrored = mirror_to_session(
             platform_name,
             str(chat_id),
             f"[Cron delivery: {job.get('name') or job.get('id', 'cron')}]\n{text}",
             source_label="cron",
             thread_id=str(thread_id),
-            user_id="system:cron",
+            user_id=user_id,
             role="user",
         )
+        if not mirrored:
+            return False
         logger.info(
             "Job '%s': opened continuable thread %s on %s:%s and seeded the brief",
             job.get("id", "?"), thread_id, platform_name, chat_id,
         )
+        return True
     except Exception as e:
         logger.debug(
             "Job '%s': seeding cron thread session failed for %s:%s:%s: %s",
             job.get("id", "?"), platform_name, chat_id, thread_id, e,
         )
+        return False
 
 
 def _seed_cron_channel_session(
@@ -1611,6 +1616,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # Guard: a given target heals at most once per delivery (prevents a live
         # heal+resend that then fails from re-entering the standalone heal path).
         healed_this_target = False
+        thread_fallback = False
 
         # Diagnostic: log thread_id for topic-aware delivery debugging
         origin = _resolve_origin(job) or {}
@@ -2095,6 +2101,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 and thread_id
                                 and send_raw_response.get("thread_fallback")
                             ):
+                                thread_fallback = platform == Platform.TELEGRAM
                                 requested_thread_id = send_raw_response.get("requested_thread_id") or thread_id
                                 msg = (
                                     f"configured thread_id {requested_thread_id} for "
@@ -2144,13 +2151,34 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     delivered = True
                     # Seed the thread session only now that delivery into it
                     # succeeded (deferred from thread-open above).
-                    if opened_thread_id and not thread_seeded:
-                        _seed_cron_thread_session(
+                    if opened_thread_id and not thread_seeded and not thread_fallback:
+                        thread_seeded = _seed_cron_thread_session(
                             job, runtime_adapter, platform_name, chat_id,
                             opened_thread_id, mirror_text,
                             chat_name=origin.get("chat_name"),
                         )
-                        thread_seeded = True
+                    # Explicit Telegram forum topics already have their final
+                    # thread_id before delivery. Seed the inbound-compatible
+                    # group session after the send succeeds so a cold-start
+                    # topic retains the actual delivered brief.
+                    if (
+                        platform == Platform.TELEGRAM
+                        and mirror_this_target
+                        and thread_id
+                        and not thread_seeded
+                        and not thread_fallback
+                        and (
+                            origin_chat_type == "group"
+                            or (not origin_chat_type and str(chat_id).startswith("-"))
+                        )
+                    ):
+                        thread_seeded = _seed_cron_thread_session(
+                            job, runtime_adapter, platform_name, chat_id,
+                            str(thread_id), mirror_text,
+                            chat_name=origin.get("chat_name"),
+                            chat_type="group",
+                            user_id=origin_user_id,
+                        )
                     # in_channel surface: CREATE + seed the flat channel/DM
                     # session (the shipped mirror only appends to an existing
                     # session — the flat row is otherwise absent for a
@@ -2164,7 +2192,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         )
                     _maybe_mirror_cron_delivery(
                         job, platform_name, chat_id, mirror_text,
-                        thread_id=thread_id, user_id=origin_user_id,
+                        thread_id=None if thread_fallback else thread_id,
+                        user_id=origin_user_id,
                         enabled=mirror_this_target and not thread_seeded and not inchannel_seeded,
                     )
             except Exception as e:
@@ -2269,6 +2298,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
 
+            if platform == Platform.TELEGRAM:
+                raw_response = (
+                    result.get("raw_response")
+                    if isinstance(result, dict)
+                    else getattr(result, "raw_response", None)
+                )
+                thread_fallback = bool(raw_response and raw_response.get("thread_fallback"))
+
             # Cron topic self-heal (standalone): a deleted forum topic is reported
             # (thread_not_found) when topic_meta is present. Recreate + repoint +
             # re-send to the fresh thread before treating it as an error.
@@ -2337,7 +2374,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
             _maybe_mirror_cron_delivery(
                 job, platform_name, chat_id, mirror_text,
-                thread_id=thread_id, user_id=origin_user_id,
+                thread_id=None if thread_fallback else thread_id,
+                user_id=origin_user_id,
                 enabled=mirror_this_target and not thread_seeded,
             )
 
