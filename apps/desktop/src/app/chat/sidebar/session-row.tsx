@@ -101,12 +101,25 @@ export function SidebarSessionRow({
     >
       <SidebarRowShell
         actions={
-          <div className="relative z-2 grid w-[1.375rem] place-items-center" data-row-actions>
+          <div className="relative z-2 flex w-auto items-center gap-0.5" data-row-actions>
             {!isWorking && (
-              <span className="pointer-events-none absolute right-6 top-1/2 min-w-6 -translate-y-1/2 text-right text-[0.625rem] leading-none text-(--ui-text-tertiary) opacity-0 transition-opacity group-hover:opacity-100">
+              <span className="pointer-events-none absolute right-12 top-1/2 min-w-6 -translate-y-1/2 text-right text-[0.625rem] leading-none text-(--ui-text-tertiary) opacity-0 transition-opacity group-hover:opacity-100">
                 {age}
               </span>
             )}
+            <Button
+              aria-label={r.archive}
+              className="size-5 rounded-[4px] bg-transparent text-transparent transition-colors duration-100 hover:bg-(--ui-control-active-background) hover:text-foreground focus-visible:bg-(--ui-control-active-background) focus-visible:text-foreground focus-visible:ring-0 group-hover:text-(--ui-text-tertiary) [&_svg]:size-3.5!"
+              onClick={event => {
+                event.stopPropagation()
+                onArchive()
+              }}
+              size="icon"
+              type="button"
+              variant="ghost"
+            >
+              <Codicon name="archive" size="0.875rem" />
+            </Button>
             <SessionActionsMenu
               onArchive={onArchive}
               onBranch={onBranch}

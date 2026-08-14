@@ -1,8 +1,9 @@
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { atom } from 'nanostores'
 import type * as React from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { startSessionDrag } from '@/app/chat/session-drag'
 import type { SessionInfo } from '@/hermes'
 import type * as ComposerStatusStore from '@/store/composer-status'
 import type * as SessionStore from '@/store/session'
@@ -21,6 +22,7 @@ vi.mock('@/i18n', () => ({
           actionsFor: (title: string) => `Actions for ${title}`,
           ageMin: 'm',
           ageNow: 'now',
+          archive: 'Archive',
           backgroundRunning: 'Running in background',
           finishedUnread: 'Finished',
           handoffOrigin: (platform: string) => `Started on ${platform}`,
@@ -127,6 +129,35 @@ const tipTrigger = (el: HTMLElement) => el.closest('[data-slot="tooltip-trigger"
 const noop = vi.fn()
 
 describe('SidebarSessionRow', () => {
+  it('archives directly without activating or dragging the session', () => {
+    const onArchive = vi.fn()
+    const onResume = vi.fn()
+
+    render(
+      <SidebarSessionRow
+        isPinned={false}
+        isSelected={false}
+        isWorking={false}
+        onArchive={onArchive}
+        onDelete={noop}
+        onPin={noop}
+        onResume={onResume}
+        session={makeSession({ title: 'Archive me' })}
+      />
+    )
+
+    const archiveButton = screen.getByRole('button', { name: 'Archive' })
+
+    expect(screen.getByRole('button', { name: 'Actions for Archive me' })).toBeTruthy()
+
+    fireEvent.pointerDown(archiveButton, { button: 0, pointerType: 'mouse' })
+    fireEvent.click(archiveButton)
+
+    expect(onArchive).toHaveBeenCalledTimes(1)
+    expect(onResume).not.toHaveBeenCalled()
+    expect(vi.mocked(startSessionDrag)).not.toHaveBeenCalled()
+  })
+
   it('wires the actions kebab tooltip text through to SessionActionsMenu', () => {
     render(
       <SidebarSessionRow
