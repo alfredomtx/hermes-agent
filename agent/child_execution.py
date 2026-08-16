@@ -20,28 +20,11 @@ _RUNTIME_PROVIDER_CUSTOM = "custom"
 
 def merge_child_route(
     cfg: Optional[Mapping[str, Any]],
-    profile: Optional[str] = None,
     overrides: Optional[Mapping[str, Any]] = None,
 ) -> dict:
     source = dict(cfg or {})
-    profiles = source.pop("profiles", None)
+    source.pop("profiles", None)  # stale config is ignored
     route = dict(source)
-    profile_name = str(profile or "").strip() or None
-    if profile_name:
-        if not isinstance(profiles, Mapping) or profile_name not in profiles:
-            known = sorted(str(name) for name in profiles) if isinstance(profiles, Mapping) else []
-            suffix = f" Known profiles: {', '.join(known)}." if known else " No profiles configured."
-            raise ValueError(f"Unknown delegation profile '{profile_name}'.{suffix}")
-        profile_cfg = profiles[profile_name]
-        if not isinstance(profile_cfg, Mapping):
-            raise ValueError(f"Delegation profile '{profile_name}' must be a mapping.")
-        route.update({key: value for key, value in profile_cfg.items() if value is not None})
-        route["_profile"] = profile_name
-        route["_profile_child_timeout_overridden"] = (
-            "child_timeout_seconds" in profile_cfg
-            and profile_cfg.get("child_timeout_seconds") is not None
-        )
-        route["_global_child_timeout_seconds"] = source.get("child_timeout_seconds")
 
     for key, value in (overrides or {}).items():
         if key in _ROUTE_KEYS and value is not None:
@@ -216,11 +199,7 @@ def resolve_child_route(
         if "delegation_cfg" in context
         else load_child_config()
     )
-    route = merge_child_route(
-        delegation_cfg,
-        spec.get("profile"),
-        spec,
-    )
+    route = merge_child_route(delegation_cfg, spec)
     resolved = spec.get("resolved_credentials")
     credentials = (
         dict(resolved)
@@ -301,7 +280,7 @@ def create_child(
             }
         )
 
-    service_tier, profile_overrides = _request_overrides_for_child(
+    service_tier, request_route_overrides = _request_overrides_for_child(
         model, route_cfg, parent_agent
     )
     request_overrides = (
@@ -311,7 +290,7 @@ def create_child(
     )
     request_overrides.update(credentials.get("request_overrides") or {})
     request_overrides.update(spec.get("request_overrides") or {})
-    request_overrides.update(profile_overrides)
+    request_overrides.update(request_route_overrides)
 
     reasoning = spec.get(
         "reasoning_config",

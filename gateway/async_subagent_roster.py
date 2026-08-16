@@ -45,7 +45,6 @@ def _children_from_record(record: Dict[str, Any]) -> List[Dict[str, Any]]:
                     "task_index": i,
                     "subagent_id": str(result.get("subagent_id") or ""),
                     "goal": result.get("goal", goal),
-                    "profile": result.get("profile") or record.get("profile"),
                     "model": result.get("model") or record.get("model"),
                     "reasoning_effort": result.get("reasoning_effort"),
                     "toolsets": result.get("toolsets") or [],
@@ -88,7 +87,6 @@ def build_async_subagent_roster_rows(
         status = _normalise_status(child.get("status"))
         label = roster_label(child.get("goal"))
         model = child.get("model") or record.get("model") or ""
-        profile = child.get("profile") or ""
         reasoning = child.get("reasoning")
         if reasoning is None:
             reasoning = child.get("reasoning_effort")
@@ -114,7 +112,6 @@ def build_async_subagent_roster_rows(
                 "tools": int(active.get("tool_count") or 0),
                 "bucket": "running",
                 "model": model,
-                "profile": profile,
                 "reasoning": reasoning,
             }
             timing = format_subagent_lifecycle_timing(
@@ -139,7 +136,6 @@ def build_async_subagent_roster_rows(
                 "tools": 0,
                 "bucket": "pending",
                 "model": model,
-                "profile": profile,
                 "reasoning": reasoning,
             }
             timing = format_subagent_lifecycle_timing(
@@ -188,7 +184,6 @@ def build_async_subagent_roster_rows(
             "tools": tools,
             "bucket": bucket,
             "model": model,
-            "profile": profile,
             "reasoning": reasoning,
             "cost_usd": float(_row_cost) if isinstance(_row_cost, (int, float)) else None,
         }
@@ -209,41 +204,13 @@ def build_async_subagent_roster_rows(
 
 
 def build_async_dispatched_header(record: Dict[str, Any]) -> str:
-    """Pinned 'what I dispatched' header line for a BACKGROUND delegation.
-
-    Rendered as the FIRST line of the bubble and KEPT for the whole lifecycle
-    (it does NOT morph away into the roster the way the old seed-card frame did).
-    The live/collapsed roster rows are appended BELOW it.
-
-    Shape example: 🔀 Delegate task — N agents · profile: `x` · toolsets=`a,b`
-      * ``N agents`` — the post-expansion child count (a ``dual-review`` fans
-        into one agent per lane, so this is the real number of agents running,
-        not the number of model-issued tasks). Singular ``— 1 agent``.
-      * ``<profile>`` — the top-level delegation profile when one was set
-        (``dual-review`` / ``coder`` / …); rendered as profile: `none` when no
-        profile was passed, so a plain delegate is EXPLICITLY marked rather than
-        leaving the reader to wonder whether the cell is missing.
-      * ``toolsets=…`` — ONLY when toolsets were EXPLICITLY passed on the
-        dispatch (an audit signal for "did I under-provision a child"); hidden
-        when the children just inherited the parent toolset (the common case),
-        to avoid noise on every row.
-    Returns "" when the record has no children/goals.
-    """
+    """Pinned dispatch header for a background delegation."""
     children = _children_from_record(record)
     n = len(children)
     if n <= 0:
         return ""
 
     head = f"🔀 Delegate task — {n} agent" + ("" if n == 1 else "s")
-
-    profile = record.get("header_profile") or record.get("profile")
-    if profile not in (None, "", [], {}):
-        head += " · profile: " + _inline_code(profile)
-    else:
-        # No delegation profile -> mark it explicitly so a plain delegate is
-        # unambiguous (not "did the profile cell go missing?").
-        head += " · profile: " + _inline_code("none")
-
     toolsets = record.get("header_toolsets")
     if toolsets in (None, "", [], {}):
         toolsets = record.get("toolsets")

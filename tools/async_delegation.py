@@ -185,7 +185,6 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
             "model",
             "is_batch",
             "children",
-            "header_profile",
             "header_toolsets",
         )
         if key in record
@@ -308,7 +307,6 @@ def recover_abandoned_delegations() -> int:
                 "toolsets": task.get("toolsets"), "role": task.get("role"),
                 "model": task.get("model"), "is_batch": bool(task.get("is_batch")),
                 "children": task.get("children"),
-                "header_profile": task.get("header_profile"),
                 "header_toolsets": task.get("header_toolsets"),
                 "status": "unknown", "summary": None,
                 "error": "Delegation owner exited before recording a terminal result; outcome unknown.",
@@ -548,11 +546,11 @@ def _normalise_children(
         else:
             source = raw_children[index] if index < len(raw_children) else {}
         child = dict(source)
+        child.pop("profile", None)
         child.update(
             {
                 "task_index": index,
                 "goal": source.get("goal") or goal,
-                "profile": source.get("profile"),
                 "model": source.get("model") or model,
                 "reasoning_effort": source.get("reasoning_effort"),
                 "toolsets": list(source.get("toolsets") or []),
@@ -603,8 +601,9 @@ def _merge_terminal_children(
         result = result_by_index.get(task_index, {})
         item = dict(child)
         for key, value in result.items():
-            if key != "task_index" and not key.startswith("_"):
+            if key != "task_index" and key != "profile" and not key.startswith("_"):
                 item[key] = value
+        item.pop("profile", None)
         item["task_index"] = task_index
         item["status"] = result.get("status") or item.get("status") or default_status
         if item.get("ended_at") is None:
@@ -622,9 +621,9 @@ def _merge_terminal_children(
         if task_index in known_indexes:
             continue
         item = dict(result)
+        item.pop("profile", None)
         item["task_index"] = task_index
         item.setdefault("goal", "")
-        item.setdefault("profile", None)
         item.setdefault("model", None)
         item.setdefault("reasoning_effort", None)
         item.setdefault("toolsets", [])
@@ -647,10 +646,9 @@ def _record_event_fields(record: Dict[str, Any], event: Dict[str, Any]) -> None:
         current = _records.get(str(record.get("delegation_id") or ""))
         if current is None:
             return
-        for key in ("children", "header_profile", "header_toolsets", "results"):
+        for key in ("children", "header_toolsets", "results"):
             if key in event:
                 current[key] = event[key]
-        current["status"] = event.get("status", current.get("status"))
         current["completed_at"] = event.get("completed_at", current.get("completed_at"))
 
 
@@ -735,7 +733,6 @@ def dispatch_async_delegation(
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     children: Optional[List[Dict[str, Any]]] = None,
-    header_profile: Optional[str] = None,
     header_toolsets: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Spawn ``runner`` on the daemon executor and return a handle immediately.
@@ -794,8 +791,6 @@ def dispatch_async_delegation(
         "interrupt_fn": interrupt_fn,
         "children": children,
     }
-    if header_profile is not None:
-        record["header_profile"] = header_profile
     if header_toolsets is not None:
         record["header_toolsets"] = list(header_toolsets)
     # Capacity check and record insert under ONE lock hold — checking
@@ -938,7 +933,7 @@ def _push_completion_event(
             default_status=status,
         ),
     }
-    for key in ("header_profile", "header_toolsets"):
+    for key in ("header_toolsets",):
         if key in record:
             evt[key] = record[key]
     _record_event_fields(record, evt)
@@ -969,7 +964,6 @@ def dispatch_async_delegation_batch(
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
     children: Optional[List[Dict[str, Any]]] = None,
-    header_profile: Optional[str] = None,
     header_toolsets: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
@@ -1019,8 +1013,6 @@ def dispatch_async_delegation_batch(
         "is_batch": True,
         "children": children,
     }
-    if header_profile is not None:
-        record["header_profile"] = header_profile
     if header_toolsets is not None:
         record["header_toolsets"] = list(header_toolsets)
     with _records_lock:
@@ -1144,7 +1136,7 @@ def _finalize_batch(
             default_status=status,
         ),
     }
-    for key in ("header_profile", "header_toolsets"):
+    for key in ("header_toolsets",):
         if key in event_record:
             evt[key] = event_record[key]
     _record_event_fields(event_record, evt)
