@@ -84,20 +84,12 @@ def _parent(session_db=None):
     )
 
 
-def test_create_child_resolves_native_profile_and_preserves_generic_overrides(
+def test_create_child_uses_explicit_route_keys_and_preserves_generic_context(
     monkeypatch, tmp_path: Path
 ):
-    """A profile selector must use native routing while retaining core context."""
+    """Explicit route keys select the child while generic context is retained."""
     session_db = object()
     parent = _parent(session_db)
-    profile = {
-        "provider": "openrouter",
-        "model": "google/gemini-3-flash-preview",
-        "base_url": "https://openrouter.ai/api/v1",
-        "api_key": "profile-key",
-        "api_mode": "chat_completions",
-        "toolsets": ["file"],
-    }
     monkeypatch.setattr("run_agent.AIAgent", _FakeAgent)
 
     progress = lambda *_args, **_kwargs: None
@@ -107,14 +99,20 @@ def test_create_child_resolves_native_profile_and_preserves_generic_overrides(
     child = create_child(
         parent,
         {
-            "profile": "reviewer",
+            "provider": "openrouter",
+            "model": "google/gemini-3-flash-preview",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "child-key",
+            "api_mode": "chat_completions",
             "instructions": "Inspect only the requested repository.",
             "toolsets": ["file"],
             "session_id": "workflow-child",
         },
         callbacks={"progress": progress, "clarify": clarify},
         context={
-            "delegation_cfg": {"profiles": {"reviewer": profile}},
+            "delegation_cfg": {
+                "profiles": {"stale": {"model": "must-not-be-used"}},
+            },
             "session_db": session_db,
             "cwd": str(cwd),
         },
@@ -122,6 +120,7 @@ def test_create_child_resolves_native_profile_and_preserves_generic_overrides(
 
     assert child.provider == "custom"
     assert child.model == "google/gemini-3-flash-preview"
+    assert child.kwargs["api_key"] == "child-key"
     assert child.kwargs["enabled_toolsets"] == ["file"]
     assert child.kwargs["ephemeral_system_prompt"] == (
         "Inspect only the requested repository."
@@ -143,61 +142,55 @@ def test_create_child_omits_max_iterations_without_explicit_cap(monkeypatch):
     assert "max_iterations" not in getattr(child, "kwargs")
 
 
-def test_resolve_child_route_prefers_explicit_context_config(monkeypatch):
+def test_resolve_child_route_uses_explicit_context_and_spec_route_keys(monkeypatch):
     parent = _parent()
     explicit_cfg = {
-        "profiles": {
-            "reviewer": {
-                "provider": "context-provider",
-                "model": "context-model",
-            }
-        }
+        "provider": "context-provider",
+        "model": "context-model",
+        "profiles": {"stale": {"model": "must-not-be-used"}},
     }
     monkeypatch.setattr(
         child_execution,
         "load_child_config",
-        lambda: {"profiles": {"reviewer": {"model": "loader-model"}}},
+        lambda: {"provider": "loader-provider", "model": "loader-model"},
     )
 
     route, _credentials = resolve_child_route(
         parent,
         {
-            "profile": "reviewer",
+            "provider": "spec-provider",
+            "model": "spec-model",
             "resolved_credentials": {"model": "resolved-model"},
         },
         {"delegation_cfg": explicit_cfg},
     )
 
-    assert route["provider"] == "context-provider"
-    assert route["model"] == "context-model"
+    assert route["provider"] == "spec-provider"
+    assert route["model"] == "spec-model"
+    assert "profiles" not in route
 
 
-def test_resolve_child_route_loads_profile_config_when_context_omits_it(monkeypatch):
+def test_resolve_child_route_ignores_stale_config_when_loading(monkeypatch):
     parent = _parent()
     monkeypatch.setattr(
         child_execution,
         "load_child_config",
         lambda: {
-            "profiles": {
-                "reviewer": {
-                    "provider": "loader-provider",
-                    "model": "loader-model",
-                }
-            }
+            "provider": "loader-provider",
+            "model": "loader-model",
+            "profiles": {"stale": {"provider": "profile-provider"}},
         },
     )
 
     route, _credentials = resolve_child_route(
         parent,
-        {
-            "profile": "reviewer",
-            "resolved_credentials": {"model": "resolved-model"},
-        },
+        {"resolved_credentials": {"model": "resolved-model"}},
         {},
     )
 
     assert route["provider"] == "loader-provider"
     assert route["model"] == "loader-model"
+    assert "profiles" not in route
 
 
 def test_create_child_does_not_depend_on_the_delegate_tool_adapter(monkeypatch):
@@ -222,7 +215,7 @@ def test_create_child_does_not_depend_on_the_delegate_tool_adapter(monkeypatch):
             "provider": "openrouter",
             "model": "google/gemini-3-flash-preview",
             "base_url": "https://openrouter.ai/api/v1",
-            "api_key": "profile-key",
+            "api_key": "child-key",
             "toolsets": [],
         },
     )
@@ -365,7 +358,7 @@ def test_unknown_service_tier_keeps_preserved_warning(caplog):
     assert "Unknown delegation service_tier 'turbo', ignoring" in caplog.text
 
 
-def test_create_child_profile_only_reasoning_preserves_parent_route_and_filters(
+def test_create_child_applies_explicit_reasoning_and_inherits_parent_route(
     monkeypatch,
 ):
     parent = _parent()
@@ -384,12 +377,12 @@ def test_create_child_profile_only_reasoning_preserves_parent_route_and_filters(
     child = create_child(
         parent,
         {
-            "profile": "reasoning-review",
+            "reasoning_effort": "high",
             "instructions": "Inspect only the requested repository.",
         },
         context={
             "delegation_cfg": {
-                "profiles": {"reasoning-review": {"reasoning_effort": "high"}}
+                "profiles": {"stale": {"reasoning_effort": "must-not-be-used"}}
             }
         },
     )

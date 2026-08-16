@@ -551,21 +551,6 @@ def _get_child_timeout(cfg: Optional[dict] = None) -> Optional[float]:
     """
     cfg = cfg if cfg is not None else _load_config()
     cfg = cfg or {}
-    profile_name = _normalize_profile_name(cfg.get("_profile"))
-    if cfg.get("_profile_child_timeout_overridden"):
-        parsed = _coerce_child_timeout(
-            cfg.get("child_timeout_seconds"),
-            label=f"delegation.profiles.{profile_name}.child_timeout_seconds",
-        )
-        if parsed is not _CHILD_TIMEOUT_UNSET:
-            return parsed
-        parsed = _coerce_child_timeout(
-            cfg.get("_global_child_timeout_seconds"),
-            label="delegation.child_timeout_seconds",
-        )
-        if parsed is not _CHILD_TIMEOUT_UNSET:
-            return parsed
-        return DEFAULT_CHILD_TIMEOUT
     val = cfg.get("child_timeout_seconds")
     if val is not None:
         try:
@@ -650,139 +635,6 @@ def _get_inherit_mcp_toolsets(cfg: Optional[dict] = None) -> bool:
     if cfg is None:
         cfg = _load_config()
     return is_truthy_value(cfg.get("inherit_mcp_toolsets"), default=False)
-
-
-def _normalize_profile_name(profile: Optional[str]) -> Optional[str]:
-    name = str(profile or "").strip()
-    return name or None
-
-
-DUAL_REVIEW_PROFILE = "dual-review"
-DUAL_REVIEWER_PROFILES = ("reviewer-codex", "reviewer-opus")
-DUAL_PLAN_PROFILE = "dual-plan"
-DUAL_PLANNER_PROFILES = ("planner-codex", "planner-opus")
-
-
-def _profile_roster(cfg: Optional[dict], key: str, fallback: tuple[str, ...]) -> tuple[str, ...]:
-    cfg = _load_config() if cfg is None else (cfg or {})
-    raw = cfg.get(key)
-    if not isinstance(raw, (list, tuple)) or not raw:
-        return fallback
-    profiles = cfg.get("profiles")
-    known = set(profiles) if isinstance(profiles, dict) else None
-    out: List[str] = []
-    for item in raw:
-        name = _normalize_profile_name(item if isinstance(item, str) else None)
-        if not name or name in out:
-            continue
-        if known is not None and name not in known:
-            logger.warning("delegation.%s names unknown profile %r; skipping it", key, name)
-            continue
-        out.append(name)
-    return tuple(out) if len(out) >= 2 else fallback
-
-
-def _get_dual_reviewer_profiles(cfg: Optional[dict] = None) -> tuple[str, ...]:
-    return _profile_roster(cfg, "dual_review_profiles", DUAL_REVIEWER_PROFILES)
-
-
-def _get_dual_planner_profiles(cfg: Optional[dict] = None) -> tuple[str, ...]:
-    return _profile_roster(cfg, "dual_plan_profiles", DUAL_PLANNER_PROFILES)
-
-
-def _is_dual_review_profile(profile: Optional[str]) -> bool:
-    return _normalize_profile_name(profile) == DUAL_REVIEW_PROFILE
-
-
-def _is_dual_plan_profile(profile: Optional[str]) -> bool:
-    return _normalize_profile_name(profile) == DUAL_PLAN_PROFILE
-
-
-def _is_single_reviewer_profile(profile: Optional[str]) -> bool:
-    return _normalize_profile_name(profile) in frozenset(_get_dual_reviewer_profiles())
-
-
-def _requires_dual_review(cfg: Optional[dict]) -> bool:
-    return is_truthy_value((cfg or {}).get("require_dual_review"), default=False)
-
-
-def _task_with_lane_context(task: Dict[str, Any], profile: str, family: str) -> Dict[str, Any]:
-    cloned = dict(task)
-    cloned["profile"] = profile
-    marker = (
-        f"{family.upper()} LANE:\n"
-        f"- This task was expanded from profile='{family}'.\n"
-        f"- Your assigned {'reviewer' if family == DUAL_REVIEW_PROFILE else 'planner'} lane is `{profile}`.\n"
-        "- If the task lists model-specific output paths, write only the path for your assigned lane.\n"
-        "- Do not write a shared artifact path unless the task explicitly says a shared write is safe."
-    )
-    context = cloned.get("context")
-    cloned["context"] = f"{context.rstrip()}\n\n{marker}" if isinstance(context, str) and context.strip() else marker
-    return cloned
-
-
-def _expand_reserved_profile_task_items(
-    task_list: List[Dict[str, Any]], top_profile: Optional[str]
-) -> List[Dict[str, Any]]:
-    expanded: List[Dict[str, Any]] = []
-    for source_index, task in enumerate(task_list):
-        profile = _normalize_profile_name(
-            task.get("profile") or top_profile if isinstance(task, dict) else top_profile
-        )
-        if isinstance(task, dict) and _is_dual_review_profile(profile):
-            lanes = [(p, True, False) for p in _get_dual_reviewer_profiles()]
-        elif isinstance(task, dict) and _is_dual_plan_profile(profile):
-            lanes = [(p, False, True) for p in _get_dual_planner_profiles()]
-        else:
-            lanes = [(None, False, False)]
-        for lane, from_review, from_plan in lanes:
-            family = DUAL_REVIEW_PROFILE if from_review else DUAL_PLAN_PROFILE
-            expanded.append({
-                "task": _task_with_lane_context(task, lane, family) if lane else task,
-                "from_dual_review": from_review,
-                "from_dual_plan": from_plan,
-                "source_index": source_index,
-                "dual_review_profile": DUAL_REVIEW_PROFILE if from_review else None,
-                "dual_plan_profile": DUAL_PLAN_PROFILE if from_plan else None,
-            })
-    return expanded
-
-
-_expand_dual_review_task_items = _expand_reserved_profile_task_items
-
-
-def _dispatched_profile(top_profile: Optional[str], items: List[Dict[str, Any]]) -> Optional[str]:
-    if _normalize_profile_name(top_profile):
-        return _normalize_profile_name(top_profile)
-    profiles = []
-    for item in items:
-        task = item.get("task") or {}
-        profiles.append(item.get("dual_review_profile") or item.get("dual_plan_profile") or task.get("profile"))
-    return profiles[0] if profiles and profiles[0] and all(p == profiles[0] for p in profiles) else None
-
-
-def _single_reviewer_profile_error(profile_name: str) -> str:
-    lanes = ", ".join(_get_dual_reviewer_profiles())
-    return (
-        f"Direct reviewer profile '{profile_name}' is disabled because delegation.require_dual_review=true. "
-        f"Use profile='dual-review' so all reviewer lanes ({lanes}) run, then aggregate their findings."
-    )
-
-
-def _merge_delegation_profile(cfg: dict, profile: Optional[str]) -> dict:
-    return child_execution.merge_child_route(cfg or {}, _normalize_profile_name(profile))
-
-
-def _profile_toolsets(cfg: dict) -> Optional[List[str]]:
-    value = (cfg or {}).get("toolsets")
-    return [str(v) for v in value if str(v or "").strip()] if isinstance(value, list) else None
-
-
-def _profile_max_iterations(cfg: dict, default: int) -> int:
-    try:
-        return max(1, int((cfg or {}).get("max_iterations", default)))
-    except (TypeError, ValueError):
-        return default
 
 
 def _request_overrides_for_child(model: Optional[str], cfg: dict, parent_agent) -> tuple[Optional[str], Dict[str, Any]]:
@@ -1538,16 +1390,6 @@ def _finish_native_child(parent_agent, child, native: Dict[str, Any]):
     parent_sid = getattr(parent_agent, "session_id", None)
     if parent_sid and getattr(child, "_session_init_model_config", None) is not None:
         child._session_init_model_config["_delegate_from"] = parent_sid
-        try:
-            from tools.tier_labels import derive_tier
-
-            route_cfg = native["route_cfg"]
-            child._session_init_model_config["_profile"] = route_cfg.get("_profile")
-            child._session_init_model_config["_tier"] = derive_tier(
-                route_cfg.get("_profile"), route_cfg
-            )
-        except Exception:
-            logger.debug("tier-label telemetry stamp failed", exc_info=True)
 
     child_pool = _resolve_child_credential_pool(
         native["credential_provider"],
@@ -1973,7 +1815,7 @@ def _run_single_child(
     if child_timeout is _CHILD_TIMEOUT_UNSET:
         # Preserve the historical zero-argument call shape when no per-run
         # delegation config was supplied. Besides compatibility with plugins
-        # and test patches, this still lets configured/profile runs pass their
+        # and test patches, this still lets configured route runs pass their
         # merged delegation mapping explicitly.
         timeout = (
             _get_child_timeout()
@@ -2720,7 +2562,6 @@ def delegate_task(
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
     background: Optional[bool] = None,
-    profile: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -2751,7 +2592,6 @@ def delegate_task(
 
     # Normalise top-level routing once; per-task values override it.
     top_role = _normalize_role(role)
-    top_profile = _normalize_profile_name(profile)
 
     # Background (async) delegation now applies to BOTH single tasks and
     # batches. A batch is dispatched as ONE async unit: the whole fan-out runs
@@ -2781,7 +2621,12 @@ def delegate_task(
 
     # Load config
     cfg = _load_config()
-    default_max_iter = _profile_max_iterations(cfg, DEFAULT_MAX_ITERATIONS)
+    try:
+        default_max_iter = max(
+            1, int(cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS))
+        )
+    except (TypeError, ValueError):
+        default_max_iter = DEFAULT_MAX_ITERATIONS
     # Model-supplied max_iterations is ignored — the config value is authoritative
     # so users get predictable budgets. The kwarg is retained for internal callers
     # and tests; a model-emitted value here would only shrink the budget and
@@ -2809,7 +2654,6 @@ def delegate_task(
             "goal": goal,
             "context": context,
             "role": top_role,
-            "profile": top_profile,
         }]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
@@ -2817,7 +2661,7 @@ def delegate_task(
     if not task_list:
         return tool_error("No tasks provided.")
 
-    # Validate source tasks before profile fan-out.
+    # Validate source tasks before constructing any children.
     for i, task in enumerate(task_list):
         if not isinstance(task, dict):
             return tool_error(
@@ -2825,39 +2669,38 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+        if "profile" in task:
+            return tool_error(
+                "Named delegation profiles are no longer supported; "
+                "remove the 'profile' field."
+            )
 
-    expanded_task_items = _expand_reserved_profile_task_items(task_list, top_profile)
-    task_list = [item["task"] for item in expanded_task_items]
     if len(task_list) > max_children:
         return tool_error(
-            f"Too many tasks: {len(task_list)} provided, but max_concurrent_children is {max_children}. "
-            "Either reduce the task count, split into multiple delegate_task calls, or increase "
-            "delegation.max_concurrent_children in config.yaml."
+            f"Too many tasks: {len(task_list)} provided, but "
+            f"max_concurrent_children is {max_children}. "
+            "Either reduce the task count, split into multiple delegate_task "
+            "calls, or increase delegation.max_concurrent_children in config.yaml."
         )
 
     task_specs: List[Dict[str, Any]] = []
-    for item in expanded_task_items:
-        task = item["task"]
-        task_profile = _normalize_profile_name(task.get("profile") or top_profile)
-        if (
-            _requires_dual_review(cfg)
-            and _is_single_reviewer_profile(task_profile)
-            and not item["from_dual_review"]
-        ):
-            return tool_error(_single_reviewer_profile_error(task_profile or ""))
+    for task in task_list:
         try:
-            task_cfg = _merge_delegation_profile(cfg, task_profile)
+            task_cfg = child_execution.merge_child_route(cfg, task)
             task_creds = _resolve_delegation_credentials(task_cfg, parent_agent)
         except ValueError as exc:
             return tool_error(str(exc))
-        task_specs.append({
-            "profile": task_profile,
-            "cfg": task_cfg,
-            "creds": task_creds,
-            "toolsets": _profile_toolsets(task_cfg),
-            "max_iterations": _profile_max_iterations(task_cfg, default_max_iter),
-            "role": _normalize_role(task.get("role") or top_role),
-        })
+
+        task_specs.append(
+            {
+                "cfg": task_cfg,
+                "creds": task_creds,
+                # No profile-selected toolset. None means inherit the parent.
+                "toolsets": None,
+                "max_iterations": default_max_iter,
+                "role": _normalize_role(task.get("role") or top_role),
+            }
+        )
 
     overall_start = time.monotonic()
     results = []
@@ -2974,7 +2817,6 @@ def delegate_task(
             {
                 "task_index": i,
                 "goal": task["goal"],
-                "profile": spec["profile"],
                 "model": child_model if isinstance(child_model, str) else spec["creds"]["model"],
                 "reasoning_effort": spec["cfg"].get("reasoning_effort"),
                 "toolsets": list(spec["toolsets"] or []),
@@ -2990,10 +2832,6 @@ def delegate_task(
             return list(first) if isinstance(first, list) else first
         return None
 
-    header_profile_value = _shared_explicit_value("profile")
-    header_profile: Optional[str] = (
-        header_profile_value if isinstance(header_profile_value, str) else None
-    )
     header_toolsets_value = _shared_explicit_value("toolsets")
     header_toolsets: Optional[List[str]] = (
         header_toolsets_value if isinstance(header_toolsets_value, list) else None
@@ -3446,7 +3284,6 @@ def delegate_task(
             # returned delegation_id matches cache/delegation/live/<id>/.
             delegation_id=live_deleg_id,
             children=child_descriptors,
-            header_profile=header_profile,
             header_toolsets=header_toolsets,
         )
 
@@ -3603,36 +3440,6 @@ def _load_config() -> dict:
 # ---------------------------------------------------------------------------
 # OpenAI Function-Calling Schema
 # ---------------------------------------------------------------------------
-
-
-_COUNT_WORDS = {2: "two", 3: "three", 4: "four", 5: "five", 6: "six"}
-
-
-def _lane_phrase(lanes: tuple[str, ...]) -> tuple[str, str]:
-    if not lanes:
-        return "none", "zero"
-    count = _COUNT_WORDS.get(len(lanes), str(len(lanes)))
-    joined = ", ".join(lanes[:-1]) + f" + {lanes[-1]}" if len(lanes) > 1 else lanes[0]
-    return joined, count
-
-
-def _dual_review_lane_phrase() -> tuple[str, str]:
-    return _lane_phrase(_get_dual_reviewer_profiles())
-
-
-def _dual_plan_lane_phrase() -> tuple[str, str]:
-    return _lane_phrase(_get_dual_planner_profiles())
-
-
-def _build_profile_param_description() -> str:
-    review_lanes, review_count = _dual_review_lane_phrase()
-    plan_lanes, plan_count = _dual_plan_lane_phrase()
-    return (
-        "Optional operator-defined delegation profile from config.yaml delegation.profiles. "
-        f"dual-review expands to {review_lanes} and counts as {review_count} child tasks. "
-        f"dual-plan expands to {plan_lanes} and counts as {plan_count} child tasks. "
-        "Per-task profile overrides the top-level profile."
-    )
 
 
 def _build_top_level_description() -> str:
@@ -3812,7 +3619,6 @@ def _build_dynamic_schema_overrides() -> dict:
     }
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
     overrides_params["properties"]["role"]["description"] = _build_role_param_description()
-    overrides_params["properties"]["profile"]["description"] = _build_profile_param_description()
 
     return {
         "description": _build_top_level_description(),
@@ -3854,10 +3660,6 @@ DELEGATE_TASK_SCHEMA = {
                     "specific you are, the better the subagent performs."
                 ),
             },
-            "profile": {
-                "type": "string",
-                "description": "(rebuilt at get_definitions() time)",
-            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -3867,10 +3669,6 @@ DELEGATE_TASK_SCHEMA = {
                         "context": {
                             "type": "string",
                             "description": "Task-specific context",
-                        },
-                        "profile": {
-                            "type": "string",
-                            "description": "Per-task delegation profile override, including dual-review or dual-plan.",
                         },
                         "role": {
                             "type": "string",
@@ -3962,7 +3760,6 @@ registry.register(
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),
-        profile=args.get("profile"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

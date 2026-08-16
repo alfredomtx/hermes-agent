@@ -6,7 +6,7 @@ from pathlib import Path
 import yaml
 
 
-def test_profile_child_timeout_seconds_overrides_global():
+def test_root_child_timeout_ignores_stale_config():
     hermes_home = Path(os.environ["HERMES_HOME"])
     (hermes_home / "config.yaml").write_text(
         yaml.safe_dump(
@@ -19,13 +19,7 @@ def test_profile_child_timeout_seconds_overrides_global():
                             "model": "gpt-5.5",
                             "child_timeout_seconds": 45,
                         },
-                        "no-cap": {
-                            "child_timeout_seconds": 0,
-                        },
-                        "inherits-global": {
-                            "provider": "openai-codex",
-                            "model": "gpt-5.5",
-                        },
+                        "no-cap": {"child_timeout_seconds": 0},
                     },
                 }
             }
@@ -34,18 +28,7 @@ def test_profile_child_timeout_seconds_overrides_global():
     )
 
     from hermes_cli.config import load_config
-    from tools.delegate_tool import _get_child_timeout, _merge_delegation_profile
+    from tools.delegate_tool import _get_child_timeout
 
     delegation = load_config()["delegation"]
-
-    quick = _merge_delegation_profile(delegation, "quick-review")
-    assert _get_child_timeout(quick) == 45.0
-
-    no_cap = _merge_delegation_profile(delegation, "no-cap")
-    assert _get_child_timeout(no_cap) is None
-
-    inherited = _merge_delegation_profile(delegation, "inherits-global")
-    assert _get_child_timeout(inherited) == 120.0
-
-    root = _merge_delegation_profile(delegation, None)
-    assert _get_child_timeout(root) == 120.0
+    assert _get_child_timeout(delegation) == 120.0

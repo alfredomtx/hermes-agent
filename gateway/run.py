@@ -131,12 +131,8 @@ def _delegate_param_cells(spec: dict) -> List[str]:
     return cells
 
 
-def _delegate_task_row(spec: dict, *, default_profile: Optional[str]) -> str:
-    profile = spec.get("profile") or default_profile
-    left: List[str] = []
-    if profile:
-        left.append(" ".join(_redact_delegate_text(str(profile)).replace("`", "").split()))
-    left.extend(_delegate_param_cells(spec))
+def _delegate_task_row(spec: dict) -> str:
+    left = _delegate_param_cells(spec)
     left.append(_delegate_goal_cell(spec.get("goal")))
     return " · ".join(left)
 
@@ -144,7 +140,6 @@ def _delegate_task_row(spec: dict, *, default_profile: Optional[str]) -> str:
 def _format_delegate_task_args_progress(args: Optional[dict]) -> List[str]:
     """Render delegate_task input as a compact Telegram roster card."""
     args = args or {}
-    default_profile = args.get("profile")
     tasks = args.get("tasks")
     if isinstance(tasks, list) and tasks:
         specs = [t if isinstance(t, dict) else {"goal": t} for t in tasks]
@@ -154,7 +149,7 @@ def _format_delegate_task_args_progress(args: Optional[dict]) -> List[str]:
         header = "🔀 Delegate task"
     lines = [header]
     shown = specs[:_DELEGATE_TASK_MAX_ROWS]
-    lines.extend(_delegate_task_row(spec, default_profile=default_profile) for spec in shown)
+    lines.extend(_delegate_task_row(spec) for spec in shown)
     extra = len(specs) - len(shown)
     if extra > 0:
         lines.append(f"… +{extra} more")

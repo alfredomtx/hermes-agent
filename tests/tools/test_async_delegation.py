@@ -143,6 +143,43 @@ def test_completion_event_lands_on_shared_queue_with_session_key():
     assert evt["delegation_id"] == res["delegation_id"]
 
 
+def test_active_count_stays_nonzero_until_completion_publication(monkeypatch):
+    publication_started = threading.Event()
+    release_publication = threading.Event()
+    completion_queue = process_registry.completion_queue
+    original_put = completion_queue.put
+
+    def blocked_put(event):
+        publication_started.set()
+        assert release_publication.wait(timeout=5.0)
+        original_put(event)
+
+    monkeypatch.setattr(completion_queue, "put", blocked_put)
+
+    dispatched = ad.dispatch_async_delegation(
+        goal="publication race",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="",
+        runner=lambda: {"status": "completed", "summary": "published result"},
+    )
+    assert dispatched["status"] == "dispatched"
+    assert publication_started.wait(timeout=2.0)
+    assert ad.active_count() == 1
+
+    release_publication.set()
+    deadline = time.monotonic() + 2.0
+    while ad.active_count() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert ad.active_count() == 0
+
+    event = completion_queue.get(timeout=2.0)
+    assert event["delegation_id"] == dispatched["delegation_id"]
+    assert event["summary"] == "published result"
+
+
 def test_batch_completion_retains_child_descriptors_and_lifecycle_fields(
     tmp_path, monkeypatch
 ):
@@ -156,7 +193,6 @@ def test_batch_completion_retains_child_descriptors_and_lifecycle_fields(
         {
             "task_index": 0,
             "goal": "audit",
-            "profile": "file-explorer",
             "model": "gpt-5.6-luna",
             "reasoning_effort": "high",
             "toolsets": ["file"],
@@ -164,7 +200,6 @@ def test_batch_completion_retains_child_descriptors_and_lifecycle_fields(
         {
             "task_index": 1,
             "goal": "verify",
-            "profile": "coder",
             "model": "gpt-5.6-terra",
             "reasoning_effort": "medium",
             "toolsets": ["terminal"],
@@ -204,7 +239,6 @@ def test_batch_completion_retains_child_descriptors_and_lifecycle_fields(
         session_key="",
         runner=runner,
         children=children,
-        header_profile="mixed",
         header_toolsets=["file", "terminal"],
     )
     assert dispatched["status"] == "dispatched"
@@ -219,11 +253,11 @@ def test_batch_completion_retains_child_descriptors_and_lifecycle_fields(
     release.set()
 
     event = process_registry.completion_queue.get(timeout=2.0)
-    assert event["header_profile"] == "mixed"
+    assert "header_profile" not in event
     assert event["header_toolsets"] == ["file", "terminal"]
     by_index = {child["task_index"]: child for child in event["children"]}
     assert by_index[0]["goal"] == "audit"
-    assert by_index[0]["profile"] == "file-explorer"
+    assert "profile" not in by_index[0]
     assert by_index[0]["model"] == "gpt-5.6-luna"
     assert by_index[0]["reasoning_effort"] == "high"
     assert by_index[0]["toolsets"] == ["file"]
@@ -234,7 +268,7 @@ def test_batch_completion_retains_child_descriptors_and_lifecycle_fields(
     assert by_index[0]["tool_count"] == 4
     assert by_index[0]["cost_usd"] == 0.42
     assert by_index[1]["goal"] == "verify"
-    assert by_index[1]["profile"] == "coder"
+    assert "profile" not in by_index[1]
     assert by_index[1]["started_at"] == 106.0
     assert by_index[1]["tool_count"] == 2
     assert by_index[1]["cost_usd"] == 0.21

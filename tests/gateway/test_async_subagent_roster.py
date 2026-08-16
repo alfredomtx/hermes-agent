@@ -131,7 +131,6 @@ def test_completed_async_store_event_renders_preserved_child_metadata(tmp_path, 
                     {
                         "task_index": 0,
                         "status": "completed",
-                        "profile": "file-explorer",
                         "model": "gpt-5.6-luna",
                         "reasoning_effort": "high",
                         "toolsets": ["file"],
@@ -151,7 +150,6 @@ def test_completed_async_store_event_renders_preserved_child_metadata(tmp_path, 
         event = restored.get(timeout=2.0)
 
         rows = build_async_subagent_roster_rows(event, [], now=120.0)
-        assert rows[0]["profile"] == "file-explorer"
         assert rows[0]["model"] == "gpt-5.6-luna"
         assert rows[0]["reasoning"] == "high"
         assert rows[0]["tools"] == 4
@@ -782,9 +780,10 @@ def _config_args_and_roster_on():
 
 @pytest.mark.asyncio
 async def test_watcher_pins_dispatched_header_above_roster(monkeypatch):
-    """args:on + roster:on -> the '🔀 Delegate task — N agents · profile' header
-    is PINNED as the first line of the bubble and STAYS there across edits; the
-    live roster rows are appended BELOW it (no morph-away)."""
+    """args:on + roster:on -> the dispatch header is pinned above the roster.
+
+    The header stays first across edits while live lifecycle rows update below.
+    """
     import gateway.run as gateway_run
 
     monkeypatch.setattr(gateway_run, "_load_gateway_config", _config_args_and_roster_on)
@@ -792,9 +791,7 @@ async def test_watcher_pins_dispatched_header_above_roster(monkeypatch):
     adapter = AsyncRosterAdapter()
     runner = _runner(adapter)
     record = _record()
-    record["profile"] = "dual-review"
-    record["children"][0]["profile"] = "reviewer-codex"
-    record["children"][1]["profile"] = "reviewer-opus"
+
 
     # First tick: bubble seeds with header + roster in ONE message.
     await runner._tick_async_delegation_rosters(
@@ -804,9 +801,8 @@ async def test_watcher_pins_dispatched_header_above_roster(monkeypatch):
     assert len(adapter.sent) == 1
     seed = adapter.sent[0]["content"]
     seed_lines = seed.split("\n")
-    assert seed_lines[0] == "🔀 Delegate task — 2 agents · profile: `dual-review`"  # pinned header
-    assert seed_lines[1].startswith("🤖 Subagents")                      # roster appended
-    assert "reviewer-codex" in seed and "reviewer-opus" in seed          # per-row lanes
+    assert seed_lines[0] == "🔀 Delegate task — 2 agents"  # pinned header
+    assert seed_lines[1].startswith("🤖 Subagents")       # roster appended
 
     # Subsequent publish: EDITS the same message; header is STILL there (not morphed away).
     record["children"][0]["status"] = "completed"
@@ -820,9 +816,8 @@ async def test_watcher_pins_dispatched_header_above_roster(monkeypatch):
     assert len(adapter.sent) == 1  # no second send
     assert adapter.edits
     edited = adapter.edits[-1]["content"]
-    assert edited.startswith("🔀 Delegate task — 2 agents · profile: `dual-review`")  # header PERSISTS
+    assert edited.startswith("🔀 Delegate task — 2 agents")  # header PERSISTS
     assert "🤖 Subagents" in edited
-    assert "reviewer-codex" in edited and "reviewer-opus" in edited
 
 
 @pytest.mark.asyncio
@@ -840,9 +835,6 @@ async def test_watcher_no_header_when_args_off(monkeypatch):
     adapter = AsyncRosterAdapter()
     runner = _runner(adapter)
     record = _record()
-    record["profile"] = "dual-review"
-    record["children"][0]["profile"] = "reviewer-codex"
-
     await runner._tick_async_delegation_rosters([record], [])
     assert len(adapter.sent) == 1
     assert "🔀 Delegate task" not in adapter.sent[0]["content"]
@@ -853,140 +845,32 @@ async def test_watcher_no_header_when_args_off(monkeypatch):
 from gateway.async_subagent_roster import build_async_dispatched_header
 
 
-def test_dispatched_header_agent_count_and_profile():
-    def rec(profile=None, toolsets=None, n=2):
-        return {"profile": profile, "toolsets": toolsets,
-                "children": [{"task_index": i, "subagent_id": f"sa-{i}", "goal": f"g{i}"} for i in range(n)]}
-
-    # N agents (post-expansion child count), profile shown, toolsets hidden when inherited.
-    assert build_async_dispatched_header(rec("dual-review", None)) == \
-        "🔀 Delegate task — 2 agents · profile: `dual-review`"
-    # toolsets shown ONLY when explicitly set.
-    assert build_async_dispatched_header(rec("coder", ["terminal", "file"])) == \
-        "🔀 Delegate task — 2 agents · profile: `coder` · toolsets=`terminal,file`"
-    # no profile -> EXPLICIT "profile: none" cell (not omitted), so a plain
-    # delegate is unambiguous.
-    assert build_async_dispatched_header(rec(None, None)) == \
-        "🔀 Delegate task — 2 agents · profile: `none`"
-    # singular.
-    assert build_async_dispatched_header(rec("explorer", None, n=1)) == \
-        "🔀 Delegate task — 1 agent · profile: `explorer`"
-    # empty record -> empty header.
-    assert build_async_dispatched_header({}) == ""
 
 
 def test_dispatched_header_prefers_header_toolsets_over_resolved():
     """The header reads `header_toolsets` (the EXPLICIT set computed by the
-    caller) in preference to the resolved `toolsets` record field, so a per-task
-    uniform set surfaces and a profile-defaulted `toolsets` does not leak in."""
+    caller) in preference to the resolved `toolsets` record field, so a uniform
+    explicit set surfaces without leaking inherited toolsets."""
     base = {"children": [{"task_index": 0, "subagent_id": "s0", "goal": "g0"},
                          {"task_index": 1, "subagent_id": "s1", "goal": "g1"}]}
     # header_toolsets present -> used.
     assert build_async_dispatched_header({**base, "header_toolsets": ["terminal", "file"]}) == \
-        "🔀 Delegate task — 2 agents · profile: `none` · toolsets=`terminal,file`"
+        "🔀 Delegate task — 2 agents · toolsets=`terminal,file`"
     # header_toolsets absent -> falls back to top-level toolsets (back-compat).
     assert build_async_dispatched_header({**base, "toolsets": ["web"]}) == \
-        "🔀 Delegate task — 2 agents · profile: `none` · toolsets=`web`"
+        "🔀 Delegate task — 2 agents · toolsets=`web`"
     # neither -> no toolsets cell.
     assert build_async_dispatched_header(base) == \
-        "🔀 Delegate task — 2 agents · profile: `none`"
+        "🔀 Delegate task — 2 agents"
 
 
-def test_dispatched_header_prefers_per_task_profile():
-    record = {
-        "profile": None,
-        "header_profile": "dual-review",
-        "children": [
-            {"task_index": 0, "subagent_id": "s0", "goal": "g0"},
-            {"task_index": 1, "subagent_id": "s1", "goal": "g1"},
-        ],
-    }
-
-    assert build_async_dispatched_header(record) == \
-        "🔀 Delegate task — 2 agents · profile: `dual-review`"
 
 
-# ── Fix A: profile must PERSIST in roster rows (now BELOW the pinned header) ──
-# Regression for "I don't see the profile anymore, only the Subagents part":
-# the profile is a per-row cell so it shows in running, partial-done, AND
-# collapsed states — independently of the pinned header above.
-
-def test_roster_rows_carry_profile_in_all_states():
-    """build_async_subagent_roster_rows threads child profile onto every row
-    bucket (running / pending / terminal) so the renderer can keep it visible."""
-    record = {
-        "delegation_id": "deleg_p",
-        "dispatched_at": 100.0,
-        "children": [
-            {"task_index": 0, "subagent_id": "sa-0", "goal": "g0",
-             "profile": "reviewer-codex", "status": "completed", "duration_seconds": 5.0},
-            {"task_index": 1, "subagent_id": "sa-1", "goal": "g1",
-             "profile": "reviewer-opus", "status": "pending"},
-        ],
-    }
-    active = [{"subagent_id": "sa-1", "started_at": 100.0, "tool_count": 0}]
-    rows = build_async_subagent_roster_rows(record, active, now=110.0)
-    by_label = {r["label"]: r for r in rows}
-    assert by_label["g0"]["profile"] == "reviewer-codex"   # terminal row
-    assert by_label["g1"]["profile"] == "reviewer-opus"    # running row
 
 
-def test_profile_suffix_renders_on_rows():
-    """_profile_suffix renders the lane, kept in both live and collapsed render."""
-    from gateway.subagent_roster import _profile_suffix
-
-    assert _profile_suffix({"profile": "reviewer-codex"}) == " · `reviewer-codex`"
-    assert _profile_suffix({"profile": "  reviewer`-`opus "}) == " · `reviewer-opus`"
-    assert _profile_suffix({"profile": ""}) == ""
-    assert _profile_suffix({}) == ""
-
-    rows = [
-        {"glyph": "✓", "label": "g0", "elapsed": 5.0, "running": False, "tools": 70,
-         "bucket": "done", "model": "gpt-5.5", "profile": "reviewer-codex"},
-        {"glyph": "✓", "label": "g1", "elapsed": 6.0, "running": False, "tools": 42,
-         "bucket": "done", "model": "us.anthropic.claude-opus-4-8", "profile": "reviewer-opus"},
-    ]
-    live = format_subagent_roster(rows, collapsed=False)
-    collapsed = format_subagent_roster(rows, collapsed=True)
-    assert live is not None and collapsed is not None
-    for text in (live, collapsed):
-        assert "reviewer-codex" in text
-        assert "reviewer-opus" in text
-        # profile sits before the model cell: `g0` · `reviewer-codex` · gpt-5.5
-        assert "`g0` · `reviewer-codex` · gpt-5.5" in text
 
 
-@pytest.mark.asyncio
-async def test_watcher_profile_persists_in_rows_through_edits(monkeypatch):
-    """End-to-end: per-row profile is present in BOTH the seed send and the
-    subsequent live-roster edit (the original 'profile vanished' regression),
-    now alongside the pinned header."""
-    import gateway.run as gateway_run
 
-    monkeypatch.setattr(gateway_run, "_load_gateway_config", _config_args_and_roster_on)
-
-    adapter = AsyncRosterAdapter()
-    runner = _runner(adapter)
-    record = _record()
-    record["profile"] = "dual-review"
-    record["children"][0]["profile"] = "reviewer-codex"
-    record["children"][1]["profile"] = "reviewer-opus"
-
-    await runner._tick_async_delegation_rosters([record], [])
-    assert "reviewer-codex" in adapter.sent[0]["content"]
-
-    await runner._publish_async_delegation_roster(
-        record,
-        [{"subagent_id": "sa-0", "started_at": 101.0, "tool_count": 1},
-         {"subagent_id": "sa-1", "started_at": 102.0, "tool_count": 0}],
-        force=True,
-        collapsed=False,
-    )
-    edited = adapter.edits[-1]["content"]
-    assert edited.startswith("🔀 Delegate task")  # header pinned
-    assert "🤖 Subagents" in edited
-    assert "reviewer-codex" in edited   # ← lane survives in the row
-    assert "reviewer-opus" in edited
 
 
 def test_pending_row_shows_queue_wait_duration():
@@ -1089,7 +973,7 @@ def test_bad_or_inverted_timestamps_fall_back_safely(status, child_updates):
     assert rows[0]["elapsed"] == 8.0
 
 
-def test_legacy_terminal_record_keeps_existing_elapsed_rendering():
+def test_terminal_record_keeps_existing_elapsed_rendering():
     rows = build_async_subagent_roster_rows(
         {
             "children": [
