@@ -92,6 +92,34 @@ describe('subagent store', () => {
     expect(item?.stream.find(e => e.kind === 'summary')?.text).toBe('search complete')
   })
 
+  it('preserves child identity and reasoning effort when later events omit metadata', () => {
+    upsertSubagent(
+      's1',
+      {
+        child_session_id: 'child-1',
+        goal: 'research files',
+        model: 'GPT Luna',
+        reasoning_effort: 'high',
+        status: 'running',
+        subagent_id: 'a1',
+        task_index: 0
+      },
+      true,
+      'subagent.start'
+    )
+    upsertSubagent(
+      's1',
+      { status: 'running', subagent_id: 'a1', task_index: 0, text: 'still working' },
+      false,
+      'subagent.thinking'
+    )
+
+    const item = listFor('s1')[0]
+    expect(item?.sessionId).toBe('child-1')
+    expect(item?.model).toBe('GPT Luna')
+    expect(item?.reasoningEffort).toBe('high')
+  })
+
   it('prunes delegate fallback rows once native events arrive', () => {
     upsertSubagent('s1', { goal: 'fallback', status: 'running', subagent_id: 'delegate-tool:abc:0', task_index: 0 })
     upsertSubagent('s1', { goal: 'native', status: 'running', subagent_id: 'sa-0-xyz', task_index: 0 })

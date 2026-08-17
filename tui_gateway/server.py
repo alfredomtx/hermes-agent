@@ -4716,6 +4716,14 @@ def _on_tool_progress(
             payload["depth"] = int(_kwargs["depth"])
         if _kwargs.get("model"):
             payload["model"] = str(_kwargs["model"])
+        reasoning = _kwargs.get("reasoning")
+        if isinstance(reasoning, dict):
+            if reasoning.get("enabled") is False:
+                payload["reasoning_effort"] = "none"
+            elif reasoning.get("enabled") is True:
+                effort = reasoning.get("effort")
+                if isinstance(effort, str) and effort:
+                    payload["reasoning_effort"] = effort
         if _kwargs.get("tool_count") is not None:
             payload["tool_count"] = int(_kwargs["tool_count"])
         if _kwargs.get("toolsets"):
