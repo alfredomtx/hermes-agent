@@ -3,11 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { host } from '@/sdk'
 import { $selectedStoredSessionId, setSelectedStoredSessionId } from '@/store/session'
 
-import {
-  createSelectSessionAndOpenAgentsAction,
-  type SessionRowContext,
-  setSessionRowHostAction
-} from './session-row'
+import { createSelectSessionAndOpenAgentsAction, type SessionRowContext, setSessionRowHostAction } from './session-row'
 
 const context: SessionRowContext = {
   profile: 'default',
