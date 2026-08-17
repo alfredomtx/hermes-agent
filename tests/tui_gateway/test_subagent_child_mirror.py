@@ -66,6 +66,30 @@ def _relay(server, event_type, **payload):
     )
 
 
+@pytest.mark.parametrize(
+    ("reasoning", "expected_effort"),
+    [
+        ({"enabled": False}, "none"),
+        ({"enabled": True, "effort": "high"}, "high"),
+        ({}, None),
+        ("high", None),
+    ],
+)
+def test_subagent_reasoning_is_normalized_for_parent_payload(server, emits, reasoning, expected_effort):
+    _relay(
+        server,
+        "subagent.start",
+        child_session_id="child-1",
+        reasoning=reasoning,
+    )
+
+    payload = emits[-1][2]
+    if expected_effort is None:
+        assert "reasoning_effort" not in payload
+    else:
+        assert payload["reasoning_effort"] == expected_effort
+
+
 def test_no_live_child_session_no_mirror(server, emits):
     _relay(server, "subagent.tool", tool_name="terminal", child_session_id="child-1")
 
